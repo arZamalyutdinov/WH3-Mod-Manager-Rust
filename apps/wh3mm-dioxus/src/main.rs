@@ -6935,17 +6935,17 @@ mod tests {
 
         assert_eq!(
             applied[0].identity.path,
-            game_dir.join("data/b.pack").display().to_string()
+            game_dir.join("data").join("b.pack").display().to_string()
         );
         assert!(applied[0].enabled);
         assert_eq!(
             applied[1].identity.path,
-            game_dir.join("data/a.pack").display().to_string()
+            game_dir.join("data").join("a.pack").display().to_string()
         );
         assert!(applied[1].enabled);
         assert_eq!(
             applied[2].identity.path,
-            game_dir.join("data/c.pack").display().to_string()
+            game_dir.join("data").join("c.pack").display().to_string()
         );
         assert!(!applied[2].enabled);
         assert!(status.contains("Restored enablement/order from used_mods.txt"));
