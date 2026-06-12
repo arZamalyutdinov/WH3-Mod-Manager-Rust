@@ -226,15 +226,6 @@ enum ModListFilter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolPanelTab {
-    Overview,
-    Launch,
-    Steam,
-    Workshop,
-    Checks,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LibraryToolTab {
     None,
     Presets,
@@ -282,7 +273,6 @@ fn App() -> Element {
     let mut show_hidden = use_signal(|| false);
     let mut mod_search = use_signal(String::new);
     let mut mod_list_filter = use_signal(|| ModListFilter::All);
-    let mut tool_panel_tab = use_signal(|| ToolPanelTab::Overview);
     let mut library_tool_tab = use_signal(|| LibraryToolTab::None);
     let mut workspace_page = use_signal(|| WorkspacePage::Mods);
     let mut selected_mod_key = use_signal(|| None::<String>);
@@ -320,7 +310,6 @@ fn App() -> Element {
     let all_mod_rows = view_model.mods.clone();
     let current_mod_filter = *mod_list_filter.read();
     let current_mod_filter_label = mod_list_filter_label(current_mod_filter);
-    let current_tool_panel = *tool_panel_tab.read();
     let current_library_tool = *library_tool_tab.read();
     let current_workspace_page = *workspace_page.read();
     let visible_rows = all_mod_rows
@@ -445,7 +434,6 @@ fn App() -> Element {
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Checks),
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Checks);
-                            tool_panel_tab.set(ToolPanelTab::Overview);
                         },
                         "Checks"
                     }
@@ -454,7 +442,6 @@ fn App() -> Element {
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Workshop),
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Workshop);
-                            tool_panel_tab.set(ToolPanelTab::Overview);
                         },
                         "Workshop"
                     }
@@ -1419,7 +1406,6 @@ fn App() -> Element {
                             style: library_utility_button_style(current_workspace_page == WorkspacePage::Checks),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Checks);
-                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { style: nav_badge_style(), "CHK" }
                             span { "Alpha checks" }
@@ -1516,7 +1502,6 @@ fn App() -> Element {
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Settings);
                                 library_tool_tab.set(LibraryToolTab::None);
-                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Launch Options" }
                             span { ">" }
@@ -1533,7 +1518,6 @@ fn App() -> Element {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Checks);
-                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Alpha Checks" }
                             span { ">" }
@@ -1542,7 +1526,6 @@ fn App() -> Element {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Steam);
-                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Steam Helper" }
                             span { ">" }
@@ -1551,364 +1534,9 @@ fn App() -> Element {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Workshop),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Workshop);
-                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Workshop Commands" }
                             span { ">" }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Launch {
-                        section {
-                            style: "display: grid; gap: 11px; margin-bottom: 12px; border-top: 1px solid #373947; padding-top: 14px;",
-                h3 {
-                    style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Launch options"
-                }
-                div {
-                    style: "display: grid; grid-template-columns: 1fr 1fr; gap: 8px;",
-                    button {
-                        style: launch_quick_button_style(),
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                let state = app_state.read().clone();
-                                let launch_options = launch_options.read().clone();
-                                let save_name = launch_save_name.read().clone();
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| build_launch_preview(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                {
-                                    Ok(preview) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(format!(
-                                            "Previewed {} enabled mods and {} generated packs for {}.",
-                                            preview.enabled_count,
-                                            preview.generated_packs.len(),
-                                            preview.mod_list_file_name
-                                        )));
-                                        launch_preview.set(Some(preview));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not preview launch: {}", error.message))),
-                                }
-                            }
-                        },
-                        "Preview"
-                    }
-                    button {
-                        style: launch_quick_button_style(),
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                let state = app_state.read().clone();
-                                let launch_options = launch_options.read().clone();
-                                let save_name = launch_save_name.read().clone();
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| prepare_launch_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                {
-                                    Ok(status) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not prepare launch files: {}", error.message))),
-                                }
-                            }
-                        },
-                        "Prepare"
-                    }
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.skip_intro_movies,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.skip_intro_movies = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Skip intros"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.script_logging,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.script_logging = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Script logging"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.auto_start_custom_battle,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.auto_start_custom_battle = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Auto battle"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.make_units_generals,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.make_units_generals = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Make generals"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.high_process_priority,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.high_process_priority = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "High priority"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.close_on_play,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.close_on_play = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Close on play"
-                }
-                input {
-                    style: "width: 220px; min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{current_launch_save_name}",
-                    placeholder: "Campaign save name",
-                    oninput: move |event| {
-                        launch_save_name.set(event.value());
-                    },
-                }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Steam {
-                        section {
-                            style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; align-items: stretch; margin-bottom: 12px; border: 1px solid #28323d; background: #141a20; border-radius: 6px; padding: 10px;",
-                h3 {
-                    style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Steam helper"
-                }
-                input {
-                    style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{steam_helper_path}",
-                    placeholder: "Steam helper executable path",
-                    oninput: move |event| {
-                        steam_helper_path.set(event.value());
-                    },
-                }
-                select {
-                    style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{steam_helper_backend}",
-                    onchange: move |event| {
-                        steam_helper_backend.set(event.value());
-                    },
-                    option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
-                    option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    onclick: move |_| {
-                        if let Some(helper_path) = pick_steam_helper_file() {
-                            let helper_path = helper_path.display().to_string();
-                            let backend = steam_helper_backend.read().clone();
-                            match save_steam_helper_settings(&helper_path, &backend) {
-                                Ok(status) => {
-                                    steam_helper_path.set(helper_path);
-                                    mod_status.set(Some(status));
-                                }
-                                Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
-                            }
-                        }
-                    },
-                    "Choose helper"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    onclick: move |_| {
-                        let helper_path = steam_helper_path.read().trim().to_string();
-                        let backend = steam_helper_backend.read().clone();
-                        match save_steam_helper_settings(&helper_path, &backend) {
-                            Ok(status) => mod_status.set(Some(status)),
-                            Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
-                        }
-                    },
-                    "Save helper"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        match probe_steam_helper(&helper_path, &backend) {
-                            Ok(status) => mod_status.set(Some(status)),
-                            Err(error) => mod_status.set(Some(format!("Could not probe Steam helper: {error}"))),
-                        }
-                    },
-                    "Probe helper"
-                }
-                button {
-                    style: "border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let mut next_state = app_state.read().clone();
-                        match refresh_steam_from_helper(&mut next_state, &helper_path, &backend) {
-                            Ok(result) => {
-                                let command_panel = steam_refresh_panel_state(&result);
-                                let status = format!(
-                                    "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.",
-                                    result.subscribed_ids.len(),
-                                    result.metadata.len(),
-                                    result.requested_metadata_count,
-                                    result.missing_metadata_count,
-                                    result.filtered_unsubscribed_count,
-                                    result.renamed_count
-                                );
-                                subscribed_workshop_ids.set(result.subscribed_ids);
-                                steam_metadata.set(result.metadata);
-                                last_steam_command.set(Some(command_panel));
-                                app_state.set(next_state);
-                                mod_status.set(Some(status));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not refresh Steam: {error}"))),
-                        }
-                    },
-                    "Refresh Steam"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        match check_steam_updates_with_helper(&app_state.read(), &helper_path, &backend) {
-                            Ok(result) => {
-                                mod_status.set(Some(steam_check_update_status(&result)));
-                                last_steam_command.set(Some(steam_check_update_panel_state(&result)));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not check Steam updates: {error}"))),
-                        }
-                    },
-                    "Check updates"
-                }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Workshop {
-                        section {
-                            style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; align-items: stretch; margin-bottom: 12px; border: 1px solid #28323d; background: #141a20; border-radius: 6px; padding: 10px;",
-                h3 {
-                    style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Workshop commands"
-                }
-                input {
-                    style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{steam_command_ids}",
-                    placeholder: "Workshop IDs",
-                    oninput: move |event| {
-                        steam_command_ids.set(event.value());
-                    },
-                }
-                button {
-                    style: "border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Subscribe, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not subscribe: {error}"))),
-                        }
-                    },
-                    "Subscribe"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Download, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not download: {error}"))),
-                        }
-                    },
-                    "Download"
-                }
-                button {
-                    style: "border: 1px solid #7f3a3a; background: #402020; color: #f8d7da; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Unsubscribe, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not unsubscribe: {error}"))),
-                        }
-                    },
-                    "Unsubscribe"
-                }
-                button {
-                    style: "border: 1px solid #7b5f22; background: #3a2d13; color: #f8e7b2; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Resubscribe, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not resubscribe: {error}"))),
-                        }
-                    },
-                    "Resubscribe"
-                }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Checks {
-                        AlphaReadinessPanel {
-                            report: alpha_readiness.clone()
                         }
                     }
                 }
@@ -3005,6 +2633,63 @@ fn App() -> Element {
                                             },
                                         }
                                     }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: launch_quick_button_style(),
+                                            onclick: move |_| {
+                                                let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                                if let Some(selected_game_folder) = selected_game_folder {
+                                                    let state = app_state.read().clone();
+                                                    let launch_options = launch_options.read().clone();
+                                                    let save_name = launch_save_name.read().clone();
+                                                    match save_game_folder(&selected_game_folder)
+                                                        .and_then(|_| build_launch_preview(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                                    {
+                                                        Ok(preview) => {
+                                                            game_folder.set(Some(selected_game_folder));
+                                                            mod_status.set(Some(format!(
+                                                                "Previewed {} enabled mods and {} generated packs for {}.",
+                                                                preview.enabled_count,
+                                                                preview.generated_packs.len(),
+                                                                preview.mod_list_file_name
+                                                            )));
+                                                            launch_preview.set(Some(preview));
+                                                        }
+                                                        Err(error) => mod_status.set(Some(format!("Could not preview launch: {}", error.message))),
+                                                    }
+                                                }
+                                            },
+                                            "Preview launch"
+                                        }
+                                        button {
+                                            style: launch_quick_button_style(),
+                                            onclick: move |_| {
+                                                let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                                if let Some(selected_game_folder) = selected_game_folder {
+                                                    let state = app_state.read().clone();
+                                                    let launch_options = launch_options.read().clone();
+                                                    let save_name = launch_save_name.read().clone();
+                                                    match save_game_folder(&selected_game_folder)
+                                                        .and_then(|_| prepare_launch_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                                    {
+                                                        Ok(status) => {
+                                                            game_folder.set(Some(selected_game_folder));
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Err(error) => mod_status.set(Some(format!("Could not prepare launch files: {}", error.message))),
+                                                    }
+                                                }
+                                            },
+                                            "Prepare files"
+                                        }
+                                    }
+                                    if let Some(preview) = launch_preview.read().as_ref() {
+                                        LaunchPreviewPanel {
+                                            preview: preview.clone(),
+                                            is_stale: preview.fingerprint != current_launch_fingerprint,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3922,41 +3607,12 @@ fn detail_action_button_style(danger: bool) -> &'static str {
 }
 
 #[cfg(test)]
-fn tool_panel_tab_label(tab: ToolPanelTab) -> &'static str {
-    match tab {
-        ToolPanelTab::Overview => "Overview",
-        ToolPanelTab::Launch => "Launch",
-        ToolPanelTab::Steam => "Steam",
-        ToolPanelTab::Workshop => "Workshop",
-        ToolPanelTab::Checks => "Checks",
-    }
-}
-
-#[cfg(test)]
-fn toggle_tool_panel(current: ToolPanelTab, target: ToolPanelTab) -> ToolPanelTab {
-    if current == target {
-        ToolPanelTab::Overview
-    } else {
-        target
-    }
-}
-
-#[cfg(test)]
 fn library_tool_tab_label(tab: LibraryToolTab) -> &'static str {
     match tab {
         LibraryToolTab::None => "None",
         LibraryToolTab::Presets => "Presets",
         LibraryToolTab::Categories => "Cats",
         LibraryToolTab::Config => "Config",
-    }
-}
-
-#[cfg(test)]
-fn tool_panel_button_style(active: bool) -> &'static str {
-    if active {
-        "border: 1px solid #4ade80; background: #1b2a1d; color: #edf2f7; border-radius: 6px; padding: 8px 8px; font-size: 12px; font-weight: 650;"
-    } else {
-        "border: 1px solid #2b352d; background: #111710; color: #cbd8cc; border-radius: 6px; padding: 8px 8px; font-size: 12px;"
     }
 }
 
@@ -7140,16 +6796,16 @@ mod tests {
         DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput, LaunchOptionState, LibraryNavTarget,
         LibraryToolTab, ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME,
         STEAM_HELPER_COMMAND_LOG_ENV, STEAM_HELPER_COMMAND_LOG_FILE, SteamCommandAction,
-        SteamCommandPanelRow, SteamCommandPanelState, SteamRefreshResult, ToolPanelTab,
-        WorkspacePage, app_brand_subtitle, app_brand_title,
-        append_app_diagnostic_log_event_to_path, append_pack_data_overwrite_packs,
-        apply_saved_or_existing_game_mod_list, apply_steam_metadata_to_mods,
-        archive_filter_bar_style, archive_filter_button_style, archive_table_header_style,
-        archive_toolbar_button_style, build_alpha_readiness_report_with_paths,
-        build_windows_launch_options, collection_row_button_style, collection_row_style,
-        continue_save_button_style, delete_category_config_for_state, dependency_names_summary,
-        detail_action_button_style, detail_metric_style, detail_source_tile_style,
-        diagnostic_snapshot_text, enabled_pack_paths_for_start_game, fetch_steam_metadata_safely,
+        SteamCommandPanelRow, SteamCommandPanelState, SteamRefreshResult, WorkspacePage,
+        app_brand_subtitle, app_brand_title, append_app_diagnostic_log_event_to_path,
+        append_pack_data_overwrite_packs, apply_saved_or_existing_game_mod_list,
+        apply_steam_metadata_to_mods, archive_filter_bar_style, archive_filter_button_style,
+        archive_table_header_style, archive_toolbar_button_style,
+        build_alpha_readiness_report_with_paths, build_windows_launch_options,
+        collection_row_button_style, collection_row_style, continue_save_button_style,
+        delete_category_config_for_state, dependency_names_summary, detail_action_button_style,
+        detail_metric_style, detail_source_tile_style, diagnostic_snapshot_text,
+        enabled_pack_paths_for_start_game, fetch_steam_metadata_safely,
         first_existing_steam_helper_path, generated_pack_details, header_metric_style,
         initial_app_state, launch_options_from_legacy_ts, launch_priority_status,
         launch_quick_button_style, launch_state_fingerprint, launch_status_with_close_on_play,
@@ -7167,9 +6823,8 @@ mod tests {
         steam_check_update_panel_state, steam_check_update_status, steam_command_panel_state,
         steam_command_status, steam_helper_process_config, steam_probe_status,
         steam_refresh_panel_state, steam_resubscribe_panel_state, steam_resubscribe_status,
-        toggle_label_style, toggle_tool_panel, tool_action_button_style, tool_panel_button_style,
-        tool_panel_tab_label, top_icon_button_style, workshop_id_summary, workshop_ids_from_input,
-        workshop_ids_from_mods,
+        toggle_label_style, tool_action_button_style, top_icon_button_style, workshop_id_summary,
+        workshop_ids_from_input, workshop_ids_from_mods,
     };
     use wh3mm_ui::ModRowViewModel;
 
@@ -7282,26 +6937,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_panel_tabs_are_labeled_and_styled_for_segmented_rail() {
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Overview), "Overview");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Launch), "Launch");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Steam), "Steam");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Workshop), "Workshop");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Checks), "Checks");
-        assert_eq!(
-            toggle_tool_panel(ToolPanelTab::Overview, ToolPanelTab::Launch),
-            ToolPanelTab::Launch
-        );
-        assert_eq!(
-            toggle_tool_panel(ToolPanelTab::Launch, ToolPanelTab::Launch),
-            ToolPanelTab::Overview
-        );
+    fn tool_actions_are_styled_for_screen_navigation() {
         assert_eq!(library_tool_tab_label(LibraryToolTab::None), "None");
         assert_eq!(library_tool_tab_label(LibraryToolTab::Presets), "Presets");
         assert_eq!(library_tool_tab_label(LibraryToolTab::Categories), "Cats");
         assert_eq!(library_tool_tab_label(LibraryToolTab::Config), "Config");
-        assert!(tool_panel_button_style(true).contains("font-weight: 650"));
-        assert!(tool_panel_button_style(false).contains("background: #111710"));
         assert!(tool_action_button_style(true).contains("background: #3a3b48"));
         assert!(tool_action_button_style(false).contains("justify-content: space-between"));
         assert!(launch_quick_button_style().contains("min-height: 42px"));
