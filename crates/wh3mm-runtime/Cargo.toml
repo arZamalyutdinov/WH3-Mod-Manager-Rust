@@ -1,0 +1,18 @@
+[package]
+name = "wh3mm-runtime"
+version = "0.1.0"
+description = "Filesystem and process adapters for the Rust WH3 Mod Manager migration"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wh3mm-core = { path = "../wh3mm-core" }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

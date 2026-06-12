@@ -1,0 +1,25 @@
+[workspace]
+members = [
+  "apps/wh3mm-steam-helper",
+  "crates/wh3mm-core",
+  "crates/wh3mm-runtime",
+  "crates/wh3mm-ui",
+]
+exclude = [
+  "apps/wh3mm-dioxus",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/arZamalyutdinov/WH3-Mod-Manager-Rust"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

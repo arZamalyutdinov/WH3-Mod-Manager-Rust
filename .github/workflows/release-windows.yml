@@ -1,0 +1,249 @@
+name: Release Windows
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0-alpha.1"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rust-release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build Rust Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          REF_NAME="${{ github.ref_name }}"
+          INPUT_TAG="${{ inputs.tag }}"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$EVENT_NAME" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="$REF_NAME"
+          else
+            SHORT_SHA="$(git rev-parse --short HEAD)"
+            TAG="v0.1.0-alpha-${SHORT_SHA}"
+          fi
+
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with 'v'"
+              exit 1
+              ;;
+          esac
+
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            apps/wh3mm-dioxus
+
+      - name: Configure vendored Steamworks library path
+        shell: pwsh
+        run: |
+          $candidateDirs = @(
+            "steamworks\dist\win64",
+            "vendor\steamworks\dist\win64"
+          )
+          $libDir = $candidateDirs | Where-Object { Test-Path (Join-Path $_ "steam_api64.lib") } | Select-Object -First 1
+          if ($libDir) {
+            $fullLibDir = (Resolve-Path $libDir).Path
+            "LIB=$fullLibDir;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "Using vendored Steamworks link library from $fullLibDir"
+          } else {
+            Write-Warning "steam_api64.lib was not found under steamworks/dist/win64 or vendor/steamworks/dist/win64. If the steamworks crate does not provide it, the native helper build may fail."
+          }
+
+      - name: Core formatting
+        run: cargo fmt --all --check
+
+      - name: Core tests
+        run: cargo test --workspace
+
+      - name: Core clippy
+        run: cargo clippy --workspace
+
+      - name: Dioxus formatting
+        run: cargo fmt --manifest-path apps/wh3mm-dioxus/Cargo.toml --check
+
+      - name: Dioxus check
+        run: cargo check --manifest-path apps/wh3mm-dioxus/Cargo.toml
+
+      - name: Dioxus tests
+        run: cargo test --manifest-path apps/wh3mm-dioxus/Cargo.toml
+
+      - name: Dioxus clippy
+        run: cargo clippy --manifest-path apps/wh3mm-dioxus/Cargo.toml
+
+      - name: Build Steam helper
+        run: cargo build --release -p wh3mm-steam-helper
+
+      - name: Build Dioxus shell
+        run: cargo build --release --manifest-path apps/wh3mm-dioxus/Cargo.toml
+
+      - name: Stage Windows payload
+        shell: pwsh
+        run: |
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $payload = Join-Path $repoRoot "out\windows-payload"
+          $helpers = Join-Path $payload "helpers"
+          $schemaOut = Join-Path $payload "schema"
+
+          Remove-Item -Recurse -Force $payload -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $helpers -Force | Out-Null
+          New-Item -ItemType Directory -Path $schemaOut -Force | Out-Null
+
+          Copy-Item "apps\wh3mm-dioxus\target\release\wh3mm-dioxus.exe" (Join-Path $payload "wh3mm-dioxus.exe") -Force
+          Copy-Item "target\release\wh3mm-steam-helper.exe" (Join-Path $helpers "wh3mm-steam-helper.exe") -Force
+          Copy-Item "schema\*" $schemaOut -Recurse -Force
+
+          $steamDllCandidates = @(
+            "steamworks\dist\win64\steam_api64.dll",
+            "vendor\steamworks\dist\win64\steam_api64.dll"
+          )
+          $steamDll = $steamDllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($steamDll) {
+            Copy-Item $steamDll (Join-Path $helpers "steam_api64.dll") -Force
+            Write-Host "Included Steam runtime DLL from $steamDll"
+          } else {
+            Write-Warning "steam_api64.dll was not found. Installer will still be built, but native Steam helper probe will report the missing DLL."
+          }
+
+          $steamLibCandidates = @(
+            "steamworks\dist\win64\steam_api64.lib",
+            "vendor\steamworks\dist\win64\steam_api64.lib"
+          )
+          $steamLib = $steamLibCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($steamLib) {
+            Write-Host "Steam import library is available for build/link validation at $steamLib"
+          }
+
+          Get-ChildItem -Path $payload -Recurse | Select-Object FullName
+
+      - name: Smoke staged Windows payload
+        shell: pwsh
+        run: .\scripts\windows-alpha-smoke.ps1 -PayloadDir out\windows-payload
+
+      - name: Create portable zip
+        id: zipmeta
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $zipOutDir = Join-Path $repoRoot "out\make\zip\win32\x64"
+          $zipPath = Join-Path $zipOutDir "WH3-Mod-Manager-Rust-$env:RELEASE_TAG-win32-x64.zip"
+
+          New-Item -ItemType Directory -Path $zipOutDir -Force | Out-Null
+          Compress-Archive -Path "out\windows-payload\*" -DestinationPath $zipPath -Force
+
+          "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip_name=$(Split-Path $zipPath -Leaf)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Created zip: $zipPath"
+
+      - name: Ensure NSIS is available
+        id: nsis
+        shell: pwsh
+        run: |
+          $candidateRoots = @(
+            [Environment]::GetFolderPath("ProgramFilesX86"),
+            [Environment]::GetFolderPath("ProgramFiles"),
+            "C:\Program Files (x86)",
+            "C:\Program Files"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $nsisExe = $candidateRoots |
+            ForEach-Object { Join-Path $_ "NSIS\makensis.exe" } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $nsisExe) {
+            choco install nsis -y --no-progress
+            $nsisExe = $candidateRoots |
+              ForEach-Object { Join-Path $_ "NSIS\makensis.exe" } |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+          }
+
+          if (-not $nsisExe) {
+            throw "NSIS was installed but makensis.exe was not found."
+          }
+
+          "nsis_exe=$nsisExe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          & $nsisExe /VERSION
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          NSIS_EXE: ${{ steps.nsis.outputs.nsis_exe }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $installerOutDir = Join-Path $repoRoot "out\installer"
+          $installerOutFile = Join-Path $installerOutDir "WH3-Mod-Manager-Rust-Installer-$env:RELEASE_TAG.exe"
+          $nsisScript = Join-Path $repoRoot "installer\windows\wh3mm-rust-installer.nsi"
+          $payloadDir = Join-Path $repoRoot "out\windows-payload"
+
+          New-Item -ItemType Directory -Path $installerOutDir -Force | Out-Null
+
+          & $env:NSIS_EXE `
+            "/DAPP_VERSION=$env:APP_VERSION" `
+            "/DPAYLOAD_DIR=$payloadDir" `
+            "/DOUT_FILE=$installerOutFile" `
+            $nsisScript
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wh3mm-rust-windows-${{ steps.meta.outputs.tag }}
+          path: |
+            out/make/zip/win32/**/*.zip
+            out/installer/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub release assets
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            out/make/zip/win32/**/*.zip
+            out/installer/*.exe
+          fail_on_unmatched_files: true

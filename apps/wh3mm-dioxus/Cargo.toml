@@ -1,0 +1,16 @@
+[package]
+name = "wh3mm-dioxus"
+version = "0.1.0"
+description = "Dioxus desktop shell for the Rust WH3 Mod Manager migration"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["desktop"] }
+rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wh3mm-core = { path = "../../crates/wh3mm-core" }
+wh3mm-runtime = { path = "../../crates/wh3mm-runtime" }
+wh3mm-ui = { path = "../../crates/wh3mm-ui" }

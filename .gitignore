@@ -1,0 +1,16 @@
+# Rust build output
+target/
+
+# Long-form local notes/docs
+*.md
+!/README.md
+
+# Local/editor noise
+.DS_Store
+.idea/
+
+# Runtime scratch
+*.log
+diagnostics/
+tempPacks/
+wh3mm_*.json
