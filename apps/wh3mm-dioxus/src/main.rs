@@ -248,6 +248,9 @@ enum WorkspacePage {
     ModDetail,
     Categories,
     Collections,
+    Checks,
+    Steam,
+    Workshop,
     Settings,
 }
 
@@ -439,23 +442,19 @@ fn App() -> Element {
                     span { style: header_metric_style(), "{hidden_mod_count} hidden" }
                     button {
                         title: "Alpha readiness: {alpha_readiness_summary}",
-                        style: top_icon_button_style(current_tool_panel == ToolPanelTab::Checks),
+                        style: top_icon_button_style(current_workspace_page == WorkspacePage::Checks),
                         onclick: move |_| {
-                            tool_panel_tab.set(toggle_tool_panel(
-                                current_tool_panel,
-                                ToolPanelTab::Checks,
-                            ));
+                            workspace_page.set(WorkspacePage::Checks);
+                            tool_panel_tab.set(ToolPanelTab::Overview);
                         },
                         "Checks"
                     }
                     button {
                         title: "Workshop commands",
-                        style: top_icon_button_style(current_tool_panel == ToolPanelTab::Workshop),
+                        style: top_icon_button_style(current_workspace_page == WorkspacePage::Workshop),
                         onclick: move |_| {
-                            tool_panel_tab.set(toggle_tool_panel(
-                                current_tool_panel,
-                                ToolPanelTab::Workshop,
-                            ));
+                            workspace_page.set(WorkspacePage::Workshop);
+                            tool_panel_tab.set(ToolPanelTab::Overview);
                         },
                         "Workshop"
                     }
@@ -1417,12 +1416,10 @@ fn App() -> Element {
                     div {
                         style: "margin-top: auto; padding-top: 18px; border-top: 1px solid #2b2d3a; display: grid; gap: 8px;",
                         button {
-                            style: library_utility_button_style(current_tool_panel == ToolPanelTab::Checks),
+                            style: library_utility_button_style(current_workspace_page == WorkspacePage::Checks),
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Checks,
-                                ));
+                                workspace_page.set(WorkspacePage::Checks);
+                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { style: nav_badge_style(), "CHK" }
                             span { "Alpha checks" }
@@ -1533,34 +1530,28 @@ fn App() -> Element {
                             span { ">" }
                         }
                         button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Checks),
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Checks,
-                                ));
+                                workspace_page.set(WorkspacePage::Checks);
+                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Alpha Checks" }
                             span { ">" }
                         }
                         button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Steam),
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Steam,
-                                ));
+                                workspace_page.set(WorkspacePage::Steam);
+                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Steam Helper" }
                             span { ">" }
                         }
                         button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Workshop),
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Workshop),
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Workshop,
-                                ));
+                                workspace_page.set(WorkspacePage::Workshop);
+                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Workshop Commands" }
                             span { ">" }
@@ -1917,13 +1908,307 @@ fn App() -> Element {
                     }
                     if current_tool_panel == ToolPanelTab::Checks {
                         AlphaReadinessPanel {
-                            report: alpha_readiness
+                            report: alpha_readiness.clone()
                         }
                     }
                 }
                 section {
                     style: "grid-area: content; min-width: 0; min-height: 0; overflow: auto; padding: 0; background: #11111a;",
-                    if current_workspace_page == WorkspacePage::Categories {
+                    if current_workspace_page == WorkspacePage::Checks {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Alpha Checks"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Readiness checks for the local app, schema, helper, Steam paths, and WH3 install."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            AlphaReadinessPanel {
+                                report: alpha_readiness.clone()
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Steam {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Steam Helper"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Configure the helper executable and refresh workshop metadata from a dedicated screen."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Helper Configuration"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    input {
+                                        style: settings_input_style(),
+                                        value: "{steam_helper_path}",
+                                        placeholder: "Steam helper executable path",
+                                        oninput: move |event| {
+                                            steam_helper_path.set(event.value());
+                                        },
+                                    }
+                                    select {
+                                        style: settings_input_style(),
+                                        value: "{steam_helper_backend}",
+                                        onchange: move |event| {
+                                            steam_helper_backend.set(event.value());
+                                        },
+                                        option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
+                                        option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                if let Some(helper_path) = pick_steam_helper_file() {
+                                                    let helper_path = helper_path.display().to_string();
+                                                    let backend = steam_helper_backend.read().clone();
+                                                    match save_steam_helper_settings(&helper_path, &backend) {
+                                                        Ok(status) => {
+                                                            steam_helper_path.set(helper_path);
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
+                                                    }
+                                                }
+                                            },
+                                            "Choose"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let helper_path = steam_helper_path.read().trim().to_string();
+                                                let backend = steam_helper_backend.read().clone();
+                                                match save_steam_helper_settings(&helper_path, &backend) {
+                                                    Ok(status) => mod_status.set(Some(status)),
+                                                    Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
+                                                }
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                match probe_steam_helper(&helper_path, &backend) {
+                                                    Ok(status) => mod_status.set(Some(status)),
+                                                    Err(error) => mod_status.set(Some(format!("Could not probe Steam helper: {error}"))),
+                                                }
+                                            },
+                                            "Probe"
+                                        }
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let mut next_state = app_state.read().clone();
+                                                match refresh_steam_from_helper(&mut next_state, &helper_path, &backend) {
+                                                    Ok(result) => {
+                                                        let command_panel = steam_refresh_panel_state(&result);
+                                                        let status = format!(
+                                                            "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.",
+                                                            result.subscribed_ids.len(),
+                                                            result.metadata.len(),
+                                                            result.requested_metadata_count,
+                                                            result.missing_metadata_count,
+                                                            result.filtered_unsubscribed_count,
+                                                            result.renamed_count
+                                                        );
+                                                        subscribed_workshop_ids.set(result.subscribed_ids);
+                                                        steam_metadata.set(result.metadata);
+                                                        last_steam_command.set(Some(command_panel));
+                                                        app_state.set(next_state);
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not refresh Steam: {error}"))),
+                                                }
+                                            },
+                                            "Refresh"
+                                        }
+                                    }
+                                    button {
+                                        style: settings_secondary_button_style(),
+                                        disabled: steam_helper_path.read().trim().is_empty(),
+                                        onclick: move |_| {
+                                            let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                            let backend = steam_helper_backend.read().clone();
+                                            match check_steam_updates_with_helper(&app_state.read(), &helper_path, &backend) {
+                                                Ok(result) => {
+                                                    mod_status.set(Some(steam_check_update_status(&result)));
+                                                    last_steam_command.set(Some(steam_check_update_panel_state(&result)));
+                                                }
+                                                Err(error) => mod_status.set(Some(format!("Could not check Steam updates: {error}"))),
+                                            }
+                                        },
+                                        "Check updates"
+                                    }
+                                }
+                            }
+                            SteamMetadataPanel {
+                                helper_path: steam_helper_path.read().clone(),
+                                subscribed_ids: subscribed_workshop_ids.read().clone(),
+                                metadata: steam_metadata.read().clone(),
+                            }
+                            if let Some(command_panel) = last_steam_command.read().clone() {
+                                SteamCommandPanel { state: command_panel }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Workshop {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Workshop Commands"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Run bounded subscribe, download, unsubscribe, and resubscribe actions for workshop IDs."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Command Queue"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    input {
+                                        style: settings_input_style(),
+                                        value: "{steam_command_ids}",
+                                        placeholder: "Workshop IDs separated by spaces, commas, or new lines",
+                                        oninput: move |event| {
+                                            steam_command_ids.set(event.value());
+                                        },
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                match run_steam_command_with_helper(SteamCommandAction::Subscribe, &helper_path, &backend, &ids, &mods) {
+                                                    Ok(result) => {
+                                                        mod_status.set(Some(result.status));
+                                                        last_steam_command.set(Some(result.panel));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not subscribe: {error}"))),
+                                                }
+                                            },
+                                            "Subscribe"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                match run_steam_command_with_helper(SteamCommandAction::Download, &helper_path, &backend, &ids, &mods) {
+                                                    Ok(result) => {
+                                                        mod_status.set(Some(result.status));
+                                                        last_steam_command.set(Some(result.panel));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not download: {error}"))),
+                                                }
+                                            },
+                                            "Download"
+                                        }
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                match run_steam_command_with_helper(SteamCommandAction::Unsubscribe, &helper_path, &backend, &ids, &mods) {
+                                                    Ok(result) => {
+                                                        mod_status.set(Some(result.status));
+                                                        last_steam_command.set(Some(result.panel));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not unsubscribe: {error}"))),
+                                                }
+                                            },
+                                            "Unsubscribe"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                match run_steam_command_with_helper(SteamCommandAction::Resubscribe, &helper_path, &backend, &ids, &mods) {
+                                                    Ok(result) => {
+                                                        mod_status.set(Some(result.status));
+                                                        last_steam_command.set(Some(result.panel));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not resubscribe: {error}"))),
+                                                }
+                                            },
+                                            "Resubscribe"
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(command_panel) = last_steam_command.read().clone() {
+                                SteamCommandPanel { state: command_panel }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Categories {
                         header {
                             style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
                             h2 {
@@ -3647,6 +3932,7 @@ fn tool_panel_tab_label(tab: ToolPanelTab) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn toggle_tool_panel(current: ToolPanelTab, target: ToolPanelTab) -> ToolPanelTab {
     if current == target {
         ToolPanelTab::Overview
