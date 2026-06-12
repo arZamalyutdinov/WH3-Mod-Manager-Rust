@@ -289,6 +289,10 @@ mod tests {
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn path_ends_with(path: &str, suffix: &str) -> bool {
+        path.replace('\\', "/").ends_with(suffix)
+    }
+
     #[test]
     fn discovers_data_and_extra_pack_files() {
         let root = temp_root("data-extra");
@@ -437,15 +441,16 @@ mod tests {
 
         assert_eq!(mods.len(), 2);
         assert!(mods.iter().any(|mod_record| {
-            mod_record.identity.path.ends_with("data/shared.pack") && mod_record.tags == ["data"]
+            path_ends_with(&mod_record.identity.path, "data/shared.pack")
+                && mod_record.tags == ["data"]
         }));
         assert!(mods.iter().any(|mod_record| {
-            mod_record.identity.path.ends_with("workshop_only.pack")
+            path_ends_with(&mod_record.identity.path, "workshop_only.pack")
                 && mod_record.tags == ["workshop", "steam"]
         }));
         assert!(!mods.iter().any(|mod_record| {
-            mod_record.identity.path.ends_with("123456789/shared.pack")
-                || mod_record.identity.path.ends_with("extra/shared.pack")
+            path_ends_with(&mod_record.identity.path, "123456789/shared.pack")
+                || path_ends_with(&mod_record.identity.path, "extra/shared.pack")
         }));
 
         fs::remove_dir_all(root).ok();
@@ -469,20 +474,15 @@ mod tests {
 
         assert_eq!(mods.len(), 2);
         assert!(mods.iter().any(|mod_record| {
-            mod_record
-                .identity
-                .path
-                .ends_with("modding/override_shared.pack")
+            path_ends_with(&mod_record.identity.path, "modding/override_shared.pack")
                 && mod_record.tags == ["data-modding"]
         }));
         assert!(mods.iter().any(|mod_record| {
-            mod_record.identity.path.ends_with("data/data_only.pack") && mod_record.tags == ["data"]
+            path_ends_with(&mod_record.identity.path, "data/data_only.pack")
+                && mod_record.tags == ["data"]
         }));
         assert!(!mods.iter().any(|mod_record| {
-            mod_record
-                .identity
-                .path
-                .ends_with("data/override_shared.pack")
+            path_ends_with(&mod_record.identity.path, "data/override_shared.pack")
         }));
 
         fs::remove_dir_all(root).ok();

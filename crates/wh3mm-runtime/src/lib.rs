@@ -2202,18 +2202,21 @@ mod tests {
         WindowsLaunchPlan, WorkshopModData,
     };
 
+    #[cfg(not(windows))]
+    use super::discover_steam_root_from_windows_registry;
     use super::{
         LaunchPreparationOptions, SteamResubscribeSafetyConfig, SteamWorkshopCheckStateResult,
         SteamWorkshopCommandAdapter, SteamWorkshopCommandResult, SteamWorkshopCommandRunner,
-        SteamWorkshopCommandSafetyConfig, SteamWorkshopHelperProcessConfig,
-        SteamWorkshopHelperProcessRunner, TsSteamHelperMetadataAdapter, TsSteamHelperRunner,
-        WH3_STEAM_APP_ID, WrittenPackFile, discover_steam_root_from_windows_registry,
-        discover_wh3_steam_install_from_steam_root, discover_wh3_workshop_folder,
-        executable_path_for_prepared_launch, parse_steam_install_path_from_reg_query_output,
+        SteamWorkshopCommandSafetyConfig, TsSteamHelperMetadataAdapter, TsSteamHelperRunner,
+        WH3_STEAM_APP_ID, WrittenPackFile, discover_wh3_steam_install_from_steam_root,
+        discover_wh3_workshop_folder, executable_path_for_prepared_launch,
+        parse_steam_install_path_from_reg_query_output,
         parse_steam_libraries_from_libraryfolders_vdf, prepare_windows_launch_files,
         remove_loaded_workshop_mod_dirs, resubscribe_with_cleanup_and_verification,
         validate_wh3_game_folder, validate_windows_game_folder,
     };
+    #[cfg(unix)]
+    use super::{SteamWorkshopHelperProcessConfig, SteamWorkshopHelperProcessRunner};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
