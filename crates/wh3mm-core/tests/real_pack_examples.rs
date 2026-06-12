@@ -4,7 +4,7 @@
 //! Windows Steam install. They catch format assumptions that synthetic packs
 //! cannot.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use wh3mm_core::{
     ModIdentity, ModRecord, PackFileMetadata, PackReadOptions,
@@ -20,7 +20,11 @@ const REAL_PACK_EXAMPLES: &[&str] = &[
 
 #[test]
 fn reads_real_steam_pack_indexes_and_lossy_metadata() {
-    for pack_path in real_pack_paths() {
+    let Some(pack_paths) = real_pack_paths() else {
+        return;
+    };
+
+    for pack_path in pack_paths {
         let index = read_pack_index(&pack_path, &PackReadOptions::default())
             .unwrap_or_else(|error| panic!("failed to read index for {pack_path:?}: {error:?}"));
         assert!(
@@ -50,7 +54,11 @@ fn reads_real_steam_pack_indexes_and_lossy_metadata() {
 
 #[test]
 fn real_steam_db_metadata_is_decodable_without_lossy_fallback() {
-    for pack_path in real_pack_paths() {
+    let Some(pack_paths) = real_pack_paths() else {
+        return;
+    };
+
+    for pack_path in pack_paths {
         let index = read_pack_index(&pack_path, &PackReadOptions::default())
             .unwrap_or_else(|error| panic!("failed to read index for {pack_path:?}: {error:?}"));
         let db_entries = index
@@ -77,8 +85,11 @@ fn real_steam_db_metadata_is_decodable_without_lossy_fallback() {
 #[test]
 fn previews_first_schema_resolvable_db_table_in_real_steam_packs() {
     let schema = load_schema_file(real_schema_path()).expect("failed to load WH3 schema");
+    let Some(pack_paths) = real_pack_paths() else {
+        return;
+    };
 
-    for pack_path in real_pack_paths() {
+    for pack_path in pack_paths {
         let contents = read_pack_contents_lossy(&pack_path, &PackReadOptions::default())
             .unwrap_or_else(|error| {
                 panic!("failed to read lossy contents for {pack_path:?}: {error:?}")
@@ -120,7 +131,10 @@ fn previews_first_schema_resolvable_db_table_in_real_steam_packs() {
 #[test]
 fn analyzes_real_steam_packs_with_schema_backed_compatibility() {
     let schema = load_schema_file(real_schema_path()).expect("failed to load WH3 schema");
-    let mods = real_pack_paths()
+    let Some(pack_paths) = real_pack_paths() else {
+        return;
+    };
+    let mods = pack_paths
         .into_iter()
         .map(|pack_path| {
             let file_name = pack_path
@@ -158,25 +172,38 @@ fn analyzes_real_steam_packs_with_schema_backed_compatibility() {
     );
 }
 
-fn real_pack_paths() -> Vec<PathBuf> {
-    REAL_PACK_EXAMPLES
+fn real_pack_paths() -> Option<Vec<PathBuf>> {
+    let paths = REAL_PACK_EXAMPLES
         .iter()
         .map(|file_name| real_pack_root().join(file_name))
-        .inspect(|path| assert_real_pack_exists(path))
-        .collect()
+        .collect::<Vec<_>>();
+    let missing_paths = paths
+        .iter()
+        .filter(|path| !path.is_file())
+        .collect::<Vec<_>>();
+    if missing_paths.is_empty() {
+        Some(paths)
+    } else {
+        eprintln!(
+            "skipping real Steam pack fixture tests; missing fixtures: {}",
+            missing_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        None
+    }
 }
 
 fn real_pack_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pack_examples_from_steam")
+    std::env::var_os("WH3MM_REAL_PACK_FIXTURES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pack_examples_from_steam")
+        })
 }
 
 fn real_schema_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schema/schema_wh3.json.zst")
-}
-
-fn assert_real_pack_exists(path: &Path) {
-    assert!(
-        path.exists(),
-        "missing real pack fixture: {path:?}. Expected pack_examples_from_steam to be present at repo root"
-    );
 }
