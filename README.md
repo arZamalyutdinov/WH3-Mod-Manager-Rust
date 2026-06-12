@@ -38,12 +38,15 @@ Live Windows validation is still required before calling this alpha-stable.
 
 The Windows workflow is `.github/workflows/release-windows.yml`.
 
-Manual `workflow_dispatch` runs build downloadable GitHub Actions artifacts:
+Manual `workflow_dispatch` builds downloadable GitHub Actions artifacts and
+publishes the same files to a GitHub Release:
 
 - `WH3-Mod-Manager-Rust-<tag>-win32-x64.zip`
 - `WH3-Mod-Manager-Rust-Installer-<tag>.exe`
 
-Tag pushes publish the same zip and installer to GitHub Releases.
+Manual runs without an explicit tag auto-resolve the next release tag in the
+same style as the TypeScript app workflow. Tag pushes publish using the pushed
+tag.
 
 The staged payload contains:
 

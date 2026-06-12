@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0-alpha.1"
+        description: "Release tag (for example: v0.1.0-alpha.1)"
         required: false
         type: string
 
@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   build-and-release:
-    name: Build Rust Windows installer
+    name: Build Windows artifact and publish release
+    if: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') || github.actor != 'github-actions[bot]' }}
     runs-on: windows-latest
     timeout-minutes: 90
 
@@ -42,11 +43,31 @@ jobs:
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
+            SOURCE="manual-input"
           elif [ "$EVENT_NAME" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="$REF_NAME"
+            SOURCE="push-tag"
           else
-            SHORT_SHA="$(git rev-parse --short HEAD)"
-            TAG="v0.1.0-alpha-${SHORT_SHA}"
+            LATEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n1)"
+            if [ -z "$LATEST_TAG" ]; then
+              TAG="v0.0.1"
+            else
+              if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                echo "Latest tag '$LATEST_TAG' does not match expected vMAJOR.MINOR.PATCH format."
+                exit 1
+              fi
+              MAJOR="${BASH_REMATCH[1]}"
+              MINOR="${BASH_REMATCH[2]}"
+              PATCH="${BASH_REMATCH[3]}"
+              NEXT_PATCH=$((PATCH + 1))
+              TAG="v${MAJOR}.${MINOR}.${NEXT_PATCH}"
+            fi
+            SOURCE="auto-increment"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "Release tag is empty"
+            exit 1
           fi
 
           case "$TAG" in
@@ -60,7 +81,9 @@ jobs:
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_source=$SOURCE" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $TAG"
+          echo "Tag source: $SOURCE"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -237,7 +260,6 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub release assets
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
