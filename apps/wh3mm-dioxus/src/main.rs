@@ -849,7 +849,7 @@ fn App() -> Element {
                         }
                     }
                     }
-                    } else if current_workspace_page == WorkspacePage::ModDetail {
+                    } else if false {
                         header {
                             style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 16px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
                             div {
@@ -1123,6 +1123,266 @@ fn App() -> Element {
                                 }
                             }
                         }
+                    } else if current_workspace_page == WorkspacePage::ModDetail {
+                        header {
+                            style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 32px 40px 20px; border-bottom: 1px solid #263041;",
+                            div {
+                                style: "min-width: 0; display: grid; gap: 7px;",
+                                h2 {
+                                    style: "font-size: 25px; line-height: 32px; margin: 0; color: #f8fafc;",
+                                    "Mod Detail"
+                                }
+                                div {
+                                    style: "font-size: 14px; line-height: 20px; color: #bccabb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                    if let Some(selected_mod) = selected_mod.as_ref() {
+                                        "{selected_mod.display_name}"
+                                    } else {
+                                        "Select a mod from the archive to inspect it here."
+                                    }
+                                }
+                            }
+                            button {
+                                style: settings_secondary_button_style(),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Mods);
+                                },
+                                "Back to mods"
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303746; background: #171b24; border-radius: 4px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 22px; max-width: 980px; padding: 18px 40px 40px;",
+                            if let Some(selected_mod) = selected_mod.clone() {
+                                section {
+                                    style: "display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 22px; align-items: start;",
+                                    div {
+                                        style: "display: grid; gap: 14px; min-width: 0;",
+                                        div {
+                                            style: detail_source_tile_style(&selected_mod),
+                                            div {
+                                                style: "font-size: 30px; line-height: 34px; font-weight: 800; letter-spacing: 0;",
+                                                "{mod_source_label(&selected_mod)}"
+                                            }
+                                            div {
+                                                style: "font-size: 12px; line-height: 16px; color: #d7ded9;",
+                                                "{mod_state_label(&selected_mod)}"
+                                            }
+                                        }
+                                        div {
+                                            style: settings_card_style(),
+                                            div {
+                                                style: "display: grid; gap: 10px; padding: 14px; font-size: 13px;",
+                                                div {
+                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
+                                                    span { "Author" }
+                                                    strong {
+                                                        style: "color: #f8fafc; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                                        "{mod_author_label(&selected_mod, &current_steam_metadata)}"
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
+                                                    span { "Updated" }
+                                                    strong {
+                                                        style: "color: #f8fafc; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                                        "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}"
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
+                                                    span { "Source" }
+                                                    strong {
+                                                        style: "color: #f8fafc;",
+                                                        "{mod_source_label(&selected_mod)}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; gap: 18px; min-width: 0;",
+                                        div {
+                                            style: "display: grid; gap: 8px; min-width: 0;",
+                                            h3 {
+                                                style: "font-size: 28px; line-height: 34px; margin: 0; color: #f8fafc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                                "{selected_mod.display_name}"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; color: #aeb8c8; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
+                                                "{selected_mod.subtitle}"
+                                            }
+                                        }
+                                        div {
+                                            style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "State" }
+                                                strong { "{mod_state_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Categories" }
+                                                strong { "{mod_categories_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Tags" }
+                                                strong { "{selected_mod.tags.len()}" }
+                                            }
+                                        }
+                                        div {
+                                            style: "display: grid; gap: 8px;",
+                                            div {
+                                                style: "font-size: 11px; line-height: 14px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 0;",
+                                                "Tags"
+                                            }
+                                            if selected_mod.tags.is_empty() {
+                                                div {
+                                                    style: "font-size: 13px; color: #778194;",
+                                                    "No tags recorded"
+                                                }
+                                            } else {
+                                                div {
+                                                    style: "display: flex; flex-wrap: wrap; gap: 6px;",
+                                                    for tag in selected_mod.tags.iter() {
+                                                        span {
+                                                            key: "{tag}",
+                                                            style: "border: 1px solid #303746; border-radius: 4px; padding: 4px 7px; font-size: 12px; color: #d8ded8; background: #1f2430;",
+                                                            "{tag}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div {
+                                            style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;",
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                disabled: selected_mod.locked,
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| {
+                                                        let mut next_state = app_state.read().clone();
+                                                        if let Some(identity) = identity_for_mod_key(&next_state, &mod_key) {
+                                                            match next_state.apply(CoreCommand::ToggleMod { identity }) {
+                                                                Ok(_) => {
+                                                                    match save_mod_state(&next_state) {
+                                                                        Ok(status) => mod_status.set(Some(status)),
+                                                                        Err(error) => mod_status.set(Some(format!("Could not save mod state: {}", error.message))),
+                                                                    }
+                                                                    app_state.set(next_state);
+                                                                }
+                                                                Err(error) => mod_status.set(Some(format!("Could not toggle mod: {}", error.message))),
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                if selected_mod.enabled {
+                                                    "Disable"
+                                                } else {
+                                                    "Enable"
+                                                }
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| toggle_mod_hidden_by_key(&mut app_state, &mut mod_status, &mod_key)
+                                                },
+                                                if selected_mod.hidden {
+                                                    "Show"
+                                                } else {
+                                                    "Hide"
+                                                }
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                disabled: selected_mod.locked,
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| move_mod_by_delta(&mut app_state, &mut mod_status, &mod_key, -1)
+                                                },
+                                                "Move up"
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                disabled: selected_mod.locked,
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| move_mod_by_delta(&mut app_state, &mut mod_status, &mod_key, 1)
+                                                },
+                                                "Move down"
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| toggle_mod_lock_by_key(&mut app_state, &mut mod_status, &mod_key)
+                                                },
+                                                if selected_mod.locked {
+                                                    "Unlock"
+                                                } else {
+                                                    "Lock"
+                                                }
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| {
+                                                        let category = category_name.read().trim().to_string();
+                                                        let color = category_color.read().trim().to_string();
+                                                        add_mod_category_by_key(
+                                                            &mut app_state,
+                                                            &mut mod_status,
+                                                            &mut saved_categories,
+                                                            &mod_key,
+                                                            &category,
+                                                            &color,
+                                                        )
+                                                    }
+                                                },
+                                                "Add category"
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| {
+                                                        let category = category_name.read().trim().to_string();
+                                                        remove_mod_category_by_key(
+                                                            &mut app_state,
+                                                            &mut mod_status,
+                                                            &mut saved_categories,
+                                                            &mod_key,
+                                                            &category,
+                                                        )
+                                                    }
+                                                },
+                                                "Remove category"
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                section {
+                                    style: "display: grid; gap: 12px; border: 1px solid #293142; border-radius: 4px; background: #171b24; padding: 22px 20px; color: #aeb8c8;",
+                                    h3 {
+                                        style: "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;",
+                                        "No mod selected"
+                                    }
+                                    div {
+                                        style: "font-size: 13px; line-height: 18px;",
+                                        "Load game mods or open a mod folder, then select a row from the archive."
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         div {
                             style: "display: grid; gap: 8px; margin-top: 28px; padding-top: 18px; border-top: 1px solid #2b2d3a;",
@@ -1241,12 +1501,11 @@ fn App() -> Element {
                     div {
                         style: "display: grid; gap: 10px; margin-bottom: 18px;",
                         button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Launch),
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Settings),
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Launch,
-                                ));
+                                workspace_page.set(WorkspacePage::Settings);
+                                library_tool_tab.set(LibraryToolTab::Config);
+                                tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Launch Options" }
                             span { ">" }
