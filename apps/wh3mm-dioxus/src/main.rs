@@ -246,6 +246,8 @@ enum LibraryToolTab {
 enum WorkspacePage {
     Mods,
     ModDetail,
+    Categories,
+    Collections,
     Settings,
 }
 
@@ -382,6 +384,18 @@ fn App() -> Element {
     let alpha_readiness_summary = alpha_readiness.summary.clone();
     let saved_category_count = saved_categories.read().len();
     let saved_preset_count = saved_presets.read().len();
+    let category_summaries = saved_categories
+        .read()
+        .iter()
+        .map(|category| {
+            let assigned_count = all_mod_rows
+                .iter()
+                .filter(|mod_row| mod_row.categories.iter().any(|name| name == category))
+                .count();
+            (category.clone(), assigned_count)
+        })
+        .collect::<Vec<_>>();
+    let preset_summaries = saved_presets.read().clone();
     let current_steam_metadata = steam_metadata.read().clone();
     let current_time_ms = current_unix_ms();
     let diagnostics_log_path_label = app_diagnostic_log_path().display().to_string();
@@ -450,7 +464,7 @@ fn App() -> Element {
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Settings),
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Settings);
-                            library_tool_tab.set(LibraryToolTab::Config);
+                            library_tool_tab.set(LibraryToolTab::None);
                         },
                         "Settings"
                     }
@@ -513,9 +527,9 @@ fn App() -> Element {
                                 current_library_tool,
                             )),
                             onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Mods);
+                                workspace_page.set(WorkspacePage::Categories);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::Categories);
+                                library_tool_tab.set(LibraryToolTab::None);
                             },
                             span { style: nav_badge_style(), "CAT" }
                             span { "Categories" }
@@ -529,9 +543,9 @@ fn App() -> Element {
                                 current_library_tool,
                             )),
                             onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Mods);
+                                workspace_page.set(WorkspacePage::Collections);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::Presets);
+                                library_tool_tab.set(LibraryToolTab::None);
                             },
                             span { style: nav_badge_style(), "COL" }
                             span { "Collections" }
@@ -546,7 +560,7 @@ fn App() -> Element {
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
+                                library_tool_tab.set(LibraryToolTab::None);
                             },
                             span { style: nav_badge_style(), "SET" }
                             span { "Settings" }
@@ -1417,7 +1431,7 @@ fn App() -> Element {
                             style: library_utility_button_style(current_workspace_page == WorkspacePage::Settings),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
+                                library_tool_tab.set(LibraryToolTab::None);
                             },
                             span { style: nav_badge_style(), "CFG" }
                             span { "Settings" }
@@ -1471,7 +1485,7 @@ fn App() -> Element {
                             if save_name.is_empty() {
                                 mod_status.set(Some("Set a campaign save name in Settings before continuing a save.".to_string()));
                                 workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
+                                library_tool_tab.set(LibraryToolTab::None);
                                 return;
                             }
                             let selected_game_folder = select_game_folder(game_folder.read().clone());
@@ -1504,7 +1518,7 @@ fn App() -> Element {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Settings),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
+                                library_tool_tab.set(LibraryToolTab::None);
                                 tool_panel_tab.set(ToolPanelTab::Overview);
                             },
                             span { "Launch Options" }
@@ -1909,7 +1923,355 @@ fn App() -> Element {
                 }
                 section {
                     style: "grid-area: content; min-width: 0; min-height: 0; overflow: auto; padding: 0; background: #11111a;",
-                    if current_workspace_page == WorkspacePage::Settings {
+                    if current_workspace_page == WorkspacePage::Categories {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Categories"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Manage category labels used by the archive and mod detail screens."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Category Editor"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(160px, 0.8fr); gap: 12px;",
+                                        input {
+                                            style: settings_input_style(),
+                                            value: "{category_name}",
+                                            placeholder: "Category name",
+                                            oninput: move |event| {
+                                                category_name.set(event.value());
+                                            },
+                                        }
+                                        select {
+                                            style: settings_input_style(),
+                                            value: "{category_color}",
+                                            onchange: move |event| {
+                                                category_color.set(event.value());
+                                            },
+                                            option { value: "blue", "Blue" }
+                                            option { value: "green", "Green" }
+                                            option { value: "yellow", "Yellow" }
+                                            option { value: "red", "Red" }
+                                            option { value: "purple", "Purple" }
+                                            option { value: "gray", "Gray" }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;",
+                                        select {
+                                            style: settings_input_style(),
+                                            value: "{selected_category_name}",
+                                            onchange: move |event| {
+                                                let value = event.value();
+                                                if !value.trim().is_empty() {
+                                                    selected_category_name.set(value.clone());
+                                                    category_name.set(value);
+                                                }
+                                            },
+                                            option {
+                                                value: "",
+                                                "Saved categories"
+                                            }
+                                            for saved_category in saved_categories.read().iter() {
+                                                option {
+                                                    value: "{saved_category}",
+                                                    "{saved_category}"
+                                                }
+                                            }
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                selected_category_name.set("Core".to_string());
+                                                category_name.set("Core".to_string());
+                                                category_color.set("blue".to_string());
+                                            },
+                                            "Reset"
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            onclick: move |_| {
+                                                let category = category_name.read().trim().to_string();
+                                                let color = category_color.read().trim().to_string();
+                                                match save_category_definition(&category, &color) {
+                                                    Ok(status) => {
+                                                        saved_categories.set(load_category_names());
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not save category: {}", error.message))),
+                                                }
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let old_category = selected_category_name.read().trim().to_string();
+                                                let new_category = category_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match rename_category_definition(&old_category, &new_category, &state) {
+                                                    Ok((mods, status)) => {
+                                                        let mut next_state = app_state.read().clone();
+                                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                        app_state.set(next_state);
+                                                        selected_category_name.set(new_category);
+                                                        saved_categories.set(load_category_names());
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not rename category: {}", error.message))),
+                                                }
+                                            },
+                                            "Rename"
+                                        }
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            onclick: move |_| {
+                                                let category = selected_category_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match delete_category_definition(&category, &state) {
+                                                    Ok((mods, status)) => {
+                                                        let mut next_state = app_state.read().clone();
+                                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                        app_state.set(next_state);
+                                                        let names = load_category_names();
+                                                        let next_category = names.first().cloned().unwrap_or_else(|| "Core".to_string());
+                                                        category_name.set(next_category.clone());
+                                                        selected_category_name.set(next_category);
+                                                        saved_categories.set(names);
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not delete category: {}", error.message))),
+                                                }
+                                            },
+                                            "Delete"
+                                        }
+                                    }
+                                }
+                            }
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Saved Categories"
+                                    }
+                                    span {
+                                        style: "font-size: 12px; color: #aeb8c8;",
+                                        "{saved_category_count} total"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    if category_summaries.is_empty() {
+                                        div {
+                                            style: "font-size: 13px; color: #9fb0c0;",
+                                            "No category definitions saved yet."
+                                        }
+                                    } else {
+                                        div {
+                                            style: "display: grid; gap: 8px;",
+                                            for (category, assigned_count) in category_summaries.iter() {
+                                                div {
+                                                    key: "{category}",
+                                                    style: collection_row_style(),
+                                                    strong { "{category}" }
+                                                    span { "{assigned_count} assigned mods" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Collections {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Collections"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Save, load, and delete named mod presets without leaving the central workspace."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Preset Editor"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    input {
+                                        style: settings_input_style(),
+                                        value: "{preset_name}",
+                                        placeholder: "Collection / preset name",
+                                        oninput: move |event| {
+                                            preset_name.set(event.value());
+                                        },
+                                    }
+                                    select {
+                                        style: settings_input_style(),
+                                        value: "{preset_name}",
+                                        onchange: move |event| {
+                                            let value = event.value();
+                                            if !value.trim().is_empty() {
+                                                preset_name.set(value);
+                                            }
+                                        },
+                                        option {
+                                            value: "",
+                                            "Saved collections"
+                                        }
+                                        for saved_preset in saved_presets.read().iter() {
+                                            option {
+                                                value: "{saved_preset}",
+                                                "{saved_preset}"
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            onclick: move |_| {
+                                                let name = preset_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match save_named_preset(&name, &state) {
+                                                    Ok(status) => {
+                                                        saved_presets.set(load_preset_names());
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not save preset: {}", error.message))),
+                                                }
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let name = preset_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match load_named_preset(&name, &state) {
+                                                    Ok((mods, status)) => {
+                                                        let mut next_state = state.clone();
+                                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                        match save_mod_state(&next_state) {
+                                                            Ok(save_status) => mod_status.set(Some(format!("{status} {save_status}"))),
+                                                            Err(error) => mod_status.set(Some(format!("{status} Could not save mod state: {}", error.message))),
+                                                        }
+                                                        app_state.set(next_state);
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not load preset: {}", error.message))),
+                                                }
+                                            },
+                                            "Load"
+                                        }
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            onclick: move |_| {
+                                                let name = preset_name.read().trim().to_string();
+                                                match delete_named_preset(&name) {
+                                                    Ok(status) => {
+                                                        let names = load_preset_names();
+                                                        let next_name = if names.iter().any(|saved_name| saved_name == &name) {
+                                                            name
+                                                        } else {
+                                                            names.first().cloned().unwrap_or_else(|| "Prototype preset".to_string())
+                                                        };
+                                                        preset_name.set(next_name);
+                                                        saved_presets.set(names);
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not delete preset: {}", error.message))),
+                                                }
+                                            },
+                                            "Delete"
+                                        }
+                                    }
+                                }
+                            }
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Saved Collections"
+                                    }
+                                    span {
+                                        style: "font-size: 12px; color: #aeb8c8;",
+                                        "{saved_preset_count} total"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    if preset_summaries.is_empty() {
+                                        div {
+                                            style: "font-size: 13px; color: #9fb0c0;",
+                                            "No collections saved yet."
+                                        }
+                                    } else {
+                                        div {
+                                            style: "display: grid; gap: 8px;",
+                                            for preset in preset_summaries.iter() {
+                                                button {
+                                                    key: "{preset}",
+                                                    style: collection_row_button_style(preset_name.read().as_str() == preset.as_str()),
+                                                    onclick: {
+                                                        let preset = preset.clone();
+                                                        move |_| {
+                                                            preset_name.set(preset.clone());
+                                                        }
+                                                    },
+                                                    strong { "{preset}" }
+                                                    span { "Saved load order" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Settings {
                         header {
                             style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
                             h2 {
@@ -3018,12 +3380,8 @@ fn library_nav_active(
                 && mod_filter == ModListFilter::Enabled
                 && library_tool == LibraryToolTab::None
         }
-        LibraryNavTarget::Categories => {
-            workspace_page == WorkspacePage::Mods && library_tool == LibraryToolTab::Categories
-        }
-        LibraryNavTarget::Collections => {
-            workspace_page == WorkspacePage::Mods && library_tool == LibraryToolTab::Presets
-        }
+        LibraryNavTarget::Categories => workspace_page == WorkspacePage::Categories,
+        LibraryNavTarget::Collections => workspace_page == WorkspacePage::Collections,
         LibraryNavTarget::Settings => workspace_page == WorkspacePage::Settings,
     }
 }
@@ -3086,6 +3444,26 @@ fn settings_path_box_style() -> &'static str {
 
 fn settings_secondary_button_style() -> &'static str {
     "border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 14px;"
+}
+
+fn settings_primary_button_style() -> &'static str {
+    "border: 1px solid #4ade80; background: #65f58b; color: #06210d; border-radius: 5px; padding: 10px 12px; font-size: 14px; font-weight: 800;"
+}
+
+fn settings_danger_button_style() -> &'static str {
+    "border: 1px solid #7f1d1d; background: #451a1a; color: #fecaca; border-radius: 5px; padding: 10px 12px; font-size: 14px;"
+}
+
+fn collection_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; border: 1px solid #303746; background: #171b24; border-radius: 5px; padding: 12px 14px; color: #e5e7eb; font-size: 14px;"
+}
+
+fn collection_row_button_style(active: bool) -> &'static str {
+    if active {
+        "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 5px; padding: 12px 14px; text-align: left; font-size: 14px;"
+    } else {
+        "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; border: 1px solid #303746; background: #171b24; color: #e5e7eb; border-radius: 5px; padding: 12px 14px; text-align: left; font-size: 14px;"
+    }
 }
 
 fn archive_toolbar_button_style(primary: bool) -> &'static str {
@@ -6482,29 +6860,29 @@ mod tests {
         apply_saved_or_existing_game_mod_list, apply_steam_metadata_to_mods,
         archive_filter_bar_style, archive_filter_button_style, archive_table_header_style,
         archive_toolbar_button_style, build_alpha_readiness_report_with_paths,
-        build_windows_launch_options, continue_save_button_style, delete_category_config_for_state,
-        dependency_names_summary, detail_action_button_style, detail_metric_style,
-        detail_source_tile_style, diagnostic_snapshot_text, enabled_pack_paths_for_start_game,
-        fetch_steam_metadata_safely, first_existing_steam_helper_path, generated_pack_details,
-        header_metric_style, initial_app_state, launch_options_from_legacy_ts,
-        launch_priority_status, launch_quick_button_style, launch_state_fingerprint,
-        launch_status_with_close_on_play, legacy_ts_launch_option_import_summary,
-        legacy_ts_launch_options_from_state, library_nav_active, library_tool_tab_label,
-        library_utility_button_style, mod_author_label, mod_categories_label,
-        mod_enable_button_style, mod_list_filter_label, mod_row_matches_filter,
-        mod_row_matches_query, mod_row_style, mod_source_label, mod_state_label, mod_updated_label,
-        mod_workshop_id_from_row, nav_badge_style, nav_button_style,
-        normalize_steam_helper_backend, read_existing_launch_mod_list_pack_names,
+        build_windows_launch_options, collection_row_button_style, collection_row_style,
+        continue_save_button_style, delete_category_config_for_state, dependency_names_summary,
+        detail_action_button_style, detail_metric_style, detail_source_tile_style,
+        diagnostic_snapshot_text, enabled_pack_paths_for_start_game, fetch_steam_metadata_safely,
+        first_existing_steam_helper_path, generated_pack_details, header_metric_style,
+        initial_app_state, launch_options_from_legacy_ts, launch_priority_status,
+        launch_quick_button_style, launch_state_fingerprint, launch_status_with_close_on_play,
+        legacy_ts_launch_option_import_summary, legacy_ts_launch_options_from_state,
+        library_nav_active, library_tool_tab_label, library_utility_button_style, mod_author_label,
+        mod_categories_label, mod_enable_button_style, mod_list_filter_label,
+        mod_row_matches_filter, mod_row_matches_query, mod_row_style, mod_source_label,
+        mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_badge_style,
+        nav_button_style, normalize_steam_helper_backend, read_existing_launch_mod_list_pack_names,
         relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
         run_steam_command_action, save_on_last_game_launch_preset_to_path,
         selected_or_first_mod_row, selected_pack_from_optional_arg, settings_card_style,
-        settings_input_style, source_tile_style, start_game_source_pack_paths,
-        start_game_temp_packs_dir_for_config_dir, steam_check_update_panel_state,
-        steam_check_update_status, steam_command_panel_state, steam_command_status,
-        steam_helper_process_config, steam_probe_status, steam_refresh_panel_state,
-        steam_resubscribe_panel_state, steam_resubscribe_status, toggle_label_style,
-        toggle_tool_panel, tool_action_button_style, tool_panel_button_style, tool_panel_tab_label,
-        top_icon_button_style, workshop_id_summary, workshop_ids_from_input,
+        settings_danger_button_style, settings_input_style, settings_primary_button_style,
+        source_tile_style, start_game_source_pack_paths, start_game_temp_packs_dir_for_config_dir,
+        steam_check_update_panel_state, steam_check_update_status, steam_command_panel_state,
+        steam_command_status, steam_helper_process_config, steam_probe_status,
+        steam_refresh_panel_state, steam_resubscribe_panel_state, steam_resubscribe_status,
+        toggle_label_style, toggle_tool_panel, tool_action_button_style, tool_panel_button_style,
+        tool_panel_tab_label, top_icon_button_style, workshop_id_summary, workshop_ids_from_input,
         workshop_ids_from_mods,
     };
     use wh3mm_ui::ModRowViewModel;
@@ -6666,9 +7044,9 @@ mod tests {
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Collections,
-            WorkspacePage::Mods,
+            WorkspacePage::Collections,
             ModListFilter::All,
-            LibraryToolTab::Presets,
+            LibraryToolTab::None,
         ));
         assert!(!library_nav_active(
             LibraryNavTarget::AllMods,
@@ -6678,21 +7056,21 @@ mod tests {
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Categories,
-            WorkspacePage::Mods,
+            WorkspacePage::Categories,
             ModListFilter::All,
-            LibraryToolTab::Categories,
+            LibraryToolTab::None,
         ));
         assert!(!library_nav_active(
             LibraryNavTarget::Collections,
-            WorkspacePage::Mods,
+            WorkspacePage::Categories,
             ModListFilter::All,
-            LibraryToolTab::Categories,
+            LibraryToolTab::None,
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Settings,
             WorkspacePage::Settings,
             ModListFilter::Enabled,
-            LibraryToolTab::Config,
+            LibraryToolTab::None,
         ));
         assert_eq!(app_brand_title(), "Mod Archive");
         assert_eq!(
@@ -6817,6 +7195,11 @@ mod tests {
     fn settings_workspace_styles_match_card_and_toggle_language() {
         assert!(settings_card_style().contains("background: #1f202b"));
         assert!(settings_input_style().contains("box-sizing: border-box"));
+        assert!(settings_primary_button_style().contains("#65f58b"));
+        assert!(settings_danger_button_style().contains("#451a1a"));
+        assert!(collection_row_style().contains("grid-template-columns"));
+        assert!(collection_row_button_style(true).contains("#60a5fa"));
+        assert!(collection_row_button_style(false).contains("#171b24"));
         assert!(toggle_label_style(true).contains("#65f58b"));
         assert!(toggle_label_style(false).contains("#353a43"));
         let workshop = ModRowViewModel {
