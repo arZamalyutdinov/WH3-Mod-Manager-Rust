@@ -389,13 +389,13 @@ fn App() -> Element {
 
     rsx! {
         main {
-            style: "height: 100vh; min-height: 0; background: #101018; color: #f2f5f2; font-family: Inter, ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden;",
+            style: "height: 100vh; min-height: 0; background: #0f1218; color: #f2f5f2; font-family: Inter, ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden;",
             header {
-                style: "height: 64px; border-bottom: 1px solid #262838; background: #11111a; display: grid; grid-template-columns: minmax(220px, auto) minmax(300px, 520px) minmax(180px, 1fr); align-items: center; gap: 16px; padding: 8px 18px; flex-shrink: 0;",
+                style: "height: 66px; border-bottom: 1px solid #263041; background: #121620; display: grid; grid-template-columns: minmax(220px, auto) minmax(300px, 520px) minmax(250px, 1fr); align-items: center; gap: 16px; padding: 8px 18px; flex-shrink: 0;",
                 div {
                     style: "min-width: 0; display: grid; gap: 2px;",
                     h1 {
-                        style: "font-size: 22px; line-height: 27px; margin: 0; color: #65f58b; letter-spacing: 0; white-space: nowrap; text-transform: uppercase;",
+                        style: "font-size: 21px; line-height: 27px; margin: 0; color: #f8fafc; letter-spacing: 0; white-space: nowrap; text-transform: uppercase;",
                         "{app_brand_title()}"
                     }
                     div {
@@ -419,10 +419,10 @@ fn App() -> Element {
                     }
                 }
                 div {
-                    style: "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 10px; color: #9fb0c0; font-size: 12px; white-space: nowrap;",
-                    span { "{filtered_mod_count} shown" }
-                    span { "{launch_enabled_mod_count} enabled" }
-                    span { "{hidden_mod_count} hidden" }
+                    style: "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #9fb0c0; font-size: 12px; white-space: nowrap;",
+                    span { style: header_metric_style(), "{filtered_mod_count} shown" }
+                    span { style: header_metric_style(), "{launch_enabled_mod_count} enabled" }
+                    span { style: header_metric_style(), "{hidden_mod_count} hidden" }
                     button {
                         title: "Alpha readiness: {alpha_readiness_summary}",
                         style: top_icon_button_style(current_tool_panel == ToolPanelTab::Checks),
@@ -432,7 +432,7 @@ fn App() -> Element {
                                 ToolPanelTab::Checks,
                             ));
                         },
-                        "!"
+                        "Checks"
                     }
                     button {
                         title: "Workshop commands",
@@ -443,7 +443,7 @@ fn App() -> Element {
                                 ToolPanelTab::Workshop,
                             ));
                         },
-                        "DL"
+                        "Workshop"
                     }
                     button {
                         title: "Settings",
@@ -452,14 +452,14 @@ fn App() -> Element {
                             workspace_page.set(WorkspacePage::Settings);
                             library_tool_tab.set(LibraryToolTab::Config);
                         },
-                        "SET"
+                        "Settings"
                     }
                 }
             }
             div {
-                style: "flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 360px); grid-template-areas: \"library content tools\"; overflow: hidden;",
+                style: "flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(220px, 252px) minmax(0, 1fr) minmax(288px, 340px); grid-template-areas: \"library content tools\"; overflow: hidden;",
                 aside {
-                    style: "grid-area: library; min-width: 0; border-right: 1px solid #2b2d3a; background: #1a1b25; padding: 20px 14px; overflow-y: auto; display: flex; flex-direction: column;",
+                    style: "grid-area: library; min-width: 0; border-right: 1px solid #263041; background: #171b24; padding: 20px 14px; overflow-y: auto; display: flex; flex-direction: column;",
                     div {
                         style: "display: grid; gap: 4px; margin-bottom: 18px;",
                         h2 {
@@ -1165,7 +1165,7 @@ fn App() -> Element {
                     }
                 }
                 aside {
-                    style: "grid-area: tools; min-width: 0; border-left: 1px solid #2b2d3a; background: #292a35; padding: 20px 18px; overflow-y: auto;",
+                    style: "grid-area: tools; min-width: 0; border-left: 1px solid #263041; background: #171b24; padding: 20px 18px; overflow-y: auto;",
                     div {
                         style: "display: grid; gap: 4px; margin-bottom: 12px;",
                         h2 {
@@ -1178,7 +1178,7 @@ fn App() -> Element {
                         }
                     }
                     button {
-                        style: "width: 100%; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 8px; padding: 18px 14px; font-weight: 800; font-size: 20px; line-height: 24px; margin-bottom: 16px; letter-spacing: 0;",
+                        style: "width: 100%; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 6px; padding: 16px 14px; font-weight: 800; font-size: 18px; line-height: 24px; margin-bottom: 14px; letter-spacing: 0;",
                         onclick: move |_| {
                             let selected_game_folder = select_game_folder(game_folder.read().clone());
                             if let Some(selected_game_folder) = selected_game_folder {
@@ -2195,6 +2195,53 @@ fn App() -> Element {
             }
             div {
                 style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; padding: 0 26px 26px;",
+                div {
+                    style: archive_filter_bar_style(),
+                    span {
+                        style: "font-size: 11px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 0;",
+                        "View"
+                    }
+                    button {
+                        style: archive_filter_button_style(current_mod_filter == ModListFilter::All),
+                        onclick: move |_| {
+                            mod_list_filter.set(ModListFilter::All);
+                            library_tool_tab.set(LibraryToolTab::None);
+                        },
+                        "All {total_mod_count}"
+                    }
+                    button {
+                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Enabled),
+                        onclick: move |_| {
+                            mod_list_filter.set(ModListFilter::Enabled);
+                            library_tool_tab.set(LibraryToolTab::None);
+                        },
+                        "Enabled {enabled_mod_count}"
+                    }
+                    button {
+                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Disabled),
+                        onclick: move |_| {
+                            mod_list_filter.set(ModListFilter::Disabled);
+                            library_tool_tab.set(LibraryToolTab::None);
+                        },
+                        "Disabled {disabled_mod_count}"
+                    }
+                    button {
+                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Locked),
+                        onclick: move |_| {
+                            mod_list_filter.set(ModListFilter::Locked);
+                            library_tool_tab.set(LibraryToolTab::None);
+                        },
+                        "Locked {locked_mod_count}"
+                    }
+                    button {
+                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Hidden),
+                        onclick: move |_| {
+                            mod_list_filter.set(ModListFilter::Hidden);
+                            library_tool_tab.set(LibraryToolTab::None);
+                        },
+                        "Hidden {hidden_mod_count}"
+                    }
+                }
                 section {
                     style: "display: grid; gap: 6px; min-width: 0;",
                     div {
@@ -2341,53 +2388,6 @@ fn App() -> Element {
                                 "{mod_updated_label(mod_row, &current_steam_metadata, current_time_ms)}"
                             }
                         }
-                    }
-                }
-                div {
-                    style: archive_filter_bar_style(),
-                    span {
-                        style: "font-size: 11px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 1.2px;",
-                        "Filter"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::All),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::All);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "All {total_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Enabled),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Enabled);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Enabled {enabled_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Disabled),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Disabled);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Disabled {disabled_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Locked),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Locked);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Locked {locked_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Hidden),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Hidden);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Hidden {hidden_mod_count}"
                     }
                 }
                 if let Some(pack) = view_model.selected_pack {
@@ -2720,25 +2720,25 @@ fn mod_list_filter_label(filter: ModListFilter) -> &'static str {
 
 fn mod_row_style(active: bool) -> &'static str {
     if active {
-        "min-height: 58px; display: grid; grid-template-columns: 44px 76px 58px minmax(0, 1.9fr) minmax(110px, 0.55fr) minmax(92px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #4ade80; border-left: 3px solid #65f58b; border-radius: 5px; padding: 8px 14px; background: #20242b; cursor: pointer;"
+        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #3b82f6; border-left: 3px solid #60a5fa; border-radius: 4px; padding: 7px 14px; background: #1d2631; cursor: pointer;"
     } else {
-        "min-height: 58px; display: grid; grid-template-columns: 44px 76px 58px minmax(0, 1.9fr) minmax(110px, 0.55fr) minmax(92px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #242735; border-left: 3px solid transparent; border-radius: 5px; padding: 8px 14px; background: #1b1c26; cursor: pointer;"
+        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #252b38; border-left: 3px solid transparent; border-radius: 4px; padding: 7px 14px; background: #171922; cursor: pointer;"
     }
 }
 
 fn archive_table_header_style() -> &'static str {
-    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 44px 76px 58px minmax(0, 1.9fr) minmax(110px, 0.55fr) minmax(92px, 0.45fr); align-items: center; gap: 10px; padding: 11px 14px; border: 1px solid #343545; background: #343541; color: #d5d9df; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 1.5px;"
+    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr); align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid #303746; background: #20242f; color: #cbd5e1; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 0;"
 }
 
 fn archive_filter_bar_style() -> &'static str {
-    "display: flex; align-items: center; flex-wrap: wrap; gap: 7px; max-width: max-content; min-height: 44px; border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 6px 8px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);"
+    "display: flex; align-items: center; flex-wrap: wrap; gap: 7px; width: 100%; min-height: 42px; box-sizing: border-box; border: 1px solid #293142; background: #151821; border-radius: 4px; padding: 6px 8px;"
 }
 
 fn archive_filter_button_style(active: bool) -> &'static str {
     if active {
-        "min-width: 78px; height: 30px; border: 1px solid #65f58b; background: #202c2a; color: #65f58b; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
+        "min-width: 78px; height: 30px; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
     } else {
-        "min-width: 78px; height: 30px; border: 1px solid #333541; background: #242531; color: #d5d9df; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 700; letter-spacing: 0;"
+        "min-width: 78px; height: 30px; border: 1px solid #303746; background: #1f2430; color: #d5d9df; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 700; letter-spacing: 0;"
     }
 }
 
@@ -2781,11 +2781,15 @@ fn nav_badge_style() -> &'static str {
     "width: 26px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid currentColor; border-radius: 4px; font-size: 9px; font-weight: 800; letter-spacing: 0;"
 }
 
+fn header_metric_style() -> &'static str {
+    "min-height: 30px; display: inline-flex; align-items: center; border: 1px solid #293142; background: #171b24; color: #cbd5e1; border-radius: 4px; padding: 0 9px; font-size: 11px; font-weight: 650; letter-spacing: 0;"
+}
+
 fn top_icon_button_style(active: bool) -> &'static str {
     if active {
-        "width: 34px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 34px; border: 1px solid #65f58b; background: #1b2a1d; color: #65f58b; border-radius: 7px; padding: 0; font-size: 10px; font-weight: 850; letter-spacing: 0;"
+        "height: 34px; min-width: 68px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
     } else {
-        "width: 34px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 34px; border: 1px solid #333541; background: #1a1b25; color: #cbd8cc; border-radius: 7px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
+        "height: 34px; min-width: 68px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #303746; background: #1f2430; color: #cbd8cc; border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: 750; letter-spacing: 0;"
     }
 }
 
@@ -6223,14 +6227,15 @@ mod tests {
         dependency_names_summary, detail_action_button_style, detail_metric_style,
         detail_source_tile_style, diagnostic_snapshot_text, enabled_pack_paths_for_start_game,
         fetch_steam_metadata_safely, first_existing_steam_helper_path, generated_pack_details,
-        initial_app_state, launch_options_from_legacy_ts, launch_priority_status,
-        launch_quick_button_style, launch_state_fingerprint, launch_status_with_close_on_play,
-        legacy_ts_launch_option_import_summary, legacy_ts_launch_options_from_state,
-        library_nav_active, library_tool_tab_label, library_utility_button_style, mod_author_label,
-        mod_categories_label, mod_enable_button_style, mod_list_filter_label,
-        mod_row_matches_filter, mod_row_matches_query, mod_row_style, mod_source_label,
-        mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_badge_style,
-        nav_button_style, normalize_steam_helper_backend, read_existing_launch_mod_list_pack_names,
+        header_metric_style, initial_app_state, launch_options_from_legacy_ts,
+        launch_priority_status, launch_quick_button_style, launch_state_fingerprint,
+        launch_status_with_close_on_play, legacy_ts_launch_option_import_summary,
+        legacy_ts_launch_options_from_state, library_nav_active, library_tool_tab_label,
+        library_utility_button_style, mod_author_label, mod_categories_label,
+        mod_enable_button_style, mod_list_filter_label, mod_row_matches_filter,
+        mod_row_matches_query, mod_row_style, mod_source_label, mod_state_label, mod_updated_label,
+        mod_workshop_id_from_row, nav_badge_style, nav_button_style,
+        normalize_steam_helper_backend, read_existing_launch_mod_list_pack_names,
         relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
         run_steam_command_action, save_on_last_game_launch_preset_to_path,
         selected_or_first_mod_row, selected_pack_from_optional_arg, settings_card_style,
@@ -6379,8 +6384,9 @@ mod tests {
         assert!(launch_quick_button_style().contains("min-height: 42px"));
         assert!(continue_save_button_style(false).contains("min-height: 50px"));
         assert!(continue_save_button_style(true).contains("background: #292a35"));
-        assert!(top_icon_button_style(true).contains("width: 34px"));
-        assert!(top_icon_button_style(false).contains("flex: 0 0 34px"));
+        assert!(header_metric_style().contains("min-height: 30px"));
+        assert!(top_icon_button_style(true).contains("min-width: 68px"));
+        assert!(top_icon_button_style(false).contains("flex: 0 0 auto"));
         assert!(archive_toolbar_button_style(true).contains("#1f6feb"));
         assert!(archive_toolbar_button_style(false).contains("min-height: 30px"));
     }
@@ -6481,8 +6487,8 @@ mod tests {
         assert!(!mod_row_style(false).contains("154px"));
         assert!(archive_table_header_style().contains("minmax(0, 1.9fr)"));
         assert!(!archive_table_header_style().contains("Actions"));
-        assert!(archive_filter_bar_style().contains("max-width: max-content"));
-        assert!(archive_filter_button_style(true).contains("#65f58b"));
+        assert!(archive_filter_bar_style().contains("width: 100%"));
+        assert!(archive_filter_button_style(true).contains("#60a5fa"));
         assert!(archive_filter_button_style(false).contains("min-width: 78px"));
         assert!(mod_row_style(false).contains("cursor: pointer"));
         assert!(mod_enable_button_style(true, false).contains("#65f58b"));
