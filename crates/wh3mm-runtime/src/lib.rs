@@ -1836,12 +1836,15 @@ fn preserve_copied_file_times(
             from_path.display()
         ))
     })?;
-    let copied_file = fs::File::open(to_path).map_err(|error| {
-        CoreError::io(format!(
-            "failed to open copied launch pack {} for timestamp preservation: {error}",
-            to_path.display()
-        ))
-    })?;
+    let copied_file = fs::OpenOptions::new()
+        .write(true)
+        .open(to_path)
+        .map_err(|error| {
+            CoreError::io(format!(
+                "failed to open copied launch pack {} for timestamp preservation: {error}",
+                to_path.display()
+            ))
+        })?;
     copied_file
         .set_times(
             FileTimes::new()
@@ -3021,7 +3024,9 @@ echo '[]'
         let target_pack = data_dir.join("local.pack");
         fs::write(&source_pack, b"pack bytes").unwrap();
         let source_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        fs::File::open(&source_pack)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source_pack)
             .unwrap()
             .set_times(
                 FileTimes::new()
@@ -3291,7 +3296,7 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Valve\Steam
                     }}
                 }}
                 "#,
-                library_dir.display()
+                vdf_path_literal(&library_dir)
             ),
         )
         .unwrap();
@@ -3342,7 +3347,7 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Valve\Steam
                     "0" "{}"
                 }}
                 "#,
-                steam_root.display()
+                vdf_path_literal(&steam_root)
             ),
         )
         .unwrap();
@@ -3729,6 +3734,10 @@ cat "$modfile" > launch-mod-list.txt
             std::process::id()
         ));
         path
+    }
+
+    fn vdf_path_literal(path: &std::path::Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
     }
 
     fn mod_record_with_path(
