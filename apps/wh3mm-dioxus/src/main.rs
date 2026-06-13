@@ -239,6 +239,7 @@ enum WorkspacePage {
     ModDetail,
     Categories,
     Collections,
+    Compatibility,
     Checks,
     Steam,
     Workshop,
@@ -1498,6 +1499,18 @@ fn App() -> Element {
                     div {
                         style: "display: grid; gap: 10px; margin-bottom: 18px;",
                         button {
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Compatibility),
+                            onclick: move |_| {
+                                let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
+                                mod_status.set(Some(conflict_status(&report)));
+                                conflict_report.set(Some(report));
+                                workspace_page.set(WorkspacePage::Compatibility);
+                                library_tool_tab.set(LibraryToolTab::None);
+                            },
+                            span { "Check Compatibility" }
+                            span { ">" }
+                        }
+                        button {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Settings),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Settings);
@@ -1515,14 +1528,6 @@ fn App() -> Element {
                             span { ">" }
                         }
                         button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Checks);
-                            },
-                            span { "Alpha Checks" }
-                            span { ">" }
-                        }
-                        button {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Steam);
@@ -1536,6 +1541,14 @@ fn App() -> Element {
                                 workspace_page.set(WorkspacePage::Workshop);
                             },
                             span { "Workshop Commands" }
+                            span { ">" }
+                        }
+                        button {
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
+                            onclick: move |_| {
+                                workspace_page.set(WorkspacePage::Checks);
+                            },
+                            span { "Alpha Checks" }
                             span { ">" }
                         }
                     }
@@ -1564,6 +1577,74 @@ fn App() -> Element {
                             style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
                             AlphaReadinessPanel {
                                 report: alpha_readiness.clone()
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Compatibility {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Compatibility"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Analyze enabled packs for file collisions, dependency misses, DB references, unique IDs, script listeners, and read errors."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; padding: 8px 40px 40px;",
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Enabled Pack Analysis"
+                                    }
+                                    button {
+                                        style: settings_primary_button_style(),
+                                        onclick: move |_| {
+                                            let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
+                                            mod_status.set(Some(conflict_status(&report)));
+                                            conflict_report.set(Some(report));
+                                        },
+                                        "Run analysis"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                        "{launch_enabled_mod_count} enabled mods will be analyzed. Results stay on this screen so the archive can remain focused on mod ordering."
+                                    }
+                                }
+                            }
+                            if let Some(report) = conflict_report.read().as_ref() {
+                                ConflictPanel { report: report.clone() }
+                            } else {
+                                section {
+                                    style: settings_card_style(),
+                                    header {
+                                        style: settings_card_header_style(),
+                                        h3 {
+                                            style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                            "No analysis yet"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_card_body_style(),
+                                        div {
+                                            style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                            "Use Run analysis or the Analyze button in the archive toolbar."
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else if current_workspace_page == WorkspacePage::Steam {
@@ -2764,6 +2845,7 @@ fn App() -> Element {
                             let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
                             mod_status.set(Some(conflict_status(&report)));
                             conflict_report.set(Some(report));
+                            workspace_page.set(WorkspacePage::Compatibility);
                         },
                         "Analyze"
                     }
@@ -3001,9 +3083,6 @@ fn App() -> Element {
                 if let Some(command_panel) = last_steam_command.read().as_ref() {
                     SteamCommandPanel { state: command_panel.clone() }
                 }
-            }
-            if let Some(report) = conflict_report.read().as_ref() {
-                ConflictPanel { report: report.clone() }
             }
                     }
                 }
