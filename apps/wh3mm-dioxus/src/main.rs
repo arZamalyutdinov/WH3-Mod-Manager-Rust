@@ -445,7 +445,7 @@ fn App() -> Element {
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Checks);
                         },
-                        "Checks"
+                        "CHK"
                     }
                     button {
                         title: "Workshop commands",
@@ -453,7 +453,7 @@ fn App() -> Element {
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Workshop);
                         },
-                        "Workshop"
+                        "WS"
                     }
                     button {
                         title: "Settings",
@@ -462,7 +462,7 @@ fn App() -> Element {
                             workspace_page.set(WorkspacePage::Settings);
                             library_tool_tab.set(LibraryToolTab::None);
                         },
-                        "Settings"
+                        "SET"
                     }
                 }
             }
@@ -3250,9 +3250,9 @@ fn header_metric_style() -> &'static str {
 
 fn top_icon_button_style(active: bool) -> &'static str {
     if active {
-        "height: 34px; min-width: 68px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
+        "width: 38px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 6px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
     } else {
-        "height: 34px; min-width: 68px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #303746; background: #1f2430; color: #cbd8cc; border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: 750; letter-spacing: 0;"
+        "width: 38px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #303746; background: #1f2430; color: #cbd8cc; border-radius: 6px; padding: 0; font-size: 10px; font-weight: 750; letter-spacing: 0;"
     }
 }
 
@@ -6824,7 +6824,7 @@ mod tests {
         assert!(continue_save_button_style(false).contains("min-height: 50px"));
         assert!(continue_save_button_style(true).contains("background: #292a35"));
         assert!(header_metric_style().contains("min-height: 30px"));
-        assert!(top_icon_button_style(true).contains("min-width: 68px"));
+        assert!(top_icon_button_style(true).contains("width: 38px"));
         assert!(top_icon_button_style(false).contains("flex: 0 0 auto"));
         assert!(archive_toolbar_button_style(true).contains("#1f6feb"));
         assert!(archive_toolbar_button_style(false).contains("min-height: 30px"));
