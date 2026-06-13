@@ -240,6 +240,7 @@ enum WorkspacePage {
     Categories,
     Collections,
     Compatibility,
+    DbViewer,
     Checks,
     Steam,
     Workshop,
@@ -259,6 +260,14 @@ fn main() {
     dioxus::launch(App);
 }
 
+fn initial_workspace_page() -> WorkspacePage {
+    if env::args().nth(1).is_some() {
+        WorkspacePage::DbViewer
+    } else {
+        WorkspacePage::Mods
+    }
+}
+
 #[component]
 fn App() -> Element {
     let mut app_state = use_signal(initial_app_state);
@@ -275,7 +284,7 @@ fn App() -> Element {
     let mut mod_search = use_signal(String::new);
     let mut mod_list_filter = use_signal(|| ModListFilter::All);
     let mut library_tool_tab = use_signal(|| LibraryToolTab::None);
-    let mut workspace_page = use_signal(|| WorkspacePage::Mods);
+    let mut workspace_page = use_signal(initial_workspace_page);
     let mut selected_mod_key = use_signal(|| None::<String>);
     let mut conflict_report = use_signal(|| None::<PackConflictReport>);
     let mut launch_preview = use_signal(|| None::<LaunchPreview>);
@@ -1528,6 +1537,14 @@ fn App() -> Element {
                             span { ">" }
                         }
                         button {
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::DbViewer),
+                            onclick: move |_| {
+                                workspace_page.set(WorkspacePage::DbViewer);
+                            },
+                            span { "DB Viewer" }
+                            span { ">" }
+                        }
+                        button {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Steam);
@@ -1642,6 +1659,79 @@ fn App() -> Element {
                                         div {
                                             style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
                                             "Use Run analysis or the Analyze button in the archive toolbar."
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::DbViewer {
+                        header {
+                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "DB Viewer"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Inspect opened pack indexes, schema-backed DB previews, loc metadata, and WHMM flow summaries away from the mod archive."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: "display: grid; gap: 24px; padding: 8px 40px 40px;",
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Pack Source"
+                                    }
+                                    button {
+                                        style: settings_primary_button_style(),
+                                        onclick: move |_| {
+                                            if let Some(pack_path) = pick_pack_file() {
+                                                pack_selection.set(load_pack_from_path(pack_path));
+                                                workspace_page.set(WorkspacePage::DbViewer);
+                                            }
+                                        },
+                                        "Open pack"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                        if view_model.selected_pack.is_some() {
+                                            "The selected pack is loaded below. Open another pack to replace the current inspection target."
+                                        } else {
+                                            "No pack is open yet. Open a .pack file to inspect its index and first schema-resolvable DB table."
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(pack) = view_model.selected_pack.clone() {
+                                PackPanel { pack }
+                            } else {
+                                section {
+                                    style: settings_card_style(),
+                                    header {
+                                        style: settings_card_header_style(),
+                                        h3 {
+                                            style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                            "No pack selected"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_card_body_style(),
+                                        div {
+                                            style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                            "Use Open pack from this screen or from the archive toolbar."
                                         }
                                     }
                                 }
@@ -2795,6 +2885,7 @@ fn App() -> Element {
                         onclick: move |_| {
                             if let Some(pack_path) = pick_pack_file() {
                                 pack_selection.set(load_pack_from_path(pack_path));
+                                workspace_page.set(WorkspacePage::DbViewer);
                             }
                         },
                         "Open pack"
@@ -3062,9 +3153,6 @@ fn App() -> Element {
                             }
                         }
                     }
-                }
-                if let Some(pack) = view_model.selected_pack {
-                    PackPanel { pack }
                 }
             }
             div {
