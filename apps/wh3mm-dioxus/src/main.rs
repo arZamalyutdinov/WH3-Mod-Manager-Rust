@@ -3155,23 +3155,6 @@ fn App() -> Element {
                     }
                 }
             }
-            div {
-                style: "display: grid; gap: 12px; margin-top: 16px;",
-                if let Some(preview) = launch_preview.read().as_ref() {
-                    LaunchPreviewPanel {
-                        preview: preview.clone(),
-                        is_stale: preview.fingerprint != current_launch_fingerprint,
-                    }
-                }
-                SteamMetadataPanel {
-                    helper_path: steam_helper_path.read().clone(),
-                    subscribed_ids: subscribed_workshop_ids.read().clone(),
-                    metadata: steam_metadata.read().clone(),
-                }
-                if let Some(command_panel) = last_steam_command.read().as_ref() {
-                    SteamCommandPanel { state: command_panel.clone() }
-                }
-            }
                     }
                 }
             }
