@@ -1139,21 +1139,23 @@ fn App() -> Element {
                     div {
                         style: "margin-top: auto; padding-top: 18px; border-top: 1px solid #2b2d3a; display: grid; gap: 8px;",
                         button {
+                            title: "Readiness checks",
                             style: library_utility_button_style(current_workspace_page == WorkspacePage::Checks),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Checks);
                             },
                             span { style: nav_badge_style(), "CHK" }
-                            span { "Alpha checks" }
+                            span { "Checks" }
                         }
                         button {
+                            title: "Diagnostics and log paths",
                             style: library_utility_button_style(current_workspace_page == WorkspacePage::Settings),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Settings);
                                 library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "CFG" }
-                            span { "Settings" }
+                            span { style: nav_badge_style(), "LOG" }
+                            span { "Logs" }
                         }
                     }
                 }
