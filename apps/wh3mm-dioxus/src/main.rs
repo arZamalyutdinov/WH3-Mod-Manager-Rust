@@ -6,6 +6,7 @@
 
 use dioxus::prelude::*;
 use dioxus_desktop::{Config as DesktopConfig, WindowBuilder, tao::dpi::LogicalSize};
+use futures_channel::oneshot;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -62,6 +63,7 @@ const PRESET_CONFIG_FILE: &str = "wh3mm_presets.json";
 const STEAM_HELPER_CONFIG_FILE: &str = "wh3mm_steam_helper.json";
 const DIAGNOSTICS_DIR_NAME: &str = "diagnostics";
 const APP_DIAGNOSTIC_LOG_FILE: &str = "wh3mm-dioxus.log";
+const PANIC_DIAGNOSTIC_LOG_FILE: &str = "wh3mm-crash.log";
 const STEAM_HELPER_COMMAND_LOG_FILE: &str = "wh3mm-steam-helper-commands.jsonl";
 const LEGACY_TS_GAME_KEY: &str = "wh3";
 const ON_LAST_GAME_LAUNCH_PRESET_NAME: &str = "On Last Game Launch";
@@ -69,6 +71,7 @@ const STEAM_HELPER_BACKEND_ENV: &str = "WH3MM_STEAM_HELPER_BACKEND";
 const STEAM_HELPER_COMMAND_LOG_ENV: &str = "WH3MM_STEAM_HELPER_COMMAND_LOG";
 const STEAM_HELPER_BACKEND_NATIVE: &str = "native";
 const STEAM_HELPER_BACKEND_FIXTURE: &str = "fixture";
+const PACKAGED_HELP_FILE: &str = "WINDOWS-ALPHA-README.md";
 const CLOSE_ON_PLAY_DELAY_SECS: u64 = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +263,7 @@ enum LibraryNavTarget {
 }
 
 fn main() {
+    install_panic_diagnostic_hook();
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
             DesktopConfig::new()
@@ -328,6 +332,7 @@ fn App() -> Element {
     let mut steam_metadata = use_signal(Vec::<WorkshopModData>::new);
     let mut subscribed_workshop_ids = use_signal(Vec::<String>::new);
     let mut last_steam_command = use_signal(|| None::<SteamCommandPanelState>);
+    let mut steam_operation = use_signal(|| None::<String>);
     let mut last_logged_mod_status = use_signal(|| None::<String>);
 
     use_effect(move || {
@@ -364,6 +369,7 @@ fn App() -> Element {
     let archive_filter_count = usize::from(current_mod_filter != ModListFilter::All)
         + usize::from(!mod_search_query.is_empty());
     let current_settings_focus = *settings_focus.read();
+    let steam_operation_in_progress = steam_operation.read().is_some();
     let filtered_mods = if mod_search_query.is_empty() {
         visible_rows
     } else {
@@ -452,6 +458,7 @@ fn App() -> Element {
     let current_steam_metadata = steam_metadata.read().clone();
     let current_time_ms = current_unix_ms();
     let diagnostics_log_path_label = app_diagnostic_log_path().display().to_string();
+    let panic_log_path_label = panic_diagnostic_log_path().display().to_string();
     let steam_command_log_path_label = steam_helper_command_log_path().display().to_string();
 
     rsx! {
@@ -1949,61 +1956,95 @@ fn App() -> Element {
                                         }
                                         button {
                                             style: settings_secondary_button_style(),
-                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                             onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
                                                 let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                                 let backend = steam_helper_backend.read().clone();
-                                                match probe_steam_helper(&helper_path, &backend) {
-                                                    Ok(status) => mod_status.set(Some(status)),
-                                                    Err(error) => mod_status.set(Some(format!("Could not probe Steam helper: {error}"))),
-                                                }
+                                                steam_operation.set(Some("Probing Steam helper".to_string()));
+                                                mod_status.set(Some("Probing Steam helper...".to_string()));
+                                                let receiver = run_in_background(move || probe_steam_helper(&helper_path, &backend));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(status)) => mod_status.set(Some(status)),
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not probe Steam helper: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not probe Steam helper: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
                                             },
                                             "Probe"
                                         }
                                         button {
                                             style: settings_primary_button_style(),
-                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                             onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
                                                 let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                                 let backend = steam_helper_backend.read().clone();
                                                 let mut next_state = app_state.read().clone();
-                                                match refresh_steam_from_helper(&mut next_state, &helper_path, &backend) {
-                                                    Ok(result) => {
-                                                        let command_panel = steam_refresh_panel_state(&result);
-                                                        let status = format!(
-                                                            "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.",
-                                                            result.subscribed_ids.len(),
-                                                            result.metadata.len(),
-                                                            result.requested_metadata_count,
-                                                            result.missing_metadata_count,
-                                                            result.filtered_unsubscribed_count,
-                                                            result.renamed_count
-                                                        );
-                                                        subscribed_workshop_ids.set(result.subscribed_ids);
-                                                        steam_metadata.set(result.metadata);
-                                                        last_steam_command.set(Some(command_panel));
-                                                        app_state.set(next_state);
-                                                        mod_status.set(Some(status));
+                                                steam_operation.set(Some("Refreshing Steam metadata".to_string()));
+                                                mod_status.set(Some("Refreshing Steam metadata...".to_string()));
+                                                let receiver = run_in_background(move || {
+                                                    refresh_steam_from_helper(&mut next_state, &helper_path, &backend)
+                                                        .map(|result| (next_state, result))
+                                                });
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok((next_state, result))) => {
+                                                            let command_panel = steam_refresh_panel_state(&result);
+                                                            let status = format!(
+                                                                "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.",
+                                                                result.subscribed_ids.len(),
+                                                                result.metadata.len(),
+                                                                result.requested_metadata_count,
+                                                                result.missing_metadata_count,
+                                                                result.filtered_unsubscribed_count,
+                                                                result.renamed_count
+                                                            );
+                                                            subscribed_workshop_ids.set(result.subscribed_ids);
+                                                            steam_metadata.set(result.metadata);
+                                                            last_steam_command.set(Some(command_panel));
+                                                            app_state.set(next_state);
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not refresh Steam: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not refresh Steam: background task ended unexpectedly.".to_string())),
                                                     }
-                                                    Err(error) => mod_status.set(Some(format!("Could not refresh Steam: {error}"))),
-                                                }
+                                                    steam_operation.set(None);
+                                                });
                                             },
                                             "Refresh"
                                         }
                                     }
                                     button {
                                         style: settings_secondary_button_style(),
-                                        disabled: steam_helper_path.read().trim().is_empty(),
+                                        disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                         onclick: move |_| {
+                                            if steam_operation.read().is_some() {
+                                                return;
+                                            }
                                             let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                             let backend = steam_helper_backend.read().clone();
-                                            match check_steam_updates_with_helper(&app_state.read(), &helper_path, &backend) {
-                                                Ok(result) => {
-                                                    mod_status.set(Some(steam_check_update_status(&result)));
-                                                    last_steam_command.set(Some(steam_check_update_panel_state(&result)));
+                                            let state = app_state.read().clone();
+                                            steam_operation.set(Some("Checking Steam updates".to_string()));
+                                            mod_status.set(Some("Checking Steam updates...".to_string()));
+                                            let receiver = run_in_background(move || check_steam_updates_with_helper(&state, &helper_path, &backend));
+                                            spawn(async move {
+                                                match receiver.await {
+                                                    Ok(Ok(result)) => {
+                                                        mod_status.set(Some(steam_check_update_status(&result)));
+                                                        last_steam_command.set(Some(steam_check_update_panel_state(&result)));
+                                                    }
+                                                    Ok(Err(error)) => mod_status.set(Some(format!("Could not check Steam updates: {error}"))),
+                                                    Err(_) => mod_status.set(Some("Could not check Steam updates: background task ended unexpectedly.".to_string())),
                                                 }
-                                                Err(error) => mod_status.set(Some(format!("Could not check Steam updates: {error}"))),
-                                            }
+                                                steam_operation.set(None);
+                                            });
                                         },
                                         "Check updates"
                                     }
@@ -2065,73 +2106,113 @@ fn App() -> Element {
                                         style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;",
                                         button {
                                             style: settings_primary_button_style(),
-                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                             onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
                                                 let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                                 let backend = steam_helper_backend.read().clone();
                                                 let ids = steam_command_ids.read().clone();
                                                 let mods = app_state.read().mods.clone();
-                                                match run_steam_command_with_helper(SteamCommandAction::Subscribe, &helper_path, &backend, &ids, &mods) {
-                                                    Ok(result) => {
-                                                        mod_status.set(Some(result.status));
-                                                        last_steam_command.set(Some(result.panel));
+                                                steam_operation.set(Some("Subscribing to Workshop items".to_string()));
+                                                mod_status.set(Some("Subscribing to Workshop items...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Subscribe, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not subscribe: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not subscribe: background task ended unexpectedly.".to_string())),
                                                     }
-                                                    Err(error) => mod_status.set(Some(format!("Could not subscribe: {error}"))),
-                                                }
+                                                    steam_operation.set(None);
+                                                });
                                             },
                                             "Subscribe"
                                         }
                                         button {
                                             style: settings_secondary_button_style(),
-                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                             onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
                                                 let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                                 let backend = steam_helper_backend.read().clone();
                                                 let ids = steam_command_ids.read().clone();
                                                 let mods = app_state.read().mods.clone();
-                                                match run_steam_command_with_helper(SteamCommandAction::Download, &helper_path, &backend, &ids, &mods) {
-                                                    Ok(result) => {
-                                                        mod_status.set(Some(result.status));
-                                                        last_steam_command.set(Some(result.panel));
+                                                steam_operation.set(Some("Requesting Workshop downloads".to_string()));
+                                                mod_status.set(Some("Requesting Workshop downloads...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Download, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not download: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not download: background task ended unexpectedly.".to_string())),
                                                     }
-                                                    Err(error) => mod_status.set(Some(format!("Could not download: {error}"))),
-                                                }
+                                                    steam_operation.set(None);
+                                                });
                                             },
                                             "Download"
                                         }
                                         button {
                                             style: settings_danger_button_style(),
-                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                             onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
                                                 let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                                 let backend = steam_helper_backend.read().clone();
                                                 let ids = steam_command_ids.read().clone();
                                                 let mods = app_state.read().mods.clone();
-                                                match run_steam_command_with_helper(SteamCommandAction::Unsubscribe, &helper_path, &backend, &ids, &mods) {
-                                                    Ok(result) => {
-                                                        mod_status.set(Some(result.status));
-                                                        last_steam_command.set(Some(result.panel));
+                                                steam_operation.set(Some("Unsubscribing from Workshop items".to_string()));
+                                                mod_status.set(Some("Unsubscribing from Workshop items...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Unsubscribe, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not unsubscribe: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not unsubscribe: background task ended unexpectedly.".to_string())),
                                                     }
-                                                    Err(error) => mod_status.set(Some(format!("Could not unsubscribe: {error}"))),
-                                                }
+                                                    steam_operation.set(None);
+                                                });
                                             },
                                             "Unsubscribe"
                                         }
                                         button {
                                             style: settings_secondary_button_style(),
-                                            disabled: steam_helper_path.read().trim().is_empty(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
                                             onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
                                                 let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
                                                 let backend = steam_helper_backend.read().clone();
                                                 let ids = steam_command_ids.read().clone();
                                                 let mods = app_state.read().mods.clone();
-                                                match run_steam_command_with_helper(SteamCommandAction::Resubscribe, &helper_path, &backend, &ids, &mods) {
-                                                    Ok(result) => {
-                                                        mod_status.set(Some(result.status));
-                                                        last_steam_command.set(Some(result.panel));
+                                                steam_operation.set(Some("Resubscribing Workshop items".to_string()));
+                                                mod_status.set(Some("Resubscribing Workshop items...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Resubscribe, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not resubscribe: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not resubscribe: background task ended unexpectedly.".to_string())),
                                                     }
-                                                    Err(error) => mod_status.set(Some(format!("Could not resubscribe: {error}"))),
-                                                }
+                                                    steam_operation.set(None);
+                                                });
                                             },
                                             "Resubscribe"
                                         }
@@ -3087,6 +3168,16 @@ fn App() -> Element {
                                         button {
                                             style: settings_secondary_button_style(),
                                             onclick: move |_| {
+                                                match open_diagnostics_folder() {
+                                                    Ok(status) => mod_status.set(Some(status)),
+                                                    Err(error) => mod_status.set(Some(error)),
+                                                }
+                                            },
+                                            "Open folder"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
                                                 let state = app_state.read().clone();
                                                 let game_folder_snapshot = game_folder.read().clone();
                                                 let helper_path_snapshot = steam_helper_path.read().clone();
@@ -3148,6 +3239,17 @@ fn App() -> Element {
                                         div {
                                             style: settings_path_box_style(),
                                             "{steam_command_log_path_label}"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Crash log"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{panic_log_path_label}"
                                         }
                                     }
                                 }
@@ -3496,12 +3598,42 @@ fn app_diagnostic_log_path() -> PathBuf {
     diagnostics_dir().join(APP_DIAGNOSTIC_LOG_FILE)
 }
 
+fn panic_diagnostic_log_path() -> PathBuf {
+    diagnostics_dir().join(PANIC_DIAGNOSTIC_LOG_FILE)
+}
+
 fn steam_helper_command_log_path() -> PathBuf {
     diagnostics_dir().join(STEAM_HELPER_COMMAND_LOG_FILE)
 }
 
 fn diagnostic_snapshot_path() -> PathBuf {
     diagnostics_dir().join(format!("wh3mm-diagnostic-{}.txt", current_unix_ms()))
+}
+
+fn install_panic_diagnostic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let thread = thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let _ = append_app_diagnostic_log_event_to_path(
+            &panic_diagnostic_log_path(),
+            &format!("panic on thread {thread_name}: {panic_info}"),
+        );
+        default_hook(panic_info);
+    }));
+}
+
+fn open_diagnostics_folder() -> Result<String, String> {
+    let path = diagnostics_dir();
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "Could not create diagnostics folder {}: {error}",
+            path.display()
+        )
+    })?;
+    let target = path.display().to_string();
+    open_system_target(&target)?;
+    Ok(format!("Opened diagnostics folder: {target}"))
 }
 
 fn append_app_diagnostic_log_event(event: &str) -> wh3mm_core::CoreResult<PathBuf> {
@@ -3575,6 +3707,7 @@ fn diagnostic_snapshot_text(input: &DiagnosticSnapshotInput<'_>) -> String {
         format!("timestamp_unix_ms={}", current_unix_ms()),
         format!("config_dir={}", app_config_dir().display()),
         format!("app_log={}", app_diagnostic_log_path().display()),
+        format!("crash_log={}", panic_diagnostic_log_path().display()),
         format!(
             "steam_helper_command_log={}",
             steam_helper_command_log_path().display()
@@ -4590,12 +4723,31 @@ fn open_selected_mod_workshop_page(mod_row: &ModRowViewModel) -> Result<String, 
     Ok(format!("Opened Steam Workshop page: {url}"))
 }
 
+fn current_executable_dir() -> Option<PathBuf> {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
 fn project_readme_path() -> PathBuf {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    [cwd.join("README.md"), cwd.join("../../README.md")]
+    project_readme_path_from(current_executable_dir().as_deref(), &cwd)
+}
+
+fn project_readme_path_from(app_dir: Option<&Path>, cwd: &Path) -> PathBuf {
+    let packaged_path = app_dir.map(|path| path.join(PACKAGED_HELP_FILE));
+    let mut candidates = packaged_path.iter().cloned().collect::<Vec<_>>();
+    candidates.extend([
+        cwd.join(PACKAGED_HELP_FILE),
+        cwd.join("README.md"),
+        cwd.join("../../WINDOWS-ALPHA-README.md"),
+        cwd.join("../../README.md"),
+    ]);
+
+    candidates
         .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from("README.md"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| packaged_path.unwrap_or_else(|| cwd.join(PACKAGED_HELP_FILE)))
 }
 
 fn open_project_readme() -> Result<String, String> {
@@ -4621,8 +4773,8 @@ fn open_system_target(target: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn open_system_target_command(target: &str) -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "start", "", target]);
+    let mut command = Command::new("explorer.exe");
+    command.arg(target);
     command
 }
 
@@ -6625,6 +6777,18 @@ fn read_existing_launch_mod_list_pack_names(game_dir: &Path) -> Option<(String, 
     None
 }
 
+fn run_in_background<T, F>(work: F) -> oneshot::Receiver<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+}
+
 fn probe_steam_helper(helper_path: &Path, backend: &str) -> Result<String, String> {
     validate_steam_helper_path(helper_path)?;
     let mut runner =
@@ -8100,14 +8264,22 @@ fn attach_first_table_preview(
 
 fn schema_path() -> PathBuf {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    [
-        cwd.join("schema/schema_wh3.json.zst"),
+    schema_path_from(current_executable_dir().as_deref(), &cwd)
+}
+
+fn schema_path_from(app_dir: Option<&Path>, cwd: &Path) -> PathBuf {
+    let relative_path = Path::new("schema").join("schema_wh3.json.zst");
+    let packaged_path = app_dir.map(|path| path.join(&relative_path));
+    let mut candidates = packaged_path.iter().cloned().collect::<Vec<_>>();
+    candidates.extend([
+        cwd.join(&relative_path),
         cwd.join("../../schema/schema_wh3.json.zst"),
-        PathBuf::from("schema/schema_wh3.json.zst"),
-    ]
-    .into_iter()
-    .find(|path| path.exists())
-    .unwrap_or_else(|| PathBuf::from("schema/schema_wh3.json.zst"))
+    ]);
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| packaged_path.unwrap_or_else(|| cwd.join(relative_path)))
 }
 
 #[cfg(test)]
@@ -8177,9 +8349,10 @@ mod tests {
         mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_button_style,
         nav_count_chip_style, nav_icon_dot_style, nav_icon_line_style, nav_icon_ring_style,
         nav_icon_stack_style, nav_icon_tile_style, normalize_steam_helper_backend, play_icon_style,
-        play_primary_button_style, project_readme_path, read_existing_launch_mod_list_pack_names,
-        relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
-        run_steam_command_action, save_on_last_game_launch_preset_to_path,
+        play_primary_button_style, project_readme_path, project_readme_path_from,
+        read_existing_launch_mod_list_pack_names, relative_time_label,
+        rename_category_config_for_state, resolve_config_file_read_path, run_in_background,
+        run_steam_command_action, save_on_last_game_launch_preset_to_path, schema_path_from,
         secondary_page_breadcrumb, secondary_page_content_style, secondary_page_header_style,
         secondary_page_kicker_style, secondary_status_style, selected_mod_folder_target,
         selected_mod_neighbor_key, selected_mod_position_label, selected_or_first_mod_row,
@@ -8224,12 +8397,57 @@ mod tests {
     }
 
     #[test]
-    fn project_readme_path_targets_repo_readme() {
+    fn background_work_returns_without_using_the_ui_thread() {
+        let mut receiver = run_in_background(|| 42_u32);
+
+        for _ in 0..100 {
+            match receiver.try_recv() {
+                Ok(Some(value)) => {
+                    assert_eq!(value, 42);
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("background work channel was canceled: {error}"),
+            }
+        }
+
+        panic!("background work did not finish within 100ms");
+    }
+
+    #[test]
+    fn project_readme_path_targets_windows_verification_guide() {
         let readme_path = project_readme_path();
         assert_eq!(
             readme_path.file_name().and_then(|name| name.to_str()),
-            Some("README.md")
+            Some("WINDOWS-ALPHA-README.md")
         );
+    }
+
+    #[test]
+    fn packaged_resources_prefer_the_executable_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "wh3mm-dioxus-packaged-resources-{}",
+            std::process::id()
+        ));
+        let app_dir = root.join("app");
+        let cwd = root.join("working-dir");
+        let packaged_schema = app_dir.join("schema/schema_wh3.json.zst");
+        let cwd_schema = cwd.join("schema/schema_wh3.json.zst");
+        let packaged_help = app_dir.join(super::PACKAGED_HELP_FILE);
+
+        fs::create_dir_all(packaged_schema.parent().unwrap()).unwrap();
+        fs::create_dir_all(cwd_schema.parent().unwrap()).unwrap();
+        fs::write(&packaged_schema, b"packaged schema").unwrap();
+        fs::write(&cwd_schema, b"working-dir schema").unwrap();
+        fs::write(&packaged_help, b"packaged help").unwrap();
+
+        assert_eq!(schema_path_from(Some(&app_dir), &cwd), packaged_schema);
+        assert_eq!(
+            project_readme_path_from(Some(&app_dir), &cwd),
+            packaged_help
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9216,6 +9434,7 @@ mod tests {
         });
 
         assert!(snapshot.contains("status=Loaded 2 mods."));
+        assert!(snapshot.contains("crash_log="));
         assert!(snapshot.contains("helper.backend=native"));
         assert!(snapshot.contains("mods.total=2"));
         assert!(snapshot.contains("mods.enabled=2"));

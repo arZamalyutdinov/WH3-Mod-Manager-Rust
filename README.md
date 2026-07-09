@@ -38,22 +38,24 @@ Live Windows validation is still required before calling this alpha-stable.
 
 The Windows workflow is `.github/workflows/release-windows.yml`.
 
-Manual `workflow_dispatch` builds downloadable GitHub Actions artifacts and
-publishes the same files to a GitHub Release:
+Manual `workflow_dispatch` builds downloadable GitHub Actions artifacts without
+publishing a release by default:
 
 - `WH3-Mod-Manager-Rust-<tag>-win32-x64.zip`
 - `WH3-Mod-Manager-Rust-Installer-<tag>.exe`
 
-Manual runs without an explicit tag auto-resolve the next release tag in the
-same style as the TypeScript app workflow. Tag pushes publish using the pushed
-tag.
+Enable the `publish_release` input only when the files should also be published
+to a GitHub Release. Publishing runs without an explicit tag auto-resolve the
+next release tag in the same style as the TypeScript app workflow. Tag pushes
+publish using the pushed tag.
 
 The staged payload contains:
 
 - `wh3mm-dioxus.exe`
 - `helpers/wh3mm-steam-helper.exe`
-- `helpers/steam_api64.dll` when `steamworks/dist/win64/steam_api64.dll` exists
+- `helpers/steam_api64.dll`
 - `schema/`
+- `WINDOWS-ALPHA-README.md`
 
 The Rust repo intentionally copies only `steam_api64.dll` and `steam_api64.lib` from the TS Steamworks folder. The TS `steamworksjs.win32-x64-msvc.node` module is Electron-specific and is not used by the Rust helper.
 
@@ -63,7 +65,10 @@ The workflow runs a packaged-payload smoke check before creating artifacts:
 .\scripts\windows-alpha-smoke.ps1 -PayloadDir .\out\windows-payload
 ```
 
-On Windows, the same script can be pointed at an extracted zip or installed app directory to verify the app exe, helper exe, schema, Steam runtime DLL placement, and fixture-mode helper protocol.
+On Windows, the same script can be pointed at an extracted zip or installed app
+directory to verify the app exe, helper exe, schema, verification guide, Steam
+runtime DLL placement, and fixture-mode helper protocol. The full manual
+checklist is [WINDOWS-ALPHA-README.md](WINDOWS-ALPHA-README.md).
 
 ## Validation
 
@@ -83,7 +88,7 @@ cargo check --manifest-path apps/wh3mm-dioxus/Cargo.toml
 cargo clippy --manifest-path apps/wh3mm-dioxus/Cargo.toml
 ```
 
-Run the Dioxus shell with demo data:
+Run the Dioxus shell:
 
 ```sh
 cargo run --manifest-path apps/wh3mm-dioxus/Cargo.toml

@@ -9,9 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (for example: v0.1.0-alpha.1)"
+        description: "Release tag (used only when publishing; for example: v0.1.0-alpha.1)"
         required: false
         type: string
+      publish_release:
+        description: "Publish the built files to a GitHub Release"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -22,7 +27,7 @@ concurrency:
 
 jobs:
   build-and-release:
-    name: Build Windows artifact and publish release
+    name: Build Windows artifact
     if: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') || github.actor != 'github-actions[bot]' }}
     runs-on: windows-latest
     timeout-minutes: 90
@@ -33,15 +38,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve release tag
+      - name: Resolve build metadata
         id: meta
         shell: bash
         run: |
           EVENT_NAME="${{ github.event_name }}"
           REF_NAME="${{ github.ref_name }}"
           INPUT_TAG="${{ inputs.tag }}"
+          PUBLISH_RELEASE="true"
 
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" != "true" ]; then
+            PUBLISH_RELEASE="false"
+            TAG="validation-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}"
+            VERSION="0.0.0-validation.${GITHUB_RUN_NUMBER}"
+            SOURCE="manual-validation"
+            if [ -n "$INPUT_TAG" ]; then
+              echo "Ignoring release tag '$INPUT_TAG' because publish_release is false."
+            fi
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
             SOURCE="manual-input"
           elif [ "$EVENT_NAME" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
@@ -52,8 +66,8 @@ jobs:
             if [ -z "$LATEST_TAG" ]; then
               TAG="v0.0.1"
             else
-              if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-                echo "Latest tag '$LATEST_TAG' does not match expected vMAJOR.MINOR.PATCH format."
+              if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]]; then
+                echo "Latest tag '$LATEST_TAG' does not start with a semantic vMAJOR.MINOR.PATCH version."
                 exit 1
               fi
               MAJOR="${BASH_REMATCH[1]}"
@@ -70,20 +84,26 @@ jobs:
             exit 1
           fi
 
-          case "$TAG" in
-            v*) ;;
-            *)
-              echo "Release tag must start with 'v'"
-              exit 1
-              ;;
-          esac
+          if [ "$PUBLISH_RELEASE" = "true" ]; then
+            case "$TAG" in
+              v*) ;;
+              *)
+                echo "Release tag must start with 'v'"
+                exit 1
+                ;;
+            esac
+          fi
 
-          VERSION="${TAG#v}"
+          if [ -z "${VERSION:-}" ]; then
+            VERSION="${TAG#v}"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag_source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "publish_release=$PUBLISH_RELEASE" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $TAG"
           echo "Tag source: $SOURCE"
+          echo "Publish release: $PUBLISH_RELEASE"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -108,7 +128,7 @@ jobs:
             "LIB=$fullLibDir;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             Write-Host "Using vendored Steamworks link library from $fullLibDir"
           } else {
-            Write-Warning "steam_api64.lib was not found under steamworks/dist/win64 or vendor/steamworks/dist/win64. If the steamworks crate does not provide it, the native helper build may fail."
+            throw "steam_api64.lib was not found under steamworks/dist/win64 or vendor/steamworks/dist/win64."
           }
 
       - name: Core formatting
@@ -153,6 +173,7 @@ jobs:
           Copy-Item "apps\wh3mm-dioxus\target\release\wh3mm-dioxus.exe" (Join-Path $payload "wh3mm-dioxus.exe") -Force
           Copy-Item "target\release\wh3mm-steam-helper.exe" (Join-Path $helpers "wh3mm-steam-helper.exe") -Force
           Copy-Item "schema\*" $schemaOut -Recurse -Force
+          Copy-Item "WINDOWS-ALPHA-README.md" (Join-Path $payload "WINDOWS-ALPHA-README.md") -Force
 
           $steamDllCandidates = @(
             "steamworks\dist\win64\steam_api64.dll",
@@ -163,7 +184,7 @@ jobs:
             Copy-Item $steamDll (Join-Path $helpers "steam_api64.dll") -Force
             Write-Host "Included Steam runtime DLL from $steamDll"
           } else {
-            Write-Warning "steam_api64.dll was not found. Installer will still be built, but native Steam helper probe will report the missing DLL."
+            throw "steam_api64.dll was not found under steamworks/dist/win64 or vendor/steamworks/dist/win64."
           }
 
           $steamLibCandidates = @(
@@ -260,6 +281,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub release assets
+        if: ${{ steps.meta.outputs.publish_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}

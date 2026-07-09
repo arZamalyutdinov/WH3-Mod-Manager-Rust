@@ -4989,6 +4989,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "dioxus-desktop",
+ "futures-channel",
  "rfd",
  "serde",
  "serde_json",

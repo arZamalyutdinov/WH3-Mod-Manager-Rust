@@ -47,6 +47,7 @@ $appExe = Resolve-RequiredFile -Path (Join-Path $payload "wh3mm-dioxus.exe") -La
 $helperDir = Resolve-RequiredDirectory -Path (Join-Path $payload "helpers") -Label "Steam helper directory"
 $helperExe = Resolve-RequiredFile -Path (Join-Path $helperDir "wh3mm-steam-helper.exe") -Label "Steam helper executable"
 $schemaFile = Resolve-RequiredFile -Path (Join-Path $payload "schema\schema_wh3.json.zst") -Label "WH3 compressed schema"
+$helpFile = Resolve-RequiredFile -Path (Join-Path $payload "WINDOWS-ALPHA-README.md") -Label "Windows alpha verification guide"
 $steamDll = Join-Path $helperDir "steam_api64.dll"
 
 if (-not $AllowMissingSteamRuntime) {
@@ -200,6 +201,7 @@ try {
   Write-Host "App: $appExe"
   Write-Host "Helper: $helperExe"
   Write-Host "Schema: $schemaFile"
+  Write-Host "Guide: $helpFile"
 } finally {
   Set-Or-ClearEnv -Name "WH3MM_STEAM_HELPER_BACKEND" -Value $oldBackend
   Set-Or-ClearEnv -Name "WH3MM_STEAM_HELPER_FIXTURE" -Value $oldFixture
