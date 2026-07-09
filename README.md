@@ -49,6 +49,9 @@ to a GitHub Release. Publishing runs without an explicit tag auto-resolve the
 next release tag in the same style as the TypeScript app workflow. Tag pushes
 publish using the pushed tag.
 
+Pushes to `codex/windows-alpha-validation` also build artifact-only validation
+files and never publish a release.
+
 The staged payload contains:
 
 - `wh3mm-dioxus.exe`
