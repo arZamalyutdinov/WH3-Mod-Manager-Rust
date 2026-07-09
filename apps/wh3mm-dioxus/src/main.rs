@@ -5,12 +5,14 @@
 //! `AppViewModel` without reimplementing domain behavior.
 
 use dioxus::prelude::*;
+use dioxus_desktop::{Config as DesktopConfig, WindowBuilder, tao::dpi::LogicalSize};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wh3mm_core::{
@@ -45,8 +47,9 @@ use wh3mm_runtime::{
     spawn_prepared_windows_launch_with_options, validate_wh3_game_folder,
 };
 use wh3mm_ui::{
-    ModRowViewModel, PackViewModel, build_app_view_model, build_db_table_preview_view_model,
-    build_pack_contents_view_model, build_pack_flow_summary_view_model,
+    ModRowViewModel, PackFlowSummaryViewModel, PackViewModel, build_app_view_model,
+    build_db_table_preview_view_model, build_pack_contents_view_model,
+    build_pack_flow_summary_view_model,
 };
 
 const MAX_TABLE_PREVIEW_ROWS: usize = 25;
@@ -226,14 +229,6 @@ enum ModListFilter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LibraryToolTab {
-    None,
-    Presets,
-    Categories,
-    Config,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspacePage {
     Mods,
     ModDetail,
@@ -241,10 +236,19 @@ enum WorkspacePage {
     Collections,
     Compatibility,
     DbViewer,
+    Skills,
     Checks,
     Steam,
     Workshop,
     Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsFocus {
+    General,
+    GamePaths,
+    Launch,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,11 +257,25 @@ enum LibraryNavTarget {
     Enabled,
     Categories,
     Collections,
-    Settings,
 }
 
 fn main() {
-    dioxus::launch(App);
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(
+            DesktopConfig::new()
+                .with_window(
+                    WindowBuilder::new()
+                        .with_title(desktop_window_title())
+                        .with_inner_size(LogicalSize::new(1600.0, 1000.0))
+                        .with_min_inner_size(LogicalSize::new(1180.0, 760.0)),
+                )
+                .with_menu(None),
+        )
+        .launch(App);
+}
+
+fn desktop_window_title() -> &'static str {
+    "WH3 Mod Manager"
 }
 
 fn initial_workspace_page() -> WorkspacePage {
@@ -266,6 +284,17 @@ fn initial_workspace_page() -> WorkspacePage {
     } else {
         WorkspacePage::Mods
     }
+}
+
+#[cfg(test)]
+fn default_tool_workspace_pages() -> [WorkspacePage; 5] {
+    [
+        WorkspacePage::Compatibility,
+        WorkspacePage::Settings,
+        WorkspacePage::ModDetail,
+        WorkspacePage::DbViewer,
+        WorkspacePage::Skills,
+    ]
 }
 
 #[component]
@@ -283,8 +312,11 @@ fn App() -> Element {
     let mut show_hidden = use_signal(|| false);
     let mut mod_search = use_signal(String::new);
     let mut mod_list_filter = use_signal(|| ModListFilter::All);
-    let mut library_tool_tab = use_signal(|| LibraryToolTab::None);
+    let mut archive_filters_expanded = use_signal(|| false);
+    let mut archive_actions_expanded = use_signal(|| false);
     let mut workspace_page = use_signal(initial_workspace_page);
+    let mut settings_focus = use_signal(|| SettingsFocus::General);
+    let mut tools_more_expanded = use_signal(|| false);
     let mut selected_mod_key = use_signal(|| None::<String>);
     let mut conflict_report = use_signal(|| None::<PackConflictReport>);
     let mut launch_preview = use_signal(|| None::<LaunchPreview>);
@@ -319,8 +351,6 @@ fn App() -> Element {
         combined_status(mod_status.read().as_deref(), status_message.as_deref());
     let all_mod_rows = view_model.mods.clone();
     let current_mod_filter = *mod_list_filter.read();
-    let current_mod_filter_label = mod_list_filter_label(current_mod_filter);
-    let current_library_tool = *library_tool_tab.read();
     let current_workspace_page = *workspace_page.read();
     let visible_rows = all_mod_rows
         .iter()
@@ -331,6 +361,9 @@ fn App() -> Element {
         .cloned()
         .collect::<Vec<_>>();
     let mod_search_query = mod_search.read().trim().to_ascii_lowercase();
+    let archive_filter_count = usize::from(current_mod_filter != ModListFilter::All)
+        + usize::from(!mod_search_query.is_empty());
+    let current_settings_focus = *settings_focus.read();
     let filtered_mods = if mod_search_query.is_empty() {
         visible_rows
     } else {
@@ -340,10 +373,29 @@ fn App() -> Element {
             .cloned()
             .collect::<Vec<_>>()
     };
-    let filtered_mod_count = filtered_mods.len();
+    let explicitly_selected_mod_key = selected_mod_key.read().clone().filter(|key| {
+        filtered_mods
+            .iter()
+            .any(|mod_row| mod_row.key.as_str() == key.as_str())
+    });
     let selected_mod =
-        selected_or_first_mod_row(&filtered_mods, selected_mod_key.read().as_deref());
+        selected_or_first_mod_row(&filtered_mods, explicitly_selected_mod_key.as_deref());
     let active_mod_key = selected_mod.as_ref().map(|mod_row| mod_row.key.clone());
+    let selected_mod_position = selected_mod_position_label(
+        &filtered_mods,
+        active_mod_key.as_deref(),
+        explicitly_selected_mod_key.is_some(),
+    );
+    let previous_mod_key = selected_mod_neighbor_key(&filtered_mods, active_mod_key.as_deref(), -1);
+    let next_mod_key = selected_mod_neighbor_key(&filtered_mods, active_mod_key.as_deref(), 1);
+    let has_selected_mod = selected_mod.is_some();
+    let has_explicitly_selected_mod = explicitly_selected_mod_key.is_some();
+    let mod_settings_action_disabled = mod_settings_action_disabled(has_selected_mod);
+    let mod_settings_action_title = mod_settings_action_title(
+        all_mod_rows.len(),
+        has_selected_mod,
+        has_explicitly_selected_mod,
+    );
     let current_launch_options = launch_options.read().clone();
     let current_launch_save_name = launch_save_name.read().clone();
     let current_launch_fingerprint = launch_state_fingerprint(
@@ -351,10 +403,6 @@ fn App() -> Element {
         &current_launch_options,
         &current_launch_save_name,
     );
-    let visible_mod_count = all_mod_rows
-        .iter()
-        .filter(|mod_row| !mod_row.hidden)
-        .count();
     let enabled_mod_count = all_mod_rows
         .iter()
         .filter(|mod_row| mod_row.enabled)
@@ -372,12 +420,15 @@ fn App() -> Element {
         .iter()
         .filter(|mod_record| mod_record.effectively_enabled())
         .count();
-    let current_game_folder_label = game_folder
-        .read()
+    let selected_game_folder = game_folder.read().clone();
+    let current_game_folder_label = selected_game_folder
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No WH3 folder selected".to_string());
-    let readiness_game_folder = game_folder.read().clone();
+    let current_game_executable_label =
+        settings_game_executable_label(selected_game_folder.as_deref());
+    let current_game_data_label = settings_game_data_label(selected_game_folder.as_deref());
+    let readiness_game_folder = selected_game_folder.clone();
     let readiness_helper_path = steam_helper_path.read().clone();
     let alpha_readiness = build_alpha_readiness_report(
         readiness_game_folder.as_deref(),
@@ -407,11 +458,11 @@ fn App() -> Element {
         main {
             style: "height: 100vh; min-height: 0; background: #0f1218; color: #f2f5f2; font-family: Inter, ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden;",
             header {
-                style: "height: 66px; border-bottom: 1px solid #263041; background: #121620; display: grid; grid-template-columns: minmax(220px, auto) minmax(300px, 520px) minmax(250px, 1fr); align-items: center; gap: 16px; padding: 8px 18px; flex-shrink: 0;",
+                style: top_shell_header_style(),
                 div {
                     style: "min-width: 0; display: grid; gap: 2px;",
                     h1 {
-                        style: "font-size: 21px; line-height: 27px; margin: 0; color: #f8fafc; letter-spacing: 0; white-space: nowrap; text-transform: uppercase;",
+                        style: top_brand_title_style(),
                         "{app_brand_title()}"
                     }
                     div {
@@ -420,32 +471,38 @@ fn App() -> Element {
                     }
                 }
                 div {
-                    style: "min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid #35374a; background: #242531; border-radius: 5px; padding: 0 10px;",
+                    style: top_search_style(),
                     span {
-                        style: "font-size: 13px; color: #7d8ea3;",
-                        "Search"
+                        style: top_search_icon_style(),
+                        span { style: top_search_icon_handle_style(), "" }
                     }
                     input {
                         style: "width: 100%; min-width: 0; height: 38px; border: 0; outline: 0; background: transparent; color: #edf2f7; font-size: 14px;",
                         value: "{mod_search}",
-                        placeholder: "Name, pack path, tag, category",
+                        placeholder: "Search mods...",
+                        onfocus: move |_| {
+                            if top_search_should_route_to_mods(current_workspace_page) {
+                                workspace_page.set(WorkspacePage::Mods);
+                            }
+                        },
                         oninput: move |event| {
                             mod_search.set(event.value());
                         },
                     }
                 }
                 div {
-                    style: "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #9fb0c0; font-size: 12px; white-space: nowrap;",
-                    span { style: header_metric_style(), "{filtered_mod_count} shown" }
-                    span { style: header_metric_style(), "{launch_enabled_mod_count} enabled" }
-                    span { style: header_metric_style(), "{hidden_mod_count} hidden" }
+                    style: top_actions_style(),
                     button {
                         title: "Alpha readiness: {alpha_readiness_summary}",
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Checks),
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Checks);
                         },
-                        "CHK"
+                        span {
+                            style: top_icon_glyph_style(),
+                            span { style: top_bell_body_style(), "" }
+                            span { style: top_bell_clapper_style(), "" }
+                        }
                     }
                     button {
                         title: "Workshop commands",
@@ -453,16 +510,26 @@ fn App() -> Element {
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Workshop);
                         },
-                        "WS"
+                        span {
+                            style: top_icon_glyph_style(),
+                            span { style: top_download_status_dot_style(), "" }
+                            span { style: top_download_stem_style(), "" }
+                            span { style: top_download_arrow_style(), "" }
+                            span { style: top_download_tray_style(), "" }
+                        }
                     }
                     button {
                         title: "Settings",
-                        style: top_icon_button_style(current_workspace_page == WorkspacePage::Settings),
+                        style: top_icon_button_style(settings_workspace_active(current_workspace_page)),
                         onclick: move |_| {
+                            settings_focus.set(SettingsFocus::General);
                             workspace_page.set(WorkspacePage::Settings);
-                            library_tool_tab.set(LibraryToolTab::None);
                         },
-                        "SET"
+                        span {
+                            style: top_icon_glyph_style(),
+                            span { style: top_profile_head_style(), "" }
+                            span { style: top_profile_body_style(), "" }
+                        }
                     }
                 }
             }
@@ -488,473 +555,818 @@ fn App() -> Element {
                                 LibraryNavTarget::AllMods,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Mods);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "ALL" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::AllMods,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_dot_style(), "" }
+                            }
                             span { "All mods" }
-                            strong { "{total_mod_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::AllMods,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{total_mod_count}"
+                            }
                         }
                         button {
                             style: nav_button_style(library_nav_active(
                                 LibraryNavTarget::Enabled,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Mods);
                                 mod_list_filter.set(ModListFilter::Enabled);
-                                library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "ON" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::Enabled,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_line_style(), "" }
+                            }
                             span { "Enabled" }
-                            strong { "{enabled_mod_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::Enabled,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{enabled_mod_count}"
+                            }
                         }
                         button {
                             style: nav_button_style(library_nav_active(
                                 LibraryNavTarget::Categories,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Categories);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "CAT" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::Categories,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_line_style(), "" }
+                            }
                             span { "Categories" }
-                            strong { "{saved_category_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::Categories,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{saved_category_count}"
+                            }
                         }
                         button {
                             style: nav_button_style(library_nav_active(
                                 LibraryNavTarget::Collections,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Collections);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "COL" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::Collections,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_stack_style(), "" }
+                            }
                             span { "Collections" }
-                            strong { "{saved_preset_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::Collections,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{saved_preset_count}"
+                            }
                         }
-                        button {
-                            style: nav_button_style(library_nav_active(
-                                LibraryNavTarget::Settings,
-                                current_workspace_page,
-                                current_mod_filter,
-                                current_library_tool,
-                            )),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::None);
-                            },
-                            span { style: nav_badge_style(), "SET" }
-                            span { "Settings" }
-                            strong { "" }
+                        if library_settings_nav_visible(current_workspace_page) {
+                            button {
+                                style: nav_button_style(true),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::General);
+                                    workspace_page.set(WorkspacePage::Settings);
+                                },
+                                span {
+                                    style: nav_icon_tile_style(true),
+                                    span { style: nav_icon_ring_style(), "" }
+                                }
+                                span { "Settings" }
+                            }
                         }
                     }
-                    if current_workspace_page == WorkspacePage::Mods {
                     div {
-                        style: "display: grid; gap: 6px; margin-bottom: 18px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Game folder"
+                        style: "margin-top: auto; padding-top: 18px; border-top: 1px solid #2b2d3a; display: grid; gap: 8px;",
+                        button {
+                            title: "Diagnostics and log paths",
+                            style: library_utility_button_style(settings_focus_active(
+                                current_workspace_page,
+                                current_settings_focus,
+                                SettingsFocus::Diagnostics,
+                            )),
+                            onclick: move |_| {
+                                settings_focus.set(SettingsFocus::Diagnostics);
+                                workspace_page.set(WorkspacePage::Settings);
+                            },
+                            span {
+                                style: nav_icon_tile_style(settings_focus_active(
+                                    current_workspace_page,
+                                    current_settings_focus,
+                                    SettingsFocus::Diagnostics,
+                                )),
+                                span { style: nav_icon_line_style(), "" }
+                                span { style: nav_icon_line_style(), "" }
+                            }
+                            span { "Logs" }
+                        }
+                        button {
+                            title: "Open project README",
+                            style: library_utility_button_style(false),
+                            onclick: move |_| {
+                                match open_project_readme() {
+                                    Ok(status) => mod_status.set(Some(status)),
+                                    Err(error) => mod_status.set(Some(error)),
+                                }
+                            },
+                            span {
+                                style: nav_icon_tile_style(false),
+                                span { style: nav_icon_stack_style(), "" }
+                                span { style: nav_icon_line_style(), "" }
+                            }
+                            span { "Wiki" }
+                        }
+                    }
+                }
+                aside {
+                    style: tools_rail_style(),
+                    div {
+                        style: tools_header_style(),
+                        h2 {
+                            style: "font-size: 18px; line-height: 24px; margin: 0; color: #edf2f7;",
+                            "Play & Tools"
                         }
                         div {
-                            style: "font-size: 12px; line-height: 17px; color: #cbd8cc; overflow-wrap: anywhere;",
-                            "{current_game_folder_label}"
+                            style: "font-size: 11px; line-height: 15px; color: #9fb0a3; text-transform: uppercase;",
+                            "Instance: Default"
                         }
                     }
                     button {
-                        style: "width: 100%; border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px; margin: -8px 0 18px;",
+                        style: play_primary_button_style(),
                         onclick: move |_| {
-                            if let Some(selected_game_folder) = pick_game_folder() {
-                                match save_game_folder(&selected_game_folder) {
+                            let selected_game_folder = select_game_folder(game_folder.read().clone());
+                            if let Some(selected_game_folder) = selected_game_folder {
+                                let state = app_state.read().clone();
+                                let launch_options = launch_options.read().clone();
+                                let save_name = launch_save_name.read().clone();
+                                let close_on_play = launch_options.close_on_play;
+                                match save_game_folder(&selected_game_folder)
+                                    .and_then(|_| launch_game_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                {
                                     Ok(status) => {
                                         game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(status));
+                                        saved_presets.set(load_preset_names());
+                                        schedule_close_on_play_if_requested(close_on_play);
+                                        mod_status.set(Some(launch_status_with_close_on_play(
+                                            status,
+                                            close_on_play,
+                                        )));
                                     }
-                                    Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
+                                    Err(error) => mod_status.set(Some(format!("Could not launch game: {}", error.message))),
                                 }
                             }
                         },
-                        "Set game folder"
+                        span { style: play_icon_style(), "" }
+                        span { "PLAY GAME" }
                     }
-                    if current_library_tool == LibraryToolTab::Presets {
-                    section {
-                        style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Preset"
-                        }
-                        input {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{preset_name}",
-                            placeholder: "Preset name",
-                            oninput: move |event| {
-                                preset_name.set(event.value());
-                            },
-                        }
-                        select {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{preset_name}",
-                            onchange: move |event| {
-                                let value = event.value();
-                                if !value.trim().is_empty() {
-                                    preset_name.set(value);
-                                }
-                            },
-                            option {
-                                value: "",
-                                "Presets"
+                    button {
+                        style: continue_save_button_style(current_launch_save_name.trim().is_empty()),
+                        onclick: move |_| {
+                            let save_name = launch_save_name.read().trim().to_string();
+                            if save_name.is_empty() {
+                                mod_status.set(Some("Set a campaign save name in Settings before continuing a save.".to_string()));
+                                settings_focus.set(SettingsFocus::Launch);
+                                workspace_page.set(WorkspacePage::Settings);
+                                return;
                             }
-                            for saved_preset in saved_presets.read().iter() {
-                                option {
-                                    value: "{saved_preset}",
-                                    "{saved_preset}"
-                                }
-                            }
-                        }
-                        div {
-                            style: "display: grid; grid-template-columns: 1fr 1fr; gap: 6px;",
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let name = preset_name.read().trim().to_string();
-                                    let state = app_state.read().clone();
-                                    match save_named_preset(&name, &state) {
-                                        Ok(status) => {
-                                            saved_presets.set(load_preset_names());
-                                            mod_status.set(Some(status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not save preset: {}", error.message))),
-                                    }
-                                },
-                                "Save"
-                            }
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let name = preset_name.read().trim().to_string();
-                                    let state = app_state.read().clone();
-                                    match load_named_preset(&name, &state) {
-                                        Ok((mods, status)) => {
-                                            let mut next_state = state.clone();
-                                            let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                            match save_mod_state(&next_state) {
-                                                Ok(save_status) => mod_status.set(Some(format!("{status} {save_status}"))),
-                                                Err(error) => mod_status.set(Some(format!("{status} Could not save mod state: {}", error.message))),
-                                            }
-                                            app_state.set(next_state);
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not load preset: {}", error.message))),
-                                    }
-                                },
-                                "Load"
-                            }
-                        }
-                        button {
-                            style: "border: 1px solid #7f1d1d; background: #451a1a; color: #fecaca; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                let name = preset_name.read().trim().to_string();
-                                match delete_named_preset(&name) {
-                                    Ok(status) => {
-                                        let names = load_preset_names();
-                                        let next_name = if names.iter().any(|saved_name| saved_name == &name) {
-                                            name
-                                        } else {
-                                            names.first().cloned().unwrap_or_else(|| "Prototype preset".to_string())
-                                        };
-                                        preset_name.set(next_name);
-                                        saved_presets.set(names);
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not delete preset: {}", error.message))),
-                                }
-                            },
-                            "Delete preset"
-                        }
-                    }
-                    }
-                    if current_library_tool == LibraryToolTab::Categories {
-                    section {
-                        style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Category"
-                        }
-                        input {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{category_name}",
-                            placeholder: "Category",
-                            oninput: move |event| {
-                                category_name.set(event.value());
-                            },
-                        }
-                        select {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{selected_category_name}",
-                            onchange: move |event| {
-                                let value = event.value();
-                                if !value.trim().is_empty() {
-                                    selected_category_name.set(value.clone());
-                                    category_name.set(value);
-                                }
-                            },
-                            option {
-                                value: "",
-                                "Categories"
-                            }
-                            for saved_category in saved_categories.read().iter() {
-                                option {
-                                    value: "{saved_category}",
-                                    "{saved_category}"
-                                }
-                            }
-                        }
-                        select {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{category_color}",
-                            onchange: move |event| {
-                                category_color.set(event.value());
-                            },
-                            option { value: "blue", "Blue" }
-                            option { value: "green", "Green" }
-                            option { value: "yellow", "Yellow" }
-                            option { value: "red", "Red" }
-                            option { value: "purple", "Purple" }
-                            option { value: "gray", "Gray" }
-                        }
-                        div {
-                            style: "display: grid; grid-template-columns: 1fr 1fr; gap: 6px;",
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let category = category_name.read().trim().to_string();
-                                    let color = category_color.read().trim().to_string();
-                                    match save_category_definition(&category, &color) {
-                                        Ok(status) => {
-                                            saved_categories.set(load_category_names());
-                                            mod_status.set(Some(status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not save category: {}", error.message))),
-                                    }
-                                },
-                                "Save"
-                            }
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let old_category = selected_category_name.read().trim().to_string();
-                                    let new_category = category_name.read().trim().to_string();
-                                    let state = app_state.read().clone();
-                                    match rename_category_definition(&old_category, &new_category, &state) {
-                                        Ok((mods, status)) => {
-                                            let mut next_state = app_state.read().clone();
-                                            let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                            app_state.set(next_state);
-                                            selected_category_name.set(new_category);
-                                            saved_categories.set(load_category_names());
-                                            mod_status.set(Some(status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not rename category: {}", error.message))),
-                                    }
-                                },
-                                "Rename"
-                            }
-                        }
-                        button {
-                            style: "border: 1px solid #7f1d1d; background: #451a1a; color: #fecaca; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                let category = selected_category_name.read().trim().to_string();
+                            let selected_game_folder = select_game_folder(game_folder.read().clone());
+                            if let Some(selected_game_folder) = selected_game_folder {
                                 let state = app_state.read().clone();
-                                match delete_category_definition(&category, &state) {
-                                    Ok((mods, status)) => {
-                                        let mut next_state = app_state.read().clone();
-                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                        app_state.set(next_state);
-                                        let names = load_category_names();
-                                        let next_category = names.first().cloned().unwrap_or_else(|| "Core".to_string());
-                                        category_name.set(next_category.clone());
-                                        selected_category_name.set(next_category);
-                                        saved_categories.set(names);
-                                        mod_status.set(Some(status));
+                                let launch_options = launch_options.read().clone();
+                                let close_on_play = launch_options.close_on_play;
+                                match save_game_folder(&selected_game_folder)
+                                    .and_then(|_| launch_game_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                {
+                                    Ok(status) => {
+                                        game_folder.set(Some(selected_game_folder));
+                                        saved_presets.set(load_preset_names());
+                                        schedule_close_on_play_if_requested(close_on_play);
+                                        mod_status.set(Some(launch_status_with_close_on_play(
+                                            status,
+                                            close_on_play,
+                                        )));
                                     }
-                                    Err(error) => mod_status.set(Some(format!("Could not delete category: {}", error.message))),
+                                    Err(error) => mod_status.set(Some(format!("Could not continue save: {}", error.message))),
                                 }
-                            },
-                            "Delete category"
-                        }
-                    }
-                    }
-                    if current_library_tool == LibraryToolTab::Config {
-                    section {
-                        style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Config"
-                        }
-                        label {
-                            style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                            input {
-                                r#type: "checkbox",
-                                checked: *show_hidden.read(),
-                                onchange: move |event| {
-                                    show_hidden.set(event.checked());
-                                },
                             }
-                            "Show hidden mods"
-                        }
-                        button {
-                            style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                if let Some(config_path) = pick_legacy_ts_config_file() {
-                                    let state = app_state.read().clone();
-                                    match import_legacy_ts_config_into_app(&state, &config_path) {
-                                        Ok(imported) => {
-                                            let mut next_state = state.clone();
-                                            let _ = next_state.apply(CoreCommand::ReplaceMods { mods: imported.mods });
-                                            app_state.set(next_state);
-                                            if let Some(imported_game_folder) = imported.game_folder {
-                                                game_folder.set(Some(imported_game_folder));
+                        },
+                        span { "Continue Last Save" }
+                        span { ">" }
+                    }
+                    if current_workspace_page == WorkspacePage::ModDetail
+                        && let Some(context_mod) = selected_mod.clone()
+                    {
+                        div {
+                            style: tool_context_panel_style(),
+                            div {
+                                style: tool_context_summary_style(),
+                                div {
+                                    style: tool_context_label_style(),
+                                    "{mod_context_label(has_explicitly_selected_mod)}"
+                                }
+                                div {
+                                    style: tool_context_name_style(),
+                                    "{context_mod.display_name}"
+                                }
+                                div {
+                                    style: tool_context_path_style(),
+                                    "{context_mod.subtitle}"
+                                }
+                                div {
+                                    style: tool_context_meta_style(),
+                                    span {
+                                        style: tool_context_meta_chip_style(),
+                                        "{mod_state_label(&context_mod)}"
+                                    }
+                                    span {
+                                        style: tool_context_meta_chip_style(),
+                                        "{mod_source_label(&context_mod)}"
+                                    }
+                                }
+                            }
+                            div {
+                                style: tool_context_actions_style(),
+                                button {
+                                    title: "Open this mod folder",
+                                    style: tool_context_action_style(false),
+                                    onclick: {
+                                        let context_mod = context_mod.clone();
+                                        move |_| {
+                                            match open_selected_mod_folder(&context_mod) {
+                                                Ok(status) => mod_status.set(Some(status)),
+                                                Err(error) => mod_status.set(Some(error)),
                                             }
-                                            launch_options.set(imported.launch_options);
-                                            saved_presets.set(load_preset_names());
-                                            let categories = load_category_names();
-                                            let next_category = categories.first().cloned().unwrap_or_else(|| "Core".to_string());
-                                            category_name.set(next_category.clone());
-                                            selected_category_name.set(next_category);
-                                            saved_categories.set(categories);
-                                            mod_status.set(Some(imported.status));
                                         }
-                                        Err(error) => mod_status.set(Some(format!("Could not import TS config: {}", error.message))),
+                                    },
+                                    "Open Folder"
+                                }
+                                button {
+                                    title: "Open this mod in Steam Workshop",
+                                    style: tool_context_action_style(mod_workshop_id_from_row(&context_mod).is_none()),
+                                    disabled: mod_workshop_id_from_row(&context_mod).is_none(),
+                                    onclick: {
+                                        let context_mod = context_mod.clone();
+                                        move |_| {
+                                            match open_selected_mod_workshop_page(&context_mod) {
+                                                Ok(status) => mod_status.set(Some(status)),
+                                                Err(error) => mod_status.set(Some(error)),
+                                            }
+                                        }
+                                    },
+                                    "View Workshop"
+                                }
+                            }
+                            button {
+                                title: "Toggle this mod",
+                                style: tool_context_toggle_style(context_mod.locked),
+                                disabled: context_mod.locked,
+                                onclick: {
+                                    let mod_key = context_mod.key.clone();
+                                    move |_| {
+                                        let mut next_state = app_state.read().clone();
+                                        if let Some(identity) = identity_for_mod_key(&next_state, &mod_key) {
+                                            match next_state.apply(CoreCommand::ToggleMod { identity }) {
+                                                Ok(_) => {
+                                                    match save_mod_state(&next_state) {
+                                                        Ok(status) => mod_status.set(Some(status)),
+                                                        Err(error) => mod_status.set(Some(format!("Could not save mod state: {}", error.message))),
+                                                    }
+                                                    app_state.set(next_state);
+                                                }
+                                                Err(error) => mod_status.set(Some(format!("Could not toggle mod: {}", error.message))),
+                                            }
+                                        }
+                                    }
+                                },
+                                span { "Toggle Mod" }
+                                span {
+                                    style: toggle_label_style(context_mod.enabled),
+                                    span {
+                                        style: settings_toggle_knob_style(context_mod.enabled),
+                                        ""
                                     }
                                 }
+                            }
+                        }
+                        div {
+                            style: tool_context_screen_group_style(),
+                            div {
+                                style: tool_context_label_style(),
+                                "{tool_other_screens_group_label()}"
+                            }
+                            button {
+                                title: "Current screen",
+                                style: tool_context_screen_button_style(true),
+                                disabled: true,
+                                span { "Mod Settings" }
+                                span { "Current" }
+                            }
+                            button {
+                                title: "Return to the full mod archive",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Mods);
+                                },
+                                span { "Mod Archive" }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
+                                    mod_status.set(Some(conflict_status(&report)));
+                                    conflict_report.set(Some(report));
+                                    workspace_page.set(WorkspacePage::Compatibility);
+                                },
+                                span { "Compatibility" }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Launch);
+                                    workspace_page.set(WorkspacePage::Settings);
+                                },
+                                span { "Launch Options" }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::DbViewer);
+                                },
+                                span { "DB Viewer" }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Skills);
+                                },
+                                span { "Skills" }
+                                span { ">" }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Settings {
+                        div {
+                            style: tool_context_screen_group_style(),
+                            div {
+                                style: tool_context_label_style(),
+                                "{tool_settings_views_group_label()}"
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::General { "Current screen" } else { "Open Settings overview" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::General),
+                                disabled: current_settings_focus == SettingsFocus::General,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::General);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::General)}" }
+                                span { if current_settings_focus == SettingsFocus::General { "Current" } else { ">" } }
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::GamePaths { "Current screen" } else { "Open game and helper paths" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::GamePaths),
+                                disabled: current_settings_focus == SettingsFocus::GamePaths,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::GamePaths);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::GamePaths)}" }
+                                span { if current_settings_focus == SettingsFocus::GamePaths { "Current" } else { ">" } }
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::Launch { "Current screen" } else { "Open launch options" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::Launch),
+                                disabled: current_settings_focus == SettingsFocus::Launch,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Launch);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::Launch)}" }
+                                span { if current_settings_focus == SettingsFocus::Launch { "Current" } else { ">" } }
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::Diagnostics { "Current screen" } else { "Open diagnostics and logs" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::Diagnostics),
+                                disabled: current_settings_focus == SettingsFocus::Diagnostics,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Diagnostics);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::Diagnostics)}" }
+                                span { if current_settings_focus == SettingsFocus::Diagnostics { "Current" } else { ">" } }
+                            }
+                        }
+                        div {
+                            style: tool_context_screen_group_style(),
+                            div {
+                                style: tool_context_label_style(),
+                                "{tool_other_screens_group_label()}"
+                            }
+                            button {
+                                title: "Return to the mod archive",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Mods);
+                                },
+                                span { "Mod Archive" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "Analyze enabled mods and open compatibility",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
+                                    mod_status.set(Some(conflict_status(&report)));
+                                    conflict_report.set(Some(report));
+                                    workspace_page.set(WorkspacePage::Compatibility);
+                                },
+                                span { "Compatibility" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "{mod_settings_action_title}",
+                                style: if mod_settings_action_disabled {
+                                    tool_context_disabled_screen_button_style()
+                                } else {
+                                    tool_context_screen_button_style(false)
+                                },
+                                disabled: mod_settings_action_disabled,
+                                onclick: {
+                                    let target_mod_key = active_mod_key.clone();
+                                    move |_| {
+                                        if let Some(mod_key) = target_mod_key.clone() {
+                                            selected_mod_key.set(Some(mod_key));
+                                        }
+                                        workspace_page.set(WorkspacePage::ModDetail);
+                                    }
+                                },
+                                span { "Mod Settings" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "Open pack and DB viewer",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::DbViewer);
+                                },
+                                span { "DB Viewer" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "Open WH3MM skills and user-flow data",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Skills);
+                                },
+                                span { "Skills" }
+                                span { ">" }
+                            }
+                        }
+                    } else {
+                    div {
+                        style: tool_action_group_style(),
+                        button {
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Compatibility),
+                            onclick: move |_| {
+                                let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
+                                mod_status.set(Some(conflict_status(&report)));
+                                conflict_report.set(Some(report));
+                                workspace_page.set(WorkspacePage::Compatibility);
                             },
-                            "Import TS config"
+                            span { "Check Compatibility" }
+                            span { ">" }
                         }
                         button {
-                            style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
+                            style: tool_action_button_style(settings_focus_active(
+                                current_workspace_page,
+                                current_settings_focus,
+                                SettingsFocus::Launch,
+                            )),
                             onclick: move |_| {
-                                if let Some(config_path) = pick_legacy_ts_config_save_file() {
-                                    let state = app_state.read().clone();
-                                    let options = launch_options.read().clone();
-                                    match export_legacy_ts_config_from_app(&state, &options, &config_path) {
-                                        Ok(status) => mod_status.set(Some(status)),
-                                        Err(error) => mod_status.set(Some(format!("Could not export TS config: {}", error.message))),
+                                settings_focus.set(SettingsFocus::Launch);
+                                workspace_page.set(WorkspacePage::Settings);
+                            },
+                            span { "Launch Options" }
+                            span { ">" }
+                        }
+                        button {
+                            title: "{mod_settings_action_title}",
+                            style: if mod_settings_action_disabled {
+                                tool_action_disabled_button_style()
+                            } else {
+                                tool_action_button_style(current_workspace_page == WorkspacePage::ModDetail)
+                            },
+                            disabled: mod_settings_action_disabled,
+                            onclick: {
+                                let target_mod_key = active_mod_key.clone();
+                                move |_| {
+                                    if let Some(mod_key) = target_mod_key.clone() {
+                                        selected_mod_key.set(Some(mod_key));
                                     }
+                                    workspace_page.set(WorkspacePage::ModDetail);
                                 }
                             },
-                            "Export TS config"
+                            span { "Mod Settings" }
+                            span { ">" }
+                        }
+                        button {
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::DbViewer),
+                            onclick: move |_| {
+                                workspace_page.set(WorkspacePage::DbViewer);
+                            },
+                            span { "DB Viewer" }
+                            span { ">" }
+                        }
+                        button {
+                            title: "WH3MM user-flow and skill data from opened packs",
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Skills),
+                            onclick: move |_| {
+                                workspace_page.set(WorkspacePage::Skills);
+                            },
+                            span { "Skills" }
+                            span { ">" }
+                        }
+                    }
+                    div {
+                        style: tool_aux_group_style(),
+                        button {
+                            title: "Show Steam, Workshop, and readiness tools",
+                            style: tool_aux_button_style(
+                                *tools_more_expanded.read()
+                                    || matches!(
+                                        current_workspace_page,
+                                        WorkspacePage::Steam | WorkspacePage::Workshop | WorkspacePage::Checks
+                                    ),
+                            ),
+                            onclick: move |_| {
+                                let expanded = *tools_more_expanded.read();
+                                tools_more_expanded.set(!expanded);
+                            },
+                            span { "More Tools" }
+                            span { if *tools_more_expanded.read() { "^" } else { ">" } }
+                        }
+                        if *tools_more_expanded.read()
+                            || matches!(
+                                current_workspace_page,
+                                WorkspacePage::Steam | WorkspacePage::Workshop | WorkspacePage::Checks
+                            )
+                        {
+                            div {
+                                style: tool_more_group_style(),
+                                button {
+                                    title: "Steam helper and workshop metadata",
+                                    style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Steam);
+                                    },
+                                    span { "Steam" }
+                                    span { ">" }
+                                }
+                                button {
+                                    title: "Workshop command queue",
+                                    style: tool_action_button_style(current_workspace_page == WorkspacePage::Workshop),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Workshop);
+                                    },
+                                    span { "Workshop" }
+                                    span { ">" }
+                                }
+                                button {
+                                    title: "Readiness checks",
+                                    style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Checks);
+                                    },
+                                    span { "Checks" }
+                                    span { ">" }
+                                }
+                            }
                         }
                     }
                     }
-                    } else if current_workspace_page == WorkspacePage::ModDetail {
+                    div {
+                        style: "margin-top: auto; padding-top: 18px;",
+                        button {
+                            title: "Open project README",
+                            style: tool_footer_button_style(false),
+                            onclick: move |_| {
+                                match open_project_readme() {
+                                    Ok(status) => mod_status.set(Some(status)),
+                                    Err(error) => mod_status.set(Some(error)),
+                                }
+                            },
+                            span { "Help / FAQ" }
+                            span { "?" }
+                        }
+                    }
+                }
+                section {
+                    style: "grid-area: content; min-width: 0; min-height: 0; overflow: auto; padding: 0; background: #11111a;",
+                    if current_workspace_page == WorkspacePage::ModDetail {
                         header {
-                            style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 32px 40px 20px; border-bottom: 1px solid #263041;",
+                            style: detail_page_header_style(),
                             div {
                                 style: "min-width: 0; display: grid; gap: 7px;",
+                                div {
+                                    style: detail_page_kicker_style(),
+                                    "{mod_detail_breadcrumb()}"
+                                }
                                 h2 {
-                                    style: "font-size: 25px; line-height: 32px; margin: 0; color: #f8fafc;",
-                                    "Mod Settings"
+                                    style: "font-size: 25px; line-height: 32px; margin: 0; color: #f8fafc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                    if let Some(selected_mod) = selected_mod.as_ref() {
+                                        "{selected_mod.display_name}"
+                                    } else {
+                                        "Mod Settings"
+                                    }
                                 }
                                 div {
                                     style: "font-size: 14px; line-height: 20px; color: #bccabb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
                                     if let Some(selected_mod) = selected_mod.as_ref() {
-                                        "{selected_mod.display_name}"
+                                        "Author: {mod_author_label(selected_mod, &current_steam_metadata)} / {selected_mod.subtitle}"
                                     } else {
                                         "Select a mod from the archive to inspect it here."
                                     }
                                 }
                             }
-                            button {
-                                style: settings_secondary_button_style(),
-                                onclick: move |_| {
-                                    workspace_page.set(WorkspacePage::Mods);
-                                },
-                                "Back to mods"
+                            div {
+                                style: detail_header_actions_style(),
+                                span {
+                                    style: detail_position_label_style(),
+                                    "{selected_mod_position}"
+                                }
+                                button {
+                                    title: "Previous mod in current archive view",
+                                    style: detail_header_nav_button_style(previous_mod_key.is_none()),
+                                    disabled: previous_mod_key.is_none(),
+                                    onclick: {
+                                        let previous_mod_key = previous_mod_key.clone();
+                                        move |_| {
+                                            if let Some(mod_key) = previous_mod_key.clone() {
+                                                selected_mod_key.set(Some(mod_key));
+                                            }
+                                        }
+                                    },
+                                    "Prev"
+                                }
+                                button {
+                                    title: "Next mod in current archive view",
+                                    style: detail_header_nav_button_style(next_mod_key.is_none()),
+                                    disabled: next_mod_key.is_none(),
+                                    onclick: {
+                                        let next_mod_key = next_mod_key.clone();
+                                        move |_| {
+                                            if let Some(mod_key) = next_mod_key.clone() {
+                                                selected_mod_key.set(Some(mod_key));
+                                            }
+                                        }
+                                    },
+                                    "Next"
+                                }
+                                button {
+                                    style: settings_secondary_button_style(),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Mods);
+                                    },
+                                    "Back to archive"
+                                }
                             }
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303746; background: #171b24; border-radius: 4px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: detail_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 22px; max-width: 980px; padding: 18px 40px 40px;",
+                            style: detail_page_content_style(),
                             if let Some(selected_mod) = selected_mod.clone() {
                                 section {
-                                    style: "display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 22px; align-items: start;",
+                                    style: detail_workspace_grid_style(),
                                     div {
-                                        style: "display: grid; gap: 14px; min-width: 0;",
+                                        style: detail_side_column_style(),
                                         div {
                                             style: detail_source_tile_style(&selected_mod),
-                                            div {
-                                                style: "font-size: 30px; line-height: 34px; font-weight: 800; letter-spacing: 0;",
+                                            strong {
+                                                style: "font-size: 24px; line-height: 30px;",
                                                 "{mod_source_label(&selected_mod)}"
                                             }
-                                            div {
-                                                style: "font-size: 12px; line-height: 16px; color: #d7ded9;",
-                                                "{mod_state_label(&selected_mod)}"
+                                            span {
+                                                style: "font-size: 12px; text-transform: uppercase; letter-spacing: 0;",
+                                                "Source"
+                                            }
+                                            span {
+                                                style: detail_source_tile_caption_style(),
+                                                "{selected_mod.display_name}"
                                             }
                                         }
                                         div {
-                                            style: settings_card_style(),
+                                            style: detail_side_meta_panel_style(),
                                             div {
-                                                style: "display: grid; gap: 10px; padding: 14px; font-size: 13px;",
-                                                div {
-                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
-                                                    span { "Author" }
-                                                    strong {
-                                                        style: "color: #f8fafc; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                                        "{mod_author_label(&selected_mod, &current_steam_metadata)}"
-                                                    }
-                                                }
-                                                div {
-                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
-                                                    span { "Updated" }
-                                                    strong {
-                                                        style: "color: #f8fafc; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                                        "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}"
-                                                    }
-                                                }
-                                                div {
-                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
-                                                    span { "Source" }
-                                                    strong {
-                                                        style: "color: #f8fafc;",
-                                                        "{mod_source_label(&selected_mod)}"
-                                                    }
-                                                }
+                                                style: detail_section_label_style(),
+                                                "Mod metadata"
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "State" }
+                                                strong { "{mod_state_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Source" }
+                                                strong { "{mod_source_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Author" }
+                                                strong { "{mod_author_label(&selected_mod, &current_steam_metadata)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Updated" }
+                                                strong { "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Categories" }
+                                                strong { "{mod_categories_label(&selected_mod)}" }
                                             }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; gap: 18px; min-width: 0;",
+                                        style: detail_main_panel_style(),
                                         div {
-                                            style: "display: grid; gap: 8px; min-width: 0;",
-                                            h3 {
-                                                style: "font-size: 28px; line-height: 34px; margin: 0; color: #f8fafc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                                "{selected_mod.display_name}"
+                                            style: detail_primary_description_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Mod Description"
                                             }
                                             div {
-                                                style: "font-size: 13px; color: #aeb8c8; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
+                                                style: detail_primary_description_body_style(),
+                                                "{mod_detail_description_text(&selected_mod, &current_steam_metadata)}"
+                                            }
+                                        }
+                                        div {
+                                            style: detail_record_path_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Pack path"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #9aa4b7; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
                                                 "{selected_mod.subtitle}"
                                             }
                                         }
                                         div {
-                                            style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
+                                            style: detail_metrics_grid_style(),
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Order" }
+                                                strong { "{mod_order_label(&all_mod_rows, &selected_mod.key)}" }
+                                            }
                                             div {
                                                 style: detail_metric_style(),
                                                 span { "State" }
@@ -967,36 +1379,110 @@ fn App() -> Element {
                                             }
                                             div {
                                                 style: detail_metric_style(),
-                                                span { "Tags" }
-                                                strong { "{selected_mod.tags.len()}" }
+                                                span { "Updated" }
+                                                strong { "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Source" }
+                                                strong { "{mod_source_label(&selected_mod)}" }
                                             }
                                         }
-                                        div {
-                                            style: "display: grid; gap: 8px;",
+                                        if !selected_mod.tags.is_empty() {
                                             div {
-                                                style: "font-size: 11px; line-height: 14px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 0;",
-                                                "Tags"
-                                            }
-                                            if selected_mod.tags.is_empty() {
-                                                div {
-                                                    style: "font-size: 13px; color: #778194;",
-                                                    "No tags recorded"
-                                                }
-                                            } else {
-                                                div {
-                                                    style: "display: flex; flex-wrap: wrap; gap: 6px;",
-                                                    for tag in selected_mod.tags.iter() {
-                                                        span {
-                                                            key: "{tag}",
-                                                            style: "border: 1px solid #303746; border-radius: 4px; padding: 4px 7px; font-size: 12px; color: #d8ded8; background: #1f2430;",
-                                                            "{tag}"
-                                                        }
+                                                style: detail_tag_list_style(),
+                                                for tag in selected_mod.tags.iter() {
+                                                    span {
+                                                        style: "border: 1px solid #303746; border-radius: 4px; padding: 4px 7px; font-size: 12px; color: #d8ded8; background: #1f2430;",
+                                                        "{tag}"
                                                     }
                                                 }
                                             }
                                         }
                                         div {
-                                            style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;",
+                                            style: detail_description_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Dependencies"
+                                            }
+                                            div {
+                                                style: detail_description_body_style(),
+                                                "{mod_detail_dependency_text(&selected_mod, &current_steam_metadata)}"
+                                            }
+                                        }
+                                        div {
+                                            style: detail_description_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Category assignment"
+                                            }
+                                            div {
+                                                style: detail_description_body_style(),
+                                                "{mod_categories_label(&selected_mod)}"
+                                            }
+                                            div {
+                                                style: detail_category_assignment_style(),
+                                                select {
+                                                    style: settings_input_style(),
+                                                    value: "{category_name}",
+                                                    onchange: move |event| {
+                                                        let value = event.value();
+                                                        if !value.trim().is_empty() {
+                                                            category_name.set(value.clone());
+                                                            selected_category_name.set(value);
+                                                        }
+                                                    },
+                                                    option {
+                                                        value: "",
+                                                        "Saved categories"
+                                                    }
+                                                    for saved_category in saved_categories.read().iter() {
+                                                        option {
+                                                            value: "{saved_category}",
+                                                            "{saved_category}"
+                                                        }
+                                                    }
+                                                }
+                                                button {
+                                                    style: detail_action_button_style(false),
+                                                    onclick: {
+                                                        let mod_key = selected_mod.key.clone();
+                                                        move |_| {
+                                                            let category = category_name.read().trim().to_string();
+                                                            let color = category_color.read().trim().to_string();
+                                                            add_mod_category_by_key(
+                                                                &mut app_state,
+                                                                &mut mod_status,
+                                                                &mut saved_categories,
+                                                                &mod_key,
+                                                                &category,
+                                                                &color,
+                                                            )
+                                                        }
+                                                    },
+                                                    "Add"
+                                                }
+                                                button {
+                                                    style: detail_action_button_style(false),
+                                                    onclick: {
+                                                        let mod_key = selected_mod.key.clone();
+                                                        move |_| {
+                                                            let category = category_name.read().trim().to_string();
+                                                            remove_mod_category_by_key(
+                                                                &mut app_state,
+                                                                &mut mod_status,
+                                                                &mut saved_categories,
+                                                                &mod_key,
+                                                                &category,
+                                                            )
+                                                        }
+                                                    },
+                                                    "Remove"
+                                                }
+                                            }
+                                        }
+                                        div {
+                                            style: detail_action_grid_style(),
                                             button {
                                                 style: detail_action_button_style(false),
                                                 disabled: selected_mod.locked,
@@ -1066,246 +1552,54 @@ fn App() -> Element {
                                                     "Lock"
                                                 }
                                             }
-                                            button {
-                                                style: detail_action_button_style(false),
-                                                onclick: {
-                                                    let mod_key = selected_mod.key.clone();
-                                                    move |_| {
-                                                        let category = category_name.read().trim().to_string();
-                                                        let color = category_color.read().trim().to_string();
-                                                        add_mod_category_by_key(
-                                                            &mut app_state,
-                                                            &mut mod_status,
-                                                            &mut saved_categories,
-                                                            &mod_key,
-                                                            &category,
-                                                            &color,
-                                                        )
-                                                    }
-                                                },
-                                                "Add category"
-                                            }
-                                            button {
-                                                style: detail_action_button_style(false),
-                                                onclick: {
-                                                    let mod_key = selected_mod.key.clone();
-                                                    move |_| {
-                                                        let category = category_name.read().trim().to_string();
-                                                        remove_mod_category_by_key(
-                                                            &mut app_state,
-                                                            &mut mod_status,
-                                                            &mut saved_categories,
-                                                            &mod_key,
-                                                            &category,
-                                                        )
-                                                    }
-                                                },
-                                                "Remove category"
-                                            }
                                         }
                                     }
                                 }
                             } else {
                                 section {
-                                    style: "display: grid; gap: 12px; border: 1px solid #293142; border-radius: 4px; background: #171b24; padding: 22px 20px; color: #aeb8c8;",
+                                    style: detail_empty_panel_style(),
                                     h3 {
-                                        style: "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;",
-                                        "No mod selected"
+                                        style: detail_empty_title_style(),
+                                        "{mod_detail_empty_title(all_mod_rows.len())}"
                                     }
                                     div {
-                                        style: "font-size: 13px; line-height: 18px;",
-                                        "Load game mods or open a mod folder, then select a row from the archive."
+                                        style: detail_empty_body_style(),
+                                        "{mod_detail_empty_body(all_mod_rows.len())}"
+                                    }
+                                    div {
+                                        style: detail_empty_actions_style(),
+                                        button {
+                                            style: detail_action_button_style(false),
+                                            onclick: move |_| {
+                                                workspace_page.set(WorkspacePage::Mods);
+                                            },
+                                            "Back to archive"
+                                        }
+                                        if !all_mod_rows.is_empty() {
+                                        button {
+                                            style: detail_action_button_style(false),
+                                            onclick: move |_| {
+                                                mod_search.set(String::new());
+                                                mod_list_filter.set(ModListFilter::All);
+                                                show_hidden.set(true);
+                                            },
+                                            "Clear filters"
+                                        }
+                                        }
                                     }
                                 }
                             }
                         }
-                    } else {
-                        div {
-                            style: "display: grid; gap: 8px; margin-top: 28px; padding-top: 18px; border-top: 1px solid #2b2d3a;",
-                            div {
-                                style: "font-size: 12px; line-height: 17px; color: #aeb8c8; overflow-wrap: anywhere;",
-                                "{current_game_folder_label}"
-                            }
-                            button {
-                                style: "width: 100%; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 13px;",
-                                onclick: move |_| {
-                                    workspace_page.set(WorkspacePage::Mods);
-                                    mod_list_filter.set(ModListFilter::All);
-                                },
-                                "Back to mods"
-                            }
-                        }
-                    }
-                    div {
-                        style: "margin-top: auto; padding-top: 18px; border-top: 1px solid #2b2d3a; display: grid; gap: 8px;",
-                        button {
-                            title: "Readiness checks",
-                            style: library_utility_button_style(current_workspace_page == WorkspacePage::Checks),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Checks);
-                            },
-                            span { style: nav_badge_style(), "CHK" }
-                            span { "Checks" }
-                        }
-                        button {
-                            title: "Diagnostics and log paths",
-                            style: library_utility_button_style(current_workspace_page == WorkspacePage::Settings),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::None);
-                            },
-                            span { style: nav_badge_style(), "LOG" }
-                            span { "Logs" }
-                        }
-                    }
-                }
-                aside {
-                    style: "grid-area: tools; min-width: 0; border-left: 1px solid #263041; background: #171b24; padding: 20px 18px; overflow-y: auto;",
-                    div {
-                        style: "display: grid; gap: 4px; margin-bottom: 12px;",
-                        h2 {
-                            style: "font-size: 18px; line-height: 24px; margin: 0; color: #edf2f7;",
-                            "Play & Tools"
-                        }
-                        div {
-                            style: "font-size: 11px; line-height: 15px; color: #9fb0a3; text-transform: uppercase;",
-                            "Instance: Default"
-                        }
-                    }
-                    button {
-                        style: "width: 100%; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 6px; padding: 16px 14px; font-weight: 800; font-size: 18px; line-height: 24px; margin-bottom: 14px; letter-spacing: 0;",
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                let state = app_state.read().clone();
-                                let launch_options = launch_options.read().clone();
-                                let save_name = launch_save_name.read().clone();
-                                let close_on_play = launch_options.close_on_play;
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| launch_game_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                {
-                                    Ok(status) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        saved_presets.set(load_preset_names());
-                                        schedule_close_on_play_if_requested(close_on_play);
-                                        mod_status.set(Some(launch_status_with_close_on_play(
-                                            status,
-                                            close_on_play,
-                                        )));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not launch game: {}", error.message))),
-                                }
-                            }
-                        },
-                        "PLAY GAME"
-                    }
-                    button {
-                        style: continue_save_button_style(current_launch_save_name.trim().is_empty()),
-                        onclick: move |_| {
-                            let save_name = launch_save_name.read().trim().to_string();
-                            if save_name.is_empty() {
-                                mod_status.set(Some("Set a campaign save name in Settings before continuing a save.".to_string()));
-                                workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::None);
-                                return;
-                            }
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                let state = app_state.read().clone();
-                                let launch_options = launch_options.read().clone();
-                                let close_on_play = launch_options.close_on_play;
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| launch_game_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                {
-                                    Ok(status) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        saved_presets.set(load_preset_names());
-                                        schedule_close_on_play_if_requested(close_on_play);
-                                        mod_status.set(Some(launch_status_with_close_on_play(
-                                            status,
-                                            close_on_play,
-                                        )));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not continue save: {}", error.message))),
-                                }
-                            }
-                        },
-                        span { "Continue Last Save" }
-                        span { ">" }
-                    }
-                    div {
-                        style: "display: grid; gap: 10px; margin-bottom: 18px;",
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Compatibility),
-                            onclick: move |_| {
-                                let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                                mod_status.set(Some(conflict_status(&report)));
-                                conflict_report.set(Some(report));
-                                workspace_page.set(WorkspacePage::Compatibility);
-                                library_tool_tab.set(LibraryToolTab::None);
-                            },
-                            span { "Check Compatibility" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Settings),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::None);
-                            },
-                            span { "Launch Options" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::ModDetail),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::ModDetail);
-                            },
-                            span { "Mod Settings" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::DbViewer),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::DbViewer);
-                            },
-                            span { "DB Viewer" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Steam);
-                            },
-                            span { "Steam Helper" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Workshop),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Workshop);
-                            },
-                            span { "Workshop Commands" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Checks);
-                            },
-                            span { "Alpha Checks" }
-                            span { ">" }
-                        }
-                    }
-                }
-                section {
-                    style: "grid-area: content; min-width: 0; min-height: 0; overflow: auto; padding: 0; background: #11111a;",
-                    if current_workspace_page == WorkspacePage::Checks {
+                    } else if current_workspace_page == WorkspacePage::Checks {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Checks)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
-                                "Alpha Checks"
+                                "Checks"
                             }
                             div {
                                 style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
@@ -1314,19 +1608,23 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             AlphaReadinessPanel {
                                 report: alpha_readiness.clone()
                             }
                         }
                     } else if current_workspace_page == WorkspacePage::Compatibility {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Compatibility)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
                                 "Compatibility"
@@ -1338,12 +1636,12 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
@@ -1394,7 +1692,11 @@ fn App() -> Element {
                         }
                     } else if current_workspace_page == WorkspacePage::DbViewer {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::DbViewer)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
                                 "DB Viewer"
@@ -1406,12 +1708,12 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
@@ -1465,12 +1767,113 @@ fn App() -> Element {
                                 }
                             }
                         }
-                    } else if current_workspace_page == WorkspacePage::Steam {
+                    } else if current_workspace_page == WorkspacePage::Skills {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Skills)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
-                                "Steam Helper"
+                                "Skills"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Inspect WH3MM user-flow and skill data from opened packs on a dedicated screen."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Skill Source"
+                                    }
+                                    button {
+                                        style: settings_primary_button_style(),
+                                        onclick: move |_| {
+                                            if let Some(pack_path) = pick_pack_file() {
+                                                pack_selection.set(load_pack_from_path(pack_path));
+                                                workspace_page.set(WorkspacePage::Skills);
+                                            }
+                                        },
+                                        "Open pack"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    if let Some(pack) = view_model.selected_pack.as_ref() {
+                                        div {
+                                            style: "display: grid; gap: 6px; min-width: 0;",
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Opened pack"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #aeb8c8; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
+                                                "{pack.path}"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                                if let Some(flow_summary) = pack.flow_summary.as_ref() {
+                                                    "{flow_summary.file_count_label} / {flow_summary.read_error_count_label}"
+                                                } else {
+                                                    "No WH3MM user-flow files were detected in this pack."
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        div {
+                                            style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                            "No pack is open yet. Open a .pack file to inspect WH3MM flow/skill data."
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(pack) = view_model.selected_pack.clone() {
+                                if let Some(flow_summary) = pack.flow_summary {
+                                    FlowSummaryPanel { flow_summary }
+                                } else {
+                                    section {
+                                        style: settings_card_style(),
+                                        header {
+                                            style: settings_card_header_style(),
+                                            h3 {
+                                                style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                                "No skills found"
+                                            }
+                                        }
+                                        div {
+                                            style: settings_card_body_style(),
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                                "The opened pack does not contain WH3MM user-flow files."
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Steam {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Steam)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Steam"
                             }
                             div {
                                 style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
@@ -1479,12 +1882,12 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
@@ -1617,10 +2020,14 @@ fn App() -> Element {
                         }
                     } else if current_workspace_page == WorkspacePage::Workshop {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Workshop)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
-                                "Workshop Commands"
+                                "Workshop"
                             }
                             div {
                                 style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
@@ -1629,12 +2036,12 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
@@ -1737,7 +2144,11 @@ fn App() -> Element {
                         }
                     } else if current_workspace_page == WorkspacePage::Categories {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Categories)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
                                 "Categories"
@@ -1749,12 +2160,12 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
@@ -1923,7 +2334,11 @@ fn App() -> Element {
                         }
                     } else if current_workspace_page == WorkspacePage::Collections {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Collections)}"
+                            }
                             h2 {
                                 style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
                                 "Collections"
@@ -1935,12 +2350,12 @@ fn App() -> Element {
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: secondary_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 24px; max-width: 900px; padding: 8px 40px 40px;",
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
@@ -2085,31 +2500,72 @@ fn App() -> Element {
                         }
                     } else if current_workspace_page == WorkspacePage::Settings {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
+                            style: settings_page_header_style(),
+                            div {
+                                style: settings_page_kicker_style(),
+                                "{settings_focus_breadcrumb(current_settings_focus)}"
+                            }
                             h2 {
-                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
-                                "Settings and Launch Options"
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2; letter-spacing: 0;",
+                                "{settings_focus_title(current_settings_focus)}"
                             }
                             div {
                                 style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
-                                "Configure application behavior and game integration parameters."
+                                "{settings_focus_description(current_settings_focus)}"
                             }
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: "max-width: 860px; border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 0 auto 16px; color: #aeb8c8; font-size: 13px;",
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 26px; max-width: 860px; padding: 8px 40px 40px;",
+                            style: settings_focus_tabs_style(),
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::General),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::General);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::General)}"
+                            }
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::GamePaths),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::GamePaths);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::GamePaths)}"
+                            }
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::Launch),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Launch);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::Launch)}"
+                            }
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::Diagnostics),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Diagnostics);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::Diagnostics)}"
+                            }
+                        }
+                        div {
+                            style: settings_page_content_style(),
                             section {
-                                style: settings_card_style(),
+                                style: settings_focus_card_style(SettingsFocus::General, current_settings_focus),
                                 header {
                                     style: settings_card_header_style(),
                                     h3 {
                                         style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
                                         "General"
+                                    }
+                                    if current_settings_focus == SettingsFocus::General {
+                                        span {
+                                            style: settings_focus_route_chip_style(),
+                                            "Current screen"
+                                        }
                                     }
                                 }
                                 div {
@@ -2134,11 +2590,14 @@ fn App() -> Element {
                                                     show_hidden.set(event.checked());
                                                 },
                                             }
-                                            span { if *show_hidden.read() { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(*show_hidden.read()),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; grid-template-columns: 1fr 1fr; gap: 10px;",
+                                        style: settings_button_pair_style(),
                                         button {
                                             style: settings_secondary_button_style(),
                                             onclick: move |_| {
@@ -2185,122 +2644,57 @@ fn App() -> Element {
                                 }
                             }
                             section {
-                                style: settings_card_style(),
-                                header {
-                                    style: settings_card_header_style(),
-                                    h3 {
-                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
-                                        "Diagnostics"
-                                    }
-                                    button {
-                                        style: settings_secondary_button_style(),
-                                        onclick: move |_| {
-                                            let state = app_state.read().clone();
-                                            let game_folder_snapshot = game_folder.read().clone();
-                                            let helper_path_snapshot = steam_helper_path.read().clone();
-                                            let helper_backend_snapshot = steam_helper_backend.read().clone();
-                                            let launch_options_snapshot = launch_options.read().clone();
-                                            let launch_save_name_snapshot = launch_save_name.read().clone();
-                                            let launch_preview_snapshot = launch_preview.read().clone();
-                                            let last_steam_command_snapshot = last_steam_command.read().clone();
-                                            let mod_status_snapshot = mod_status.read().clone();
-                                            let (_, pack_status_snapshot) = pack_selection.read().clone();
-                                            let status_snapshot = combined_status(
-                                                mod_status_snapshot.as_deref(),
-                                                pack_status_snapshot.as_deref(),
-                                            );
-                                            let readiness_snapshot = build_alpha_readiness_report(
-                                                game_folder_snapshot.as_deref(),
-                                                helper_path_snapshot.trim(),
-                                            );
-
-                                            match write_diagnostic_snapshot(DiagnosticSnapshotInput {
-                                                app_state: &state,
-                                                game_folder: game_folder_snapshot.as_deref(),
-                                                helper_path: &helper_path_snapshot,
-                                                helper_backend: &helper_backend_snapshot,
-                                                launch_options: &launch_options_snapshot,
-                                                launch_save_name: &launch_save_name_snapshot,
-                                                status_message: status_snapshot.as_deref(),
-                                                readiness: &readiness_snapshot,
-                                                launch_preview: launch_preview_snapshot.as_ref(),
-                                                last_steam_command: last_steam_command_snapshot.as_ref(),
-                                            }) {
-                                                Ok(path) => mod_status.set(Some(format!("Wrote diagnostic snapshot {}.", path.display()))),
-                                                Err(error) => mod_status.set(Some(format!("Could not write diagnostic snapshot: {}", error.message))),
-                                            }
-                                        },
-                                        "Write snapshot"
-                                    }
-                                }
-                                div {
-                                    style: settings_card_body_style(),
-                                    div {
-                                        style: "display: grid; gap: 8px;",
-                                        label {
-                                            style: "font-size: 14px; color: #e5e7eb;",
-                                            "App log"
-                                        }
-                                        div {
-                                            style: settings_path_box_style(),
-                                            "{diagnostics_log_path_label}"
-                                        }
-                                    }
-                                    div {
-                                        style: "display: grid; gap: 8px;",
-                                        label {
-                                            style: "font-size: 14px; color: #e5e7eb;",
-                                            "Steam helper command log"
-                                        }
-                                        div {
-                                            style: settings_path_box_style(),
-                                            "{steam_command_log_path_label}"
-                                        }
-                                    }
-                                }
-                            }
-                            section {
-                                style: settings_card_style(),
+                                style: settings_focus_card_style(SettingsFocus::GamePaths, current_settings_focus),
                                 header {
                                     style: settings_card_header_style(),
                                     h3 {
                                         style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
                                         "Game Paths"
                                     }
-                                    button {
-                                        style: "border: 0; background: transparent; color: #bfdbfe; padding: 0; font-size: 13px;",
-                                        onclick: move |_| {
-                                            if let Some(discovered_game_folder) = auto_discover_game_folder() {
-                                                match save_game_folder(&discovered_game_folder) {
-                                                    Ok(status) => {
-                                                        game_folder.set(Some(discovered_game_folder));
-                                                        mod_status.set(Some(status));
-                                                    }
-                                                    Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
-                                                }
-                                            } else {
-                                                mod_status.set(Some("Could not auto-detect a WH3 Steam install on this machine.".to_string()));
+                                    div {
+                                        style: settings_card_header_actions_style(),
+                                        if current_settings_focus == SettingsFocus::GamePaths {
+                                            span {
+                                                style: settings_focus_route_chip_style(),
+                                                "Current screen"
                                             }
-                                        },
-                                        "Auto-detect"
+                                        }
+                                        button {
+                                            style: "border: 0; background: transparent; color: #bfdbfe; padding: 0; font-size: 13px;",
+                                            onclick: move |_| {
+                                                if let Some(discovered_game_folder) = auto_discover_game_folder() {
+                                                    match save_game_folder(&discovered_game_folder) {
+                                                        Ok(status) => {
+                                                            game_folder.set(Some(discovered_game_folder));
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
+                                                    }
+                                                } else {
+                                                    mod_status.set(Some("Could not auto-detect a WH3 Steam install on this machine.".to_string()));
+                                                }
+                                            },
+                                            "Auto-detect"
+                                        }
                                     }
                                 }
                                 div {
                                     style: settings_card_body_style(),
                                     div {
-                                        style: "display: grid; gap: 8px;",
+                                        style: settings_field_style(),
                                         label {
                                             style: "font-size: 14px; color: #e5e7eb;",
-                                            "Game folder"
+                                            "Executable location"
                                         }
                                         div {
-                                            style: "display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 10px;",
+                                            style: settings_path_action_row_style(),
                                             div {
                                                 style: settings_path_box_style(),
-                                                "{current_game_folder_label}"
+                                                "{current_game_executable_label}"
                                             }
                                             button {
                                                 style: settings_secondary_button_style(),
+                                                title: "Choose the WH3 install folder that contains Warhammer3.exe",
                                                 onclick: move |_| {
                                                     if let Some(selected_game_folder) = pick_game_folder() {
                                                         match save_game_folder(&selected_game_folder) {
@@ -2317,47 +2711,98 @@ fn App() -> Element {
                                         }
                                     }
                                     div {
-                                        style: "display: grid; gap: 8px;",
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Data folder"
+                                        }
+                                        div {
+                                            style: settings_path_action_row_style(),
+                                            div {
+                                                style: settings_path_box_style(),
+                                                "{current_game_data_label}"
+                                            }
+                                            button {
+                                                style: settings_secondary_button_style(),
+                                                title: "Choose the WH3 install folder; the data folder is derived from it",
+                                                onclick: move |_| {
+                                                    if let Some(selected_game_folder) = pick_game_folder() {
+                                                        match save_game_folder(&selected_game_folder) {
+                                                            Ok(status) => {
+                                                                game_folder.set(Some(selected_game_folder));
+                                                                mod_status.set(Some(status));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Change root"
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Game root"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{current_game_folder_label}"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
                                         label {
                                             style: "font-size: 14px; color: #e5e7eb;",
                                             "Steam helper executable"
                                         }
-                                        input {
-                                            style: settings_input_style(),
-                                            value: "{steam_helper_path}",
-                                            placeholder: "Steam helper executable path",
-                                            oninput: move |event| {
-                                                steam_helper_path.set(event.value());
-                                            },
+                                        div {
+                                            style: settings_path_action_row_style(),
+                                            input {
+                                                style: settings_input_style(),
+                                                value: "{steam_helper_path}",
+                                                placeholder: "Steam helper executable path",
+                                                oninput: move |event| {
+                                                    steam_helper_path.set(event.value());
+                                                },
+                                            }
+                                            button {
+                                                style: settings_secondary_button_style(),
+                                                onclick: move |_| {
+                                                    if let Some(helper_path) = pick_steam_helper_file() {
+                                                        let helper_path = helper_path.display().to_string();
+                                                        let backend = steam_helper_backend.read().clone();
+                                                        match save_steam_helper_settings(&helper_path, &backend) {
+                                                            Ok(status) => {
+                                                                steam_helper_path.set(helper_path);
+                                                                mod_status.set(Some(status));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Browse"
+                                            }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; grid-template-columns: minmax(0, 1fr) 96px 96px; gap: 10px;",
-                                        select {
-                                            style: settings_input_style(),
-                                            value: "{steam_helper_backend}",
-                                            onchange: move |event| {
-                                                steam_helper_backend.set(event.value());
-                                            },
-                                            option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
-                                            option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
-                                        }
-                                        button {
-                                            style: settings_secondary_button_style(),
-                                            onclick: move |_| {
-                                                if let Some(helper_path) = pick_steam_helper_file() {
-                                                    let helper_path = helper_path.display().to_string();
-                                                    let backend = steam_helper_backend.read().clone();
-                                                    match save_steam_helper_settings(&helper_path, &backend) {
-                                                        Ok(status) => {
-                                                            steam_helper_path.set(helper_path);
-                                                            mod_status.set(Some(status));
-                                                        }
-                                                        Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
-                                                    }
-                                                }
-                                            },
-                                            "Choose"
+                                        style: settings_helper_backend_row_style(),
+                                        div {
+                                            style: settings_inline_field_style(),
+                                            label {
+                                                style: "font-size: 14px; color: #e5e7eb;",
+                                                "Steam helper backend"
+                                            }
+                                            select {
+                                                style: settings_input_style(),
+                                                value: "{steam_helper_backend}",
+                                                onchange: move |event| {
+                                                    steam_helper_backend.set(event.value());
+                                                },
+                                                option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
+                                                option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
+                                            }
                                         }
                                         button {
                                             style: settings_secondary_button_style(),
@@ -2375,12 +2820,18 @@ fn App() -> Element {
                                 }
                             }
                             section {
-                                style: settings_card_style(),
+                                style: settings_focus_card_style(SettingsFocus::Launch, current_settings_focus),
                                 header {
                                     style: settings_card_header_style(),
                                     h3 {
                                         style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
                                         "Launch Options"
+                                    }
+                                    if current_settings_focus == SettingsFocus::Launch {
+                                        span {
+                                            style: settings_focus_route_chip_style(),
+                                            "Current screen"
+                                        }
                                     }
                                 }
                                 div {
@@ -2404,7 +2855,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.skip_intro_movies { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.skip_intro_movies),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2426,7 +2880,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.script_logging { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.script_logging),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2448,7 +2905,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.auto_start_custom_battle { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.auto_start_custom_battle),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2470,7 +2930,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.make_units_generals { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.make_units_generals),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2492,7 +2955,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.high_process_priority { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.high_process_priority),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2514,11 +2980,14 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.close_on_play { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.close_on_play),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; gap: 8px;",
+                                        style: settings_field_style(),
                                         label {
                                             style: "font-size: 14px; color: #e5e7eb;",
                                             "Campaign save name"
@@ -2533,54 +3002,62 @@ fn App() -> Element {
                                         }
                                     }
                                     div {
-                                        style: "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;",
-                                        button {
-                                            style: launch_quick_button_style(),
-                                            onclick: move |_| {
-                                                let selected_game_folder = select_game_folder(game_folder.read().clone());
-                                                if let Some(selected_game_folder) = selected_game_folder {
-                                                    let state = app_state.read().clone();
-                                                    let launch_options = launch_options.read().clone();
-                                                    let save_name = launch_save_name.read().clone();
-                                                    match save_game_folder(&selected_game_folder)
-                                                        .and_then(|_| build_launch_preview(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                                    {
-                                                        Ok(preview) => {
-                                                            game_folder.set(Some(selected_game_folder));
-                                                            mod_status.set(Some(format!(
-                                                                "Previewed {} enabled mods and {} generated packs for {}.",
-                                                                preview.enabled_count,
-                                                                preview.generated_packs.len(),
-                                                                preview.mod_list_file_name
-                                                            )));
-                                                            launch_preview.set(Some(preview));
-                                                        }
-                                                        Err(error) => mod_status.set(Some(format!("Could not preview launch: {}", error.message))),
-                                                    }
-                                                }
-                                            },
-                                            "Preview launch"
+                                        style: settings_launch_actions_style(),
+                                        div {
+                                            style: settings_launch_actions_copy_style(),
+                                            strong { "Launch files" }
+                                            span { "Preview the exact mod list or write launch files without starting WH3." }
                                         }
-                                        button {
-                                            style: launch_quick_button_style(),
-                                            onclick: move |_| {
-                                                let selected_game_folder = select_game_folder(game_folder.read().clone());
-                                                if let Some(selected_game_folder) = selected_game_folder {
-                                                    let state = app_state.read().clone();
-                                                    let launch_options = launch_options.read().clone();
-                                                    let save_name = launch_save_name.read().clone();
-                                                    match save_game_folder(&selected_game_folder)
-                                                        .and_then(|_| prepare_launch_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                                    {
-                                                        Ok(status) => {
-                                                            game_folder.set(Some(selected_game_folder));
-                                                            mod_status.set(Some(status));
+                                        div {
+                                            style: settings_launch_button_row_style(),
+                                            button {
+                                                style: launch_quick_button_style(),
+                                                onclick: move |_| {
+                                                    let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                                    if let Some(selected_game_folder) = selected_game_folder {
+                                                        let state = app_state.read().clone();
+                                                        let launch_options = launch_options.read().clone();
+                                                        let save_name = launch_save_name.read().clone();
+                                                        match save_game_folder(&selected_game_folder)
+                                                            .and_then(|_| build_launch_preview(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                                        {
+                                                            Ok(preview) => {
+                                                                game_folder.set(Some(selected_game_folder));
+                                                                mod_status.set(Some(format!(
+                                                                    "Previewed {} enabled mods and {} generated packs for {}.",
+                                                                    preview.enabled_count,
+                                                                    preview.generated_packs.len(),
+                                                                    preview.mod_list_file_name
+                                                                )));
+                                                                launch_preview.set(Some(preview));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not preview launch: {}", error.message))),
                                                         }
-                                                        Err(error) => mod_status.set(Some(format!("Could not prepare launch files: {}", error.message))),
                                                     }
-                                                }
-                                            },
-                                            "Prepare files"
+                                                },
+                                                "Preview launch"
+                                            }
+                                            button {
+                                                style: launch_quick_button_style(),
+                                                onclick: move |_| {
+                                                    let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                                    if let Some(selected_game_folder) = selected_game_folder {
+                                                        let state = app_state.read().clone();
+                                                        let launch_options = launch_options.read().clone();
+                                                        let save_name = launch_save_name.read().clone();
+                                                        match save_game_folder(&selected_game_folder)
+                                                            .and_then(|_| prepare_launch_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                                        {
+                                                            Ok(status) => {
+                                                                game_folder.set(Some(selected_game_folder));
+                                                                mod_status.set(Some(status));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not prepare launch files: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Prepare files"
+                                            }
                                         }
                                     }
                                     if let Some(preview) = launch_preview.read().as_ref() {
@@ -2591,175 +3068,142 @@ fn App() -> Element {
                                     }
                                 }
                             }
+                            section {
+                                style: settings_focus_card_style(SettingsFocus::Diagnostics, current_settings_focus),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Diagnostics"
+                                    }
+                                    div {
+                                        style: settings_card_header_actions_style(),
+                                        if current_settings_focus == SettingsFocus::Diagnostics {
+                                            span {
+                                                style: settings_focus_route_chip_style(),
+                                                "Current screen"
+                                            }
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let state = app_state.read().clone();
+                                                let game_folder_snapshot = game_folder.read().clone();
+                                                let helper_path_snapshot = steam_helper_path.read().clone();
+                                                let helper_backend_snapshot = steam_helper_backend.read().clone();
+                                                let launch_options_snapshot = launch_options.read().clone();
+                                                let launch_save_name_snapshot = launch_save_name.read().clone();
+                                                let launch_preview_snapshot = launch_preview.read().clone();
+                                                let last_steam_command_snapshot = last_steam_command.read().clone();
+                                                let mod_status_snapshot = mod_status.read().clone();
+                                                let (_, pack_status_snapshot) = pack_selection.read().clone();
+                                                let status_snapshot = combined_status(
+                                                    mod_status_snapshot.as_deref(),
+                                                    pack_status_snapshot.as_deref(),
+                                                );
+                                                let readiness_snapshot = build_alpha_readiness_report(
+                                                    game_folder_snapshot.as_deref(),
+                                                    helper_path_snapshot.trim(),
+                                                );
+
+                                                match write_diagnostic_snapshot(DiagnosticSnapshotInput {
+                                                    app_state: &state,
+                                                    game_folder: game_folder_snapshot.as_deref(),
+                                                    helper_path: &helper_path_snapshot,
+                                                    helper_backend: &helper_backend_snapshot,
+                                                    launch_options: &launch_options_snapshot,
+                                                    launch_save_name: &launch_save_name_snapshot,
+                                                    status_message: status_snapshot.as_deref(),
+                                                    readiness: &readiness_snapshot,
+                                                    launch_preview: launch_preview_snapshot.as_ref(),
+                                                    last_steam_command: last_steam_command_snapshot.as_ref(),
+                                                }) {
+                                                    Ok(path) => mod_status.set(Some(format!("Wrote diagnostic snapshot {}.", path.display()))),
+                                                    Err(error) => mod_status.set(Some(format!("Could not write diagnostic snapshot: {}", error.message))),
+                                                }
+                                            },
+                                            "Write snapshot"
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "App log"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{diagnostics_log_path_label}"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Steam helper command log"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{steam_command_log_path_label}"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     } else {
-            header {
-                style: "min-height: 48px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 8px 26px; border-bottom: 1px solid #262838; background: #11111a;",
-                div {
-                    style: "min-width: 0; display: flex; align-items: center; gap: 10px;",
-                    strong {
-                        style: "font-size: 11px; line-height: 15px; color: #d5d9df; text-transform: uppercase; letter-spacing: 1.5px; white-space: nowrap;",
-                        "Archive"
-                    }
-                    div {
-                        style: "font-size: 12px; line-height: 16px; color: #94a89b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                        "{current_mod_filter_label}: {filtered_mod_count} shown / {visible_mod_count} visible / {launch_enabled_mod_count} launch enabled"
-                    }
-                }
-                div {
-                    style: "display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px;",
-                    button {
-                        style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            if let Some(pack_path) = pick_pack_file() {
-                                pack_selection.set(load_pack_from_path(pack_path));
-                                workspace_page.set(WorkspacePage::DbViewer);
-                            }
-                        },
-                        "Open pack"
-                    }
-                    button {
-                        style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            if let Some(mod_folder) = pick_mod_folder() {
-                                match load_mods_from_folder(mod_folder) {
-                                    Ok((mods, status)) => {
-                                        let mut next_state = app_state.read().clone();
-                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                        app_state.set(next_state);
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => {
-                                        mod_status.set(Some(format!("Could not discover mods: {}", error.message)));
-                                    }
-                                }
-                            }
-                        },
-                        "Open mod folder"
-                    }
-                    button {
-                        style: archive_toolbar_button_style(true),
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| load_mods_from_game_folder(selected_game_folder.clone()))
-                                {
-                                    Ok((mods, status)) => {
-                                        let mut next_state = app_state.read().clone();
-                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                        app_state.set(next_state);
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not load game mods: {}", error.message))),
-                                }
-                            }
-                        },
-                        "Load game mods"
-                    }
-                    button {
-                        style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                            mod_status.set(Some(conflict_status(&report)));
-                            conflict_report.set(Some(report));
-                            workspace_page.set(WorkspacePage::Compatibility);
-                        },
-                        "Analyze"
-                    }
-                    if !mod_search_query.is_empty() {
-                        button {
-                            style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            mod_search.set(String::new());
-                        },
-                        "Clear search"
-                    }
-                }
-                }
-            }
             if let Some(status_message) = view_model.status_message {
                 div {
-                    style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 14px 26px; color: #aeb8c8; font-size: 13px;",
+                    style: archive_status_style(),
                     "{status_message}"
                 }
             }
             div {
-                style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; padding: 0 26px 26px;",
-                div {
-                    style: archive_filter_bar_style(),
-                    span {
-                        style: "font-size: 11px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 0;",
-                        "View"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::All),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::All);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "All {total_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Enabled),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Enabled);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Enabled {enabled_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Disabled),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Disabled);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Disabled {disabled_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Locked),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Locked);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Locked {locked_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Hidden),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Hidden);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Hidden {hidden_mod_count}"
-                    }
-                }
+                style: archive_workspace_style(),
                 section {
                     style: "display: grid; gap: 6px; min-width: 0;",
                     div {
                         style: archive_table_header_style(),
                         div { "Ord" }
                         div { "Status" }
-                        div { "Type" }
+                        div { "Source" }
                         div { "Pack / Mod Name" }
                         div { "Author" }
                         div { "Updated" }
+                        button {
+                            title: "Sources and archive actions",
+                            style: archive_header_icon_button_style(*archive_actions_expanded.read()),
+                            onclick: move |_| {
+                                let expanded = *archive_actions_expanded.read();
+                                archive_actions_expanded.set(!expanded);
+                            },
+                            span {
+                                style: archive_header_gear_icon_style(),
+                                span { style: archive_header_gear_ring_style(), "" }
+                                span { style: archive_header_gear_tooth_style("top"), "" }
+                                span { style: archive_header_gear_tooth_style("right"), "" }
+                                span { style: archive_header_gear_tooth_style("bottom"), "" }
+                                span { style: archive_header_gear_tooth_style("left"), "" }
+                            }
+                        }
                     }
                     if all_mod_rows.is_empty() {
                         div {
-                            style: "border: 1px solid #28323d; border-radius: 6px; background: #151b18; padding: 22px 18px; color: #cbd8cc; display: grid; gap: 8px;",
+                            style: archive_empty_panel_style(),
                             h3 {
-                                style: "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;",
-                                "No mods loaded"
+                                style: archive_empty_title_style(),
+                                "{archive_empty_title(all_mod_rows.len())}"
                             }
                             div {
-                                style: "font-size: 13px; line-height: 18px; color: #9fb0c0;",
-                                "No source selected."
+                                style: archive_empty_body_style(),
+                                "{archive_empty_body(all_mod_rows.len())}"
                             }
                             div {
-                                style: "display: flex; flex-wrap: wrap; gap: 8px;",
+                                style: archive_empty_actions_style(),
                                 button {
-                                    style: "border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 6px; padding: 8px 12px;",
+                                    style: archive_empty_button_style(true),
                                     onclick: move |_| {
                                         let selected_game_folder = select_game_folder(game_folder.read().clone());
                                         if let Some(selected_game_folder) = selected_game_folder {
@@ -2780,7 +3224,7 @@ fn App() -> Element {
                                     "Load game mods"
                                 }
                                 button {
-                                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
+                                    style: archive_empty_button_style(false),
                                     onclick: move |_| {
                                         if let Some(mod_folder) = pick_mod_folder() {
                                             match load_mods_from_folder(mod_folder) {
@@ -2802,14 +3246,31 @@ fn App() -> Element {
                         }
                     } else if filtered_mods.is_empty() {
                         div {
-                            style: "border: 1px solid #28323d; border-radius: 6px; background: #151b18; padding: 18px 16px; color: #9fb0c0; font-size: 13px;",
-                            "No mods match the current search."
+                            style: archive_empty_panel_style(),
+                            h3 {
+                                style: archive_empty_title_style(),
+                                "{archive_empty_title(all_mod_rows.len())}"
+                            }
+                            div {
+                                style: archive_empty_body_style(),
+                                "{archive_empty_body(all_mod_rows.len())}"
+                            }
+                            button {
+                                style: archive_empty_button_style(false),
+                                onclick: move |_| {
+                                    mod_search.set(String::new());
+                                    mod_list_filter.set(ModListFilter::All);
+                                    show_hidden.set(true);
+                                },
+                                "Clear filters"
+                            }
                         }
                     }
-                    for (mod_order, mod_row) in filtered_mods.iter().enumerate().map(|(index, row)| (index + 1, row)) {
+                    for mod_row in filtered_mods.iter() {
                         article {
                             key: "{mod_row.key}",
-                            style: mod_row_style(active_mod_key.as_deref() == Some(mod_row.key.as_str())),
+                            title: "Open Mod Settings for {mod_row.display_name}",
+                            style: mod_row_style(explicitly_selected_mod_key.as_deref() == Some(mod_row.key.as_str())),
                             onclick: {
                                 let mod_key = mod_row.key.clone();
                                 move |_| {
@@ -2819,7 +3280,7 @@ fn App() -> Element {
                             },
                             div {
                                 style: "font-size: 13px; color: #d5d9df; text-align: center; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                "{mod_order}"
+                                "{mod_order_label(&all_mod_rows, &mod_row.key)}"
                             }
                             button {
                                 title: "Enable or disable mod",
@@ -2844,11 +3305,7 @@ fn App() -> Element {
                                         }
                                     }
                                 },
-                                if mod_row.enabled {
-                                    "ON"
-                                } else {
-                                    "OFF"
-                                }
+                                span { style: mod_enable_knob_style(mod_row.enabled, mod_row.locked), "" }
                             }
                             div {
                                 style: source_tile_style(mod_row),
@@ -2878,6 +3335,138 @@ fn App() -> Element {
                             div {
                                 style: "font-size: 12px; color: #aeb8c8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
                                 "{mod_updated_label(mod_row, &current_steam_metadata, current_time_ms)}"
+                            }
+                            div {
+                                title: "Open Mod Settings",
+                                style: archive_row_open_indicator_style(explicitly_selected_mod_key.as_deref() == Some(mod_row.key.as_str())),
+                                ">"
+                            }
+                        }
+                    }
+                }
+                div {
+                    style: archive_utility_dock_style(),
+                    div {
+                        style: archive_filter_bar_style(),
+                        button {
+                            title: "Show archive filters",
+                            style: archive_filter_chip_style(*archive_filters_expanded.read() || archive_filter_count > 0),
+                            onclick: move |_| {
+                                let expanded = *archive_filters_expanded.read();
+                                archive_filters_expanded.set(!expanded);
+                            },
+                            span { "Filter ({archive_filter_count})" }
+                            span { if *archive_filters_expanded.read() { "^" } else { ">" } }
+                        }
+                        if *archive_filters_expanded.read() {
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::All),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::All);
+                                },
+                                "All {total_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Enabled),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Enabled);
+                                },
+                                "Enabled {enabled_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Disabled),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Disabled);
+                                },
+                                "Disabled {disabled_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Locked),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Locked);
+                                },
+                                "Locked {locked_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Hidden),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Hidden);
+                                },
+                                "Hidden {hidden_mod_count}"
+                            }
+                            if !mod_search_query.is_empty() {
+                                button {
+                                    style: archive_filter_button_style(false),
+                                    onclick: move |_| {
+                                        mod_search.set(String::new());
+                                    },
+                                    "Clear search"
+                                }
+                            }
+                        }
+                    }
+                    div {
+                        style: archive_source_action_row_style(),
+                        if *archive_actions_expanded.read() {
+                            button {
+                                style: archive_toolbar_button_style(false),
+                                onclick: move |_| {
+                                    if let Some(pack_path) = pick_pack_file() {
+                                        pack_selection.set(load_pack_from_path(pack_path));
+                                        workspace_page.set(WorkspacePage::DbViewer);
+                                    }
+                                },
+                                "Open pack"
+                            }
+                            button {
+                                style: archive_toolbar_button_style(false),
+                                onclick: move |_| {
+                                    if let Some(mod_folder) = pick_mod_folder() {
+                                        match load_mods_from_folder(mod_folder) {
+                                            Ok((mods, status)) => {
+                                                let mut next_state = app_state.read().clone();
+                                                let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                app_state.set(next_state);
+                                                mod_status.set(Some(status));
+                                            }
+                                            Err(error) => {
+                                                mod_status.set(Some(format!("Could not discover mods: {}", error.message)));
+                                            }
+                                        }
+                                    }
+                                },
+                                "Open folder"
+                            }
+                            button {
+                                style: archive_toolbar_button_style(true),
+                                onclick: move |_| {
+                                    let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                    if let Some(selected_game_folder) = selected_game_folder {
+                                        match save_game_folder(&selected_game_folder)
+                                            .and_then(|_| load_mods_from_game_folder(selected_game_folder.clone()))
+                                        {
+                                            Ok((mods, status)) => {
+                                                let mut next_state = app_state.read().clone();
+                                                let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                app_state.set(next_state);
+                                                game_folder.set(Some(selected_game_folder));
+                                                mod_status.set(Some(status));
+                                            }
+                                            Err(error) => mod_status.set(Some(format!("Could not load game mods: {}", error.message))),
+                                        }
+                                    }
+                                },
+                                "Load game"
+                            }
+                            button {
+                                style: archive_toolbar_button_style(false),
+                                onclick: move |_| {
+                                    let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
+                                    mod_status.set(Some(conflict_status(&report)));
+                                    conflict_report.set(Some(report));
+                                    workspace_page.set(WorkspacePage::Compatibility);
+                                },
+                                "Analyze"
                             }
                         }
                     }
@@ -3115,6 +3704,42 @@ fn app_brand_subtitle(app_title: &str) -> String {
     format!("{app_title} / Windows alpha")
 }
 
+fn top_search_should_route_to_mods(workspace_page: WorkspacePage) -> bool {
+    workspace_page != WorkspacePage::Mods
+}
+
+fn settings_workspace_active(workspace_page: WorkspacePage) -> bool {
+    workspace_page == WorkspacePage::Settings
+}
+
+fn library_settings_nav_visible(workspace_page: WorkspacePage) -> bool {
+    settings_workspace_active(workspace_page)
+}
+
+fn top_shell_header_style() -> &'static str {
+    "height: 66px; border-bottom: 1px solid #263041; background: #121620; display: grid; grid-template-columns: minmax(220px, auto) minmax(260px, 420px) auto; align-items: center; gap: 16px; padding: 8px 18px; flex-shrink: 0;"
+}
+
+fn top_brand_title_style() -> &'static str {
+    "font-size: 21px; line-height: 27px; margin: 0; color: #65f58b; letter-spacing: 0; white-space: nowrap; text-transform: uppercase;"
+}
+
+fn top_search_style() -> &'static str {
+    "min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid #35374a; background: #242531; border-radius: 5px; padding: 0 10px;"
+}
+
+fn top_search_icon_style() -> &'static str {
+    "position: relative; width: 14px; height: 14px; flex: 0 0 auto; border: 2px solid #7d8ea3; border-radius: 999px; box-sizing: border-box;"
+}
+
+fn top_search_icon_handle_style() -> &'static str {
+    "position: absolute; width: 7px; height: 2px; right: -5px; bottom: -3px; background: #7d8ea3; border-radius: 999px; transform: rotate(45deg); transform-origin: center;"
+}
+
+fn top_actions_style() -> &'static str {
+    "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #9fb0c0; font-size: 12px; white-space: nowrap;"
+}
+
 fn mod_row_matches_query(mod_row: &ModRowViewModel, normalized_query: &str) -> bool {
     if normalized_query.is_empty() {
         return true;
@@ -3147,6 +3772,113 @@ fn selected_or_first_mod_row(
         .or_else(|| rows.first().cloned())
 }
 
+fn selected_mod_neighbor_key(
+    rows: &[ModRowViewModel],
+    selected_key: Option<&str>,
+    direction: i8,
+) -> Option<String> {
+    let selected_key = selected_key?;
+    let selected_index = rows.iter().position(|row| row.key == selected_key)?;
+    let neighbor_index = if direction < 0 {
+        selected_index.checked_sub(1)?
+    } else if direction > 0 {
+        selected_index.checked_add(1)?
+    } else {
+        selected_index
+    };
+
+    rows.get(neighbor_index).map(|row| row.key.clone())
+}
+
+fn selected_mod_position_label(
+    rows: &[ModRowViewModel],
+    selected_key: Option<&str>,
+    has_explicit_selection: bool,
+) -> String {
+    if rows.is_empty() {
+        return "No mods".to_string();
+    }
+
+    let Some(index) = selected_key.and_then(|key| rows.iter().position(|row| row.key == key))
+    else {
+        return format!("{} mods", rows.len());
+    };
+
+    if has_explicit_selection {
+        format!("Mod {} of {}", index + 1, rows.len())
+    } else {
+        format!("First visible / {}", rows.len())
+    }
+}
+
+fn mod_settings_action_disabled(has_selected_mod: bool) -> bool {
+    !has_selected_mod
+}
+
+fn mod_settings_action_title(
+    total_mod_count: usize,
+    has_selectable_mod: bool,
+    has_explicit_selection: bool,
+) -> &'static str {
+    if has_selectable_mod && has_explicit_selection {
+        "Open selected mod settings"
+    } else if has_selectable_mod {
+        "Open first visible mod settings"
+    } else if total_mod_count == 0 {
+        "Load game mods before opening Mod Settings"
+    } else {
+        "Clear search or filters before opening Mod Settings"
+    }
+}
+
+fn mod_context_label(has_explicit_selection: bool) -> &'static str {
+    if has_explicit_selection {
+        "Selected Mod"
+    } else {
+        "First Visible Mod"
+    }
+}
+
+fn mod_detail_empty_title(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "No mod selected"
+    } else {
+        "No visible mod selected"
+    }
+}
+
+fn mod_detail_empty_body(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "Load game mods or open a mod folder, then select a row from the archive."
+    } else {
+        "Current search or filters hide every mod. Clear them to restore the archive selection."
+    }
+}
+
+fn archive_empty_title(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "No mods loaded"
+    } else {
+        "No visible mods"
+    }
+}
+
+fn archive_empty_body(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "No source selected."
+    } else {
+        "Current search or filters hide every archive row."
+    }
+}
+
+fn mod_order_label(all_rows: &[ModRowViewModel], mod_key: &str) -> String {
+    all_rows
+        .iter()
+        .position(|row| row.key == mod_key)
+        .map(|index| (index + 1).to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn mod_row_matches_filter(mod_row: &ModRowViewModel, filter: ModListFilter) -> bool {
     match filter {
         ModListFilter::All => true,
@@ -3177,6 +3909,7 @@ fn mod_categories_label(mod_row: &ModRowViewModel) -> String {
     }
 }
 
+#[cfg(test)]
 fn mod_list_filter_label(filter: ModListFilter) -> &'static str {
     match filter {
         ModListFilter::All => "All mods",
@@ -3189,18 +3922,108 @@ fn mod_list_filter_label(filter: ModListFilter) -> &'static str {
 
 fn mod_row_style(active: bool) -> &'static str {
     if active {
-        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #3b82f6; border-left: 3px solid #60a5fa; border-radius: 4px; padding: 7px 14px; background: #1d2631; cursor: pointer;"
+        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #3b82f6; border-left: 3px solid #60a5fa; border-radius: 4px; padding: 7px 14px; background: #1d2631; cursor: pointer;"
     } else {
-        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #252b38; border-left: 3px solid transparent; border-radius: 4px; padding: 7px 14px; background: #171922; cursor: pointer;"
+        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #252b38; border-left: 3px solid transparent; border-radius: 4px; padding: 7px 14px; background: #171922; cursor: pointer;"
     }
 }
 
+fn archive_status_style() -> &'static str {
+    "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 12px 10px; color: #aeb8c8; font-size: 13px;"
+}
+
+fn archive_workspace_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; padding: 0 10px 24px;"
+}
+
 fn archive_table_header_style() -> &'static str {
-    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr); align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid #303746; background: #20242f; color: #cbd5e1; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 0;"
+    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid #303746; background: #20242f; color: #cbd5e1; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn archive_empty_panel_style() -> &'static str {
+    "min-height: 118px; display: grid; align-content: center; gap: 8px; border: 1px solid #252b38; border-left: 3px solid #303746; border-radius: 4px; background: #151722; padding: 18px 20px; color: #cbd8cc;"
+}
+
+fn archive_empty_title_style() -> &'static str {
+    "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;"
+}
+
+fn archive_empty_body_style() -> &'static str {
+    "font-size: 13px; line-height: 18px; color: #9aa4b7;"
+}
+
+fn archive_empty_actions_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px;"
+}
+
+fn archive_empty_button_style(primary: bool) -> &'static str {
+    if primary {
+        "min-height: 34px; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 5px; padding: 8px 12px; font-size: 13px; font-weight: 800;"
+    } else {
+        "min-height: 34px; border: 1px solid #3a4354; background: #242936; color: #edf2f7; border-radius: 5px; padding: 8px 12px; font-size: 13px;"
+    }
+}
+
+fn archive_header_icon_button_style(active: bool) -> &'static str {
+    if active {
+        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #65f58b; background: #17251a; color: #b7ffc7; border-radius: 5px; padding: 0;"
+    } else {
+        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #3a4354; background: #242936; color: #d5dbe6; border-radius: 5px; padding: 0;"
+    }
+}
+
+fn archive_header_gear_icon_style() -> &'static str {
+    "position: relative; width: 18px; height: 18px; display: block;"
+}
+
+fn archive_header_gear_ring_style() -> &'static str {
+    "position: absolute; left: 4px; top: 4px; width: 10px; height: 10px; border: 2px solid currentColor; border-radius: 999px; box-sizing: border-box;"
+}
+
+fn archive_header_gear_tooth_style(position: &str) -> &'static str {
+    match position {
+        "top" => {
+            "position: absolute; left: 8px; top: 0; width: 2px; height: 5px; background: currentColor; border-radius: 2px;"
+        }
+        "right" => {
+            "position: absolute; right: 0; top: 8px; width: 5px; height: 2px; background: currentColor; border-radius: 2px;"
+        }
+        "bottom" => {
+            "position: absolute; left: 8px; bottom: 0; width: 2px; height: 5px; background: currentColor; border-radius: 2px;"
+        }
+        "left" => {
+            "position: absolute; left: 0; top: 8px; width: 5px; height: 2px; background: currentColor; border-radius: 2px;"
+        }
+        _ => "",
+    }
+}
+
+fn archive_row_open_indicator_style(active: bool) -> &'static str {
+    if active {
+        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 5px; font-size: 18px; line-height: 18px; font-weight: 800;"
+    } else {
+        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #303746; background: #202532; color: #9aa4b7; border-radius: 5px; font-size: 18px; line-height: 18px; font-weight: 800;"
+    }
+}
+
+fn archive_utility_dock_style() -> &'static str {
+    "position: sticky; bottom: 0; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; border: 1px solid #293142; background: rgba(21, 24, 33, 0.98); border-radius: 6px; padding: 8px; box-shadow: 0 -10px 24px rgba(0, 0, 0, 0.22);"
 }
 
 fn archive_filter_bar_style() -> &'static str {
-    "display: flex; align-items: center; flex-wrap: wrap; gap: 7px; width: 100%; min-height: 42px; box-sizing: border-box; border: 1px solid #293142; background: #151821; border-radius: 4px; padding: 6px 8px;"
+    "display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; min-height: 34px; box-sizing: border-box;"
+}
+
+fn archive_source_action_row_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; min-width: 0;"
+}
+
+fn archive_filter_chip_style(active: bool) -> &'static str {
+    if active {
+        "min-width: 130px; height: 36px; display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 0 14px; font-size: 13px; font-weight: 650; letter-spacing: 0;"
+    } else {
+        "min-width: 130px; height: 36px; display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #303746; background: #232530; color: #d8ded8; border-radius: 5px; padding: 0 14px; font-size: 13px; font-weight: 650; letter-spacing: 0;"
+    }
 }
 
 fn archive_filter_button_style(active: bool) -> &'static str {
@@ -3215,23 +4038,26 @@ fn library_nav_active(
     target: LibraryNavTarget,
     workspace_page: WorkspacePage,
     mod_filter: ModListFilter,
-    library_tool: LibraryToolTab,
 ) -> bool {
     match target {
         LibraryNavTarget::AllMods => {
-            workspace_page == WorkspacePage::Mods
-                && mod_filter == ModListFilter::All
-                && library_tool == LibraryToolTab::None
+            (workspace_page == WorkspacePage::Mods && mod_filter == ModListFilter::All)
+                || workspace_page == WorkspacePage::ModDetail
         }
         LibraryNavTarget::Enabled => {
-            workspace_page == WorkspacePage::Mods
-                && mod_filter == ModListFilter::Enabled
-                && library_tool == LibraryToolTab::None
+            workspace_page == WorkspacePage::Mods && mod_filter == ModListFilter::Enabled
         }
         LibraryNavTarget::Categories => workspace_page == WorkspacePage::Categories,
         LibraryNavTarget::Collections => workspace_page == WorkspacePage::Collections,
-        LibraryNavTarget::Settings => workspace_page == WorkspacePage::Settings,
     }
+}
+
+fn settings_focus_active(
+    workspace_page: WorkspacePage,
+    current_focus: SettingsFocus,
+    target_focus: SettingsFocus,
+) -> bool {
+    workspace_page == WorkspacePage::Settings && current_focus == target_focus
 }
 
 fn nav_button_style(active: bool) -> &'static str {
@@ -3242,12 +4068,36 @@ fn nav_button_style(active: bool) -> &'static str {
     }
 }
 
-fn nav_badge_style() -> &'static str {
-    "width: 26px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid currentColor; border-radius: 4px; font-size: 9px; font-weight: 800; letter-spacing: 0;"
+fn nav_icon_tile_style(active: bool) -> &'static str {
+    if active {
+        "width: 26px; height: 24px; display: grid; grid-template-columns: repeat(2, 1fr); place-items: center; gap: 2px; border: 1px solid currentColor; border-radius: 4px; padding: 4px; box-sizing: border-box;"
+    } else {
+        "width: 26px; height: 24px; display: grid; grid-template-columns: repeat(2, 1fr); place-items: center; gap: 2px; border: 1px solid #3d4a3e; border-radius: 4px; padding: 4px; box-sizing: border-box;"
+    }
 }
 
-fn header_metric_style() -> &'static str {
-    "min-height: 30px; display: inline-flex; align-items: center; border: 1px solid #293142; background: #171b24; color: #cbd5e1; border-radius: 4px; padding: 0 9px; font-size: 11px; font-weight: 650; letter-spacing: 0;"
+fn nav_icon_dot_style() -> &'static str {
+    "width: 4px; height: 4px; border-radius: 999px; background: currentColor;"
+}
+
+fn nav_icon_line_style() -> &'static str {
+    "grid-column: 1 / -1; width: 12px; height: 2px; border-radius: 999px; background: currentColor;"
+}
+
+fn nav_icon_stack_style() -> &'static str {
+    "grid-column: 1 / -1; width: 13px; height: 10px; border: 1px solid currentColor; border-radius: 2px; box-shadow: 3px 3px 0 -1px #171b24, 3px 3px 0 0 currentColor;"
+}
+
+fn nav_icon_ring_style() -> &'static str {
+    "grid-column: 1 / -1; width: 10px; height: 10px; border: 2px solid currentColor; border-radius: 999px; box-sizing: border-box;"
+}
+
+fn nav_count_chip_style(active: bool) -> &'static str {
+    if active {
+        "justify-self: end; min-width: 28px; height: 22px; display: inline-grid; place-items: center; border: 1px solid #2f6f44; background: #25322b; color: #d8ffe1; border-radius: 4px; padding: 0 7px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
+    } else {
+        "justify-self: end; min-width: 28px; height: 22px; display: inline-grid; place-items: center; border: 1px solid #2d3442; background: #20232d; color: #d5d9df; border-radius: 4px; padding: 0 7px; font-size: 11px; font-weight: 750; letter-spacing: 0;"
+    }
 }
 
 fn top_icon_button_style(active: bool) -> &'static str {
@@ -3258,6 +4108,42 @@ fn top_icon_button_style(active: bool) -> &'static str {
     }
 }
 
+fn top_icon_glyph_style() -> &'static str {
+    "position: relative; width: 22px; height: 22px; display: block; color: currentColor;"
+}
+
+fn top_bell_body_style() -> &'static str {
+    "position: absolute; left: 6px; top: 4px; width: 10px; height: 12px; border: 2px solid currentColor; border-bottom: 0; border-radius: 10px 10px 3px 3px; box-sizing: border-box;"
+}
+
+fn top_bell_clapper_style() -> &'static str {
+    "position: absolute; left: 9px; top: 16px; width: 4px; height: 2px; border-radius: 999px; background: currentColor;"
+}
+
+fn top_download_status_dot_style() -> &'static str {
+    "position: absolute; right: 0; top: 0; width: 6px; height: 6px; border-radius: 999px; background: #65f58b;"
+}
+
+fn top_download_stem_style() -> &'static str {
+    "position: absolute; left: 10px; top: 4px; width: 2px; height: 10px; border-radius: 999px; background: currentColor;"
+}
+
+fn top_download_arrow_style() -> &'static str {
+    "position: absolute; left: 7px; top: 10px; width: 7px; height: 7px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); box-sizing: border-box;"
+}
+
+fn top_download_tray_style() -> &'static str {
+    "position: absolute; left: 5px; bottom: 2px; width: 12px; height: 3px; border: 2px solid currentColor; border-top: 0; border-radius: 0 0 3px 3px; box-sizing: border-box;"
+}
+
+fn top_profile_head_style() -> &'static str {
+    "position: absolute; left: 7px; top: 4px; width: 8px; height: 8px; border: 2px solid currentColor; border-radius: 999px; box-sizing: border-box;"
+}
+
+fn top_profile_body_style() -> &'static str {
+    "position: absolute; left: 4px; top: 13px; width: 14px; height: 7px; border: 2px solid currentColor; border-radius: 999px 999px 4px 4px; box-sizing: border-box;"
+}
+
 fn library_utility_button_style(active: bool) -> &'static str {
     if active {
         "display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; gap: 10px; width: 100%; min-height: 38px; border: 0; border-left: 2px solid #65f58b; background: #202c2a; color: #65f58b; border-radius: 4px; padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: 1.4px;"
@@ -3266,20 +4152,201 @@ fn library_utility_button_style(active: bool) -> &'static str {
     }
 }
 
+fn settings_focus_title(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "General Settings",
+        SettingsFocus::GamePaths => "Game Paths",
+        SettingsFocus::Launch => "Launch Options",
+        SettingsFocus::Diagnostics => "Logs and Diagnostics",
+    }
+}
+
+fn settings_focus_tab_label(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "General",
+        SettingsFocus::GamePaths => "Game Paths",
+        SettingsFocus::Launch => "Launch Options",
+        SettingsFocus::Diagnostics => "Diagnostics",
+    }
+}
+
+fn settings_focus_description(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "Manage app-level behavior plus TS config import and export.",
+        SettingsFocus::GamePaths => {
+            "Set the WH3 install folder and Steam helper integration paths."
+        }
+        SettingsFocus::Launch => {
+            "Tune WH3 startup behavior, generated packs, save continuation, and launch preview."
+        }
+        SettingsFocus::Diagnostics => {
+            "Find live log paths and write a diagnostic snapshot for troubleshooting."
+        }
+    }
+}
+
+fn settings_focus_breadcrumb(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "Settings / General",
+        SettingsFocus::GamePaths => "Settings / Game Paths",
+        SettingsFocus::Launch => "Settings / Launch Options",
+        SettingsFocus::Diagnostics => "Settings / Diagnostics",
+    }
+}
+
+fn settings_game_executable_label(game_folder: Option<&Path>) -> String {
+    settings_game_child_path_label(
+        game_folder,
+        "Warhammer3.exe",
+        "No WH3 executable path selected",
+    )
+}
+
+fn settings_game_data_label(game_folder: Option<&Path>) -> String {
+    settings_game_child_path_label(game_folder, "data", "No WH3 data folder selected")
+}
+
+fn settings_game_child_path_label(
+    game_folder: Option<&Path>,
+    child_name: &str,
+    empty_label: &str,
+) -> String {
+    let Some(game_folder) = game_folder else {
+        return empty_label.to_string();
+    };
+
+    let raw_folder = game_folder.display().to_string();
+    let trimmed = raw_folder.trim_end_matches(['/', '\\']);
+    if trimmed.trim().is_empty() {
+        return empty_label.to_string();
+    }
+
+    if trimmed.contains('\\') {
+        format!("{trimmed}\\{child_name}")
+    } else {
+        Path::new(trimmed).join(child_name).display().to_string()
+    }
+}
+
+fn settings_focus_tabs_style() -> &'static str {
+    "width: min(100%, 860px); box-sizing: border-box; margin: 0 auto 16px; padding: 0 40px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;"
+}
+
+fn settings_focus_tab_style(active: bool) -> &'static str {
+    if active {
+        "min-height: 36px; border: 1px solid #65f58b; background: #17251a; color: #d8ffe1; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 800; letter-spacing: 0;"
+    } else {
+        "min-height: 36px; border: 1px solid #303241; background: #20212b; color: #d5d9df; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700; letter-spacing: 0;"
+    }
+}
+
 fn settings_card_style() -> &'static str {
     "border: 1px solid #303241; background: #1f202b; border-radius: 8px; overflow: hidden;"
 }
 
+fn settings_focus_card_style(section: SettingsFocus, focus: SettingsFocus) -> String {
+    if section == focus {
+        return format!(
+            "{} order: 0; border-color: #65f58b; box-shadow: 0 0 0 1px rgba(101, 245, 139, 0.18);",
+            settings_card_style()
+        );
+    }
+
+    format!("{} display: none;", settings_card_style())
+}
+
+fn secondary_page_header_style() -> &'static str {
+    "display: grid; gap: 8px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 34px 40px 18px;"
+}
+
+fn secondary_page_breadcrumb(page: WorkspacePage) -> &'static str {
+    match page {
+        WorkspacePage::Categories => "Library / Categories",
+        WorkspacePage::Collections => "Library / Collections",
+        WorkspacePage::Compatibility => "Mod Archive / Compatibility",
+        WorkspacePage::DbViewer => "Packs / DB Viewer",
+        WorkspacePage::Skills => "Packs / Skills",
+        WorkspacePage::Checks => "Tools / Checks",
+        WorkspacePage::Steam => "Tools / Steam",
+        WorkspacePage::Workshop => "Tools / Workshop",
+        WorkspacePage::Mods | WorkspacePage::ModDetail | WorkspacePage::Settings => "",
+    }
+}
+
+fn secondary_page_kicker_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #65f58b; font-weight: 800; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn secondary_status_style() -> &'static str {
+    "width: min(100%, 1040px); box-sizing: border-box; border: 1px solid #303746; background: #171b24; border-radius: 4px; padding: 8px 10px; margin: 0 auto 14px; color: #aeb8c8; font-size: 13px;"
+}
+
+fn secondary_page_content_style() -> &'static str {
+    "display: grid; gap: 22px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 0 40px 44px;"
+}
+
+fn settings_page_header_style() -> &'static str {
+    "display: grid; gap: 8px; width: min(100%, 860px); box-sizing: border-box; margin: 0 auto; padding: 42px 40px 22px;"
+}
+
+fn settings_page_kicker_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #65f58b; font-weight: 800; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn settings_page_content_style() -> &'static str {
+    "display: grid; gap: 26px; width: min(100%, 860px); box-sizing: border-box; margin: 0 auto; padding: 0 40px 44px;"
+}
+
 fn settings_card_header_style() -> &'static str {
-    "display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; background: #2a2b37; border-bottom: 1px solid #303241;"
+    "display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 58px; padding: 16px 22px; background: #2a2b37; border-bottom: 1px solid #303241;"
+}
+
+fn settings_card_header_actions_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap;"
+}
+
+fn settings_focus_route_chip_style() -> &'static str {
+    "min-height: 24px; display: inline-flex; align-items: center; border: 1px solid #4ade80; background: #17251a; color: #d8ffe1; border-radius: 4px; padding: 0 8px; font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.8px; white-space: nowrap;"
 }
 
 fn settings_card_body_style() -> &'static str {
-    "display: grid; gap: 18px; padding: 20px;"
+    "display: grid; gap: 0; padding: 20px 22px;"
 }
 
 fn settings_row_style() -> &'static str {
-    "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; padding-bottom: 18px; border-bottom: 1px solid #2b2d39;"
+    "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; min-height: 58px; padding: 14px 0; border-bottom: 1px solid #2b2d39;"
+}
+
+fn settings_field_style() -> &'static str {
+    "display: grid; gap: 8px; min-width: 0; padding: 14px 0; border-bottom: 1px solid #2b2d39;"
+}
+
+fn settings_inline_field_style() -> &'static str {
+    "display: grid; gap: 8px; min-width: 0;"
+}
+
+fn settings_path_action_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) 104px; gap: 10px; align-items: stretch;"
+}
+
+fn settings_helper_backend_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) 104px; gap: 10px; align-items: end; padding: 14px 0; border-bottom: 1px solid #2b2d39;"
+}
+
+fn settings_button_pair_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 14px 0;"
+}
+
+fn settings_launch_actions_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, 0.75fr); gap: 16px; align-items: center; padding: 18px 0 4px; border-top: 1px solid #2b2d39;"
+}
+
+fn settings_launch_actions_copy_style() -> &'static str {
+    "display: grid; gap: 4px; min-width: 0; color: #e5e7eb; font-size: 14px; line-height: 20px;"
+}
+
+fn settings_launch_button_row_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0;"
 }
 
 fn settings_input_style() -> &'static str {
@@ -3324,19 +4391,37 @@ fn archive_toolbar_button_style(primary: bool) -> &'static str {
 
 fn toggle_label_style(enabled: bool) -> &'static str {
     if enabled {
-        "min-width: 58px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #4ade80; background: #65f58b; color: #06210d; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 48px; height: 26px; display: inline-flex; align-items: center; justify-content: flex-start; border: 1px solid #4ade80; background: #65f58b; border-radius: 999px; padding: 2px; box-sizing: border-box; cursor: pointer;"
     } else {
-        "min-width: 58px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #475569; background: #353a43; color: #cbd5e1; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 48px; height: 26px; display: inline-flex; align-items: center; justify-content: flex-start; border: 1px solid #475569; background: #353a43; border-radius: 999px; padding: 2px; box-sizing: border-box; cursor: pointer;"
+    }
+}
+
+fn settings_toggle_knob_style(enabled: bool) -> &'static str {
+    if enabled {
+        "width: 18px; height: 18px; display: block; border-radius: 999px; background: #06210d; transform: translateX(22px);"
+    } else {
+        "width: 18px; height: 18px; display: block; border-radius: 999px; background: #cbd5e1; transform: translateX(0);"
     }
 }
 
 fn mod_enable_button_style(enabled: bool, locked: bool) -> &'static str {
     if locked {
-        "width: 54px; height: 26px; border: 1px solid #4b5563; background: #343946; color: #9aa4b7; border-radius: 999px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 44px; height: 24px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid #4b5563; background: #343946; border-radius: 999px; padding: 2px; box-sizing: border-box;"
     } else if enabled {
-        "width: 54px; height: 26px; border: 1px solid #4ade80; background: #65f58b; color: #06210d; border-radius: 999px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 44px; height: 24px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid #4ade80; background: #65f58b; border-radius: 999px; padding: 2px; box-sizing: border-box;"
     } else {
-        "width: 54px; height: 26px; border: 1px solid #475569; background: #353a43; color: #cbd5e1; border-radius: 999px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 44px; height: 24px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid #475569; background: #353a43; border-radius: 999px; padding: 2px; box-sizing: border-box;"
+    }
+}
+
+fn mod_enable_knob_style(enabled: bool, locked: bool) -> &'static str {
+    if locked {
+        "width: 16px; height: 16px; display: block; border-radius: 999px; background: #9aa4b7; transform: translateX(20px);"
+    } else if enabled {
+        "width: 16px; height: 16px; display: block; border-radius: 999px; background: #06210d; transform: translateX(20px);"
+    } else {
+        "width: 16px; height: 16px; display: block; border-radius: 999px; background: #cbd5e1; transform: translateX(0);"
     }
 }
 
@@ -3380,6 +4465,47 @@ fn mod_updated_label(
     relative_time_label(metadata.last_changed_ms, now_ms)
 }
 
+fn mod_detail_description_text(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
+    if workshop_metadata_for_row(mod_row, metadata).is_some() {
+        return "Cached Steam Workshop metadata is available for this record.".to_string();
+    }
+
+    format!(
+        "No description metadata is cached for this {} record.",
+        mod_source_label(mod_row).to_ascii_lowercase()
+    )
+}
+
+fn mod_detail_dependency_text(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
+    let Some(metadata) = workshop_metadata_for_row(mod_row, metadata) else {
+        return "No workshop dependency metadata is cached for this record.".to_string();
+    };
+
+    if let Some(summary) = dependency_names_summary(metadata, 6) {
+        return summary;
+    }
+
+    if metadata.dependency_ids.is_empty() {
+        "No required workshop dependencies are recorded.".to_string()
+    } else {
+        let visible_ids = metadata
+            .dependency_ids
+            .iter()
+            .take(6)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut summary = visible_ids.join(", ");
+        let hidden_count = metadata
+            .dependency_ids
+            .len()
+            .saturating_sub(visible_ids.len());
+        if hidden_count > 0 {
+            summary.push_str(&format!(" +{hidden_count}"));
+        }
+        summary
+    }
+}
+
 fn workshop_metadata_for_row<'a>(
     mod_row: &ModRowViewModel,
     metadata: &'a [WorkshopModData],
@@ -3409,6 +4535,109 @@ fn mod_workshop_id_from_row(mod_row: &ModRowViewModel) -> Option<String> {
                 .next()
         })
         .and_then(normalize_workshop_id)
+}
+
+fn selected_mod_folder_target(mod_row: &ModRowViewModel) -> Option<String> {
+    let raw_path = mod_row.subtitle.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    if raw_path.to_ascii_lowercase().ends_with(".pack") {
+        return split_parent_path(raw_path).map(str::to_string);
+    }
+
+    Some(raw_path.to_string())
+}
+
+fn split_parent_path(path: &str) -> Option<&str> {
+    let slash_index = path.rfind('/');
+    let backslash_index = path.rfind('\\');
+    let separator_index = match (slash_index, backslash_index) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(index), None) | (None, Some(index)) => Some(index),
+        (None, None) => None,
+    }?;
+
+    if separator_index == 0 {
+        Some(&path[..1])
+    } else {
+        Some(&path[..separator_index])
+    }
+}
+
+fn workshop_url_for_mod_row(mod_row: &ModRowViewModel) -> Option<String> {
+    mod_workshop_id_from_row(mod_row).map(|workshop_id| {
+        format!("https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}")
+    })
+}
+
+fn open_selected_mod_folder(mod_row: &ModRowViewModel) -> Result<String, String> {
+    let Some(target) = selected_mod_folder_target(mod_row) else {
+        return Err("Could not open selected mod folder: no path is available.".to_string());
+    };
+
+    open_system_target(&target)?;
+    Ok(format!("Opened selected mod folder: {target}"))
+}
+
+fn open_selected_mod_workshop_page(mod_row: &ModRowViewModel) -> Result<String, String> {
+    let Some(url) = workshop_url_for_mod_row(mod_row) else {
+        return Err("Selected mod does not have a Steam Workshop ID.".to_string());
+    };
+
+    open_system_target(&url)?;
+    Ok(format!("Opened Steam Workshop page: {url}"))
+}
+
+fn project_readme_path() -> PathBuf {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    [cwd.join("README.md"), cwd.join("../../README.md")]
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("README.md"))
+}
+
+fn open_project_readme() -> Result<String, String> {
+    let readme_path = project_readme_path();
+    let target = readme_path.display().to_string();
+    open_system_target(&target)?;
+    Ok(format!("Opened project README: {target}"))
+}
+
+fn open_system_target(target: &str) -> Result<(), String> {
+    let status = open_system_target_command(target)
+        .status()
+        .map_err(|error| format!("Could not open {target}: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not open {target}: opener exited with {status}"
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_system_target_command(target: &str) -> Command {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "start", "", target]);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn open_system_target_command(target: &str) -> Command {
+    let mut command = Command::new("open");
+    command.arg(target);
+    command
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_system_target_command(target: &str) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(target);
+    command
 }
 
 fn relative_time_label(changed_ms: u64, now_ms: u64) -> String {
@@ -3461,19 +4690,135 @@ fn source_tile_style(mod_row: &ModRowViewModel) -> &'static str {
 fn detail_source_tile_style(mod_row: &ModRowViewModel) -> &'static str {
     match mod_source_label(mod_row) {
         "WS" => {
-            "aspect-ratio: 1 / 1; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #2563eb; background: #172554; color: #bfdbfe; border-radius: 8px; text-align: center;"
+            "aspect-ratio: 1 / 1; min-height: 220px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #2563eb; background: #172554; color: #bfdbfe; border-radius: 8px; text-align: center; padding: 18px;"
         }
         "CORE" => {
-            "aspect-ratio: 1 / 1; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #4b5563; background: #272b35; color: #d1d5db; border-radius: 8px; text-align: center;"
+            "aspect-ratio: 1 / 1; min-height: 220px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #4b5563; background: #272b35; color: #d1d5db; border-radius: 8px; text-align: center; padding: 18px;"
         }
         _ => {
-            "aspect-ratio: 1 / 1; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #166534; background: #10281a; color: #86efac; border-radius: 8px; text-align: center;"
+            "aspect-ratio: 1 / 1; min-height: 220px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #166534; background: #10281a; color: #86efac; border-radius: 8px; text-align: center; padding: 18px;"
         }
     }
 }
 
+fn detail_source_tile_caption_style() -> &'static str {
+    "width: 100%; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #f8fafc; font-size: 13px; line-height: 18px; font-weight: 750;"
+}
+
+fn detail_page_header_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 30px 40px 16px;"
+}
+
+fn mod_detail_breadcrumb() -> &'static str {
+    "Mod Archive / Mod Settings"
+}
+
+fn detail_page_kicker_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #65f58b; font-weight: 800; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn detail_header_actions_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; flex-wrap: wrap;"
+}
+
+fn detail_position_label_style() -> &'static str {
+    "min-height: 34px; display: inline-flex; align-items: center; border: 1px solid #303241; background: #171b24; color: #aeb8c8; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700; white-space: nowrap;"
+}
+
+fn detail_header_nav_button_style(disabled: bool) -> &'static str {
+    if disabled {
+        "min-height: 34px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 5px; padding: 7px 10px; font-size: 13px; cursor: not-allowed;"
+    } else {
+        "min-height: 34px; border: 1px solid #3b3d4d; background: #292a35; color: #f2f5f2; border-radius: 5px; padding: 7px 10px; font-size: 13px;"
+    }
+}
+
+fn detail_status_style() -> &'static str {
+    "width: min(100%, 1040px); box-sizing: border-box; border: 1px solid #303746; background: #171b24; border-radius: 4px; padding: 8px 10px; margin: 0 auto 14px; color: #aeb8c8; font-size: 13px;"
+}
+
+fn detail_empty_panel_style() -> &'static str {
+    "display: grid; align-content: center; gap: 12px; min-height: 180px; border: 1px solid #303241; border-left: 3px solid #303746; border-radius: 8px; background: #1f202b; padding: 24px 26px; color: #aeb8c8;"
+}
+
+fn detail_empty_title_style() -> &'static str {
+    "font-size: 18px; line-height: 24px; margin: 0; color: #edf2f7;"
+}
+
+fn detail_empty_body_style() -> &'static str {
+    "font-size: 13px; line-height: 19px; color: #aeb8c8; max-width: 620px;"
+}
+
+fn detail_empty_actions_style() -> &'static str {
+    "display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 2px;"
+}
+
+fn detail_page_content_style() -> &'static str {
+    "display: grid; gap: 18px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 0 40px 40px;"
+}
+
+fn detail_workspace_grid_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(210px, 260px) minmax(0, 1fr); gap: 18px; align-items: start;"
+}
+
+fn detail_side_column_style() -> &'static str {
+    "display: grid; gap: 12px; min-width: 0;"
+}
+
+fn detail_side_meta_panel_style() -> &'static str {
+    "display: grid; gap: 9px; border: 1px solid #303241; background: #1f202b; border-radius: 8px; padding: 14px 16px;"
+}
+
+fn detail_side_meta_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 0.75fr) minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; font-size: 12px; line-height: 16px; color: #aeb8c8;"
+}
+
+fn detail_main_panel_style() -> &'static str {
+    "display: grid; gap: 18px; min-width: 0; border: 1px solid #303241; background: #1f202b; border-radius: 8px; padding: 20px 22px;"
+}
+
+fn detail_metrics_grid_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px;"
+}
+
 fn detail_metric_style() -> &'static str {
     "display: grid; gap: 4px; min-width: 0; border-top: 1px solid #3b3d4d; padding-top: 10px; font-size: 12px; color: #aeb8c8;"
+}
+
+fn detail_section_label_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn detail_tag_list_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; gap: 6px;"
+}
+
+fn detail_primary_description_panel_style() -> &'static str {
+    "display: grid; gap: 10px; min-height: 150px; border: 1px solid #303241; background: #1a1b26; border-radius: 6px; padding: 18px 20px;"
+}
+
+fn detail_primary_description_body_style() -> &'static str {
+    "font-size: 14px; line-height: 21px; color: #e2e8dd;"
+}
+
+fn detail_record_path_style() -> &'static str {
+    "display: grid; gap: 8px; min-width: 0; overflow: hidden; border-top: 1px solid #303241; padding-top: 14px;"
+}
+
+fn detail_description_panel_style() -> &'static str {
+    "display: grid; gap: 8px; border-top: 1px solid #303241; padding-top: 14px;"
+}
+
+fn detail_description_body_style() -> &'static str {
+    "font-size: 13px; line-height: 19px; color: #d8ded8;"
+}
+
+fn detail_category_assignment_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) minmax(86px, auto) minmax(86px, auto); gap: 8px; align-items: stretch;"
+}
+
+fn detail_action_grid_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 8px;"
 }
 
 fn detail_action_button_style(danger: bool) -> &'static str {
@@ -3484,34 +4829,144 @@ fn detail_action_button_style(danger: bool) -> &'static str {
     }
 }
 
-#[cfg(test)]
-fn library_tool_tab_label(tab: LibraryToolTab) -> &'static str {
-    match tab {
-        LibraryToolTab::None => "None",
-        LibraryToolTab::Presets => "Presets",
-        LibraryToolTab::Categories => "Cats",
-        LibraryToolTab::Config => "Config",
-    }
-}
-
 fn launch_quick_button_style() -> &'static str {
     "min-height: 42px; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 14px; font-weight: 650;"
 }
 
+fn tools_rail_style() -> &'static str {
+    "grid-area: tools; min-width: 0; border-left: 1px solid #263041; background: #20212b; padding: 28px 18px; overflow-y: auto; display: flex; flex-direction: column;"
+}
+
+fn tools_header_style() -> &'static str {
+    "display: grid; gap: 4px; margin-bottom: 26px;"
+}
+
+fn play_primary_button_style() -> &'static str {
+    "width: 100%; min-height: 76px; display: flex; align-items: center; justify-content: center; gap: 12px; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 8px; padding: 18px 14px; font-weight: 900; font-size: 24px; line-height: 30px; margin-bottom: 22px; letter-spacing: 0; box-shadow: 0 0 18px rgba(101, 245, 139, 0.14);"
+}
+
+fn play_icon_style() -> &'static str {
+    "width: 0; height: 0; display: inline-block; border-top: 9px solid transparent; border-bottom: 9px solid transparent; border-left: 14px solid currentColor;"
+}
+
 fn continue_save_button_style(needs_save_name: bool) -> &'static str {
     if needs_save_name {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 50px; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 5px; padding: 12px 16px; margin: -4px 0 18px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 6px; padding: 12px 16px; margin: -2px 0 22px; font-size: 15px; text-align: left;"
     } else {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 50px; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 5px; padding: 12px 16px; margin: -4px 0 18px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 6px; padding: 12px 16px; margin: -2px 0 22px; font-size: 15px; text-align: left;"
+    }
+}
+
+fn tool_action_group_style() -> &'static str {
+    "display: grid; gap: 10px; margin-bottom: 18px;"
+}
+
+fn tool_context_panel_style() -> &'static str {
+    "display: grid; gap: 8px; margin: -2px 0 18px; padding: 12px; border: 1px solid #303241; background: #1a1b25; border-radius: 6px;"
+}
+
+fn tool_context_summary_style() -> &'static str {
+    "display: grid; gap: 4px; min-width: 0; padding: 0 2px 8px; border-bottom: 1px solid #303241;"
+}
+
+fn tool_context_label_style() -> &'static str {
+    "font-size: 10px; line-height: 13px; color: #9fb0a3; text-transform: uppercase; letter-spacing: 1px;"
+}
+
+fn tool_settings_views_group_label() -> &'static str {
+    "Settings Views"
+}
+
+fn tool_other_screens_group_label() -> &'static str {
+    "Other Screens"
+}
+
+fn tool_context_name_style() -> &'static str {
+    "font-size: 14px; line-height: 18px; color: #f2f5f2; font-weight: 750; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
+}
+
+fn tool_context_path_style() -> &'static str {
+    "font-size: 11px; line-height: 15px; color: #9aa4b7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;"
+}
+
+fn tool_context_meta_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; gap: 6px; padding-top: 4px;"
+}
+
+fn tool_context_meta_chip_style() -> &'static str {
+    "min-height: 22px; display: inline-flex; align-items: center; border: 1px solid #303746; background: #202532; color: #cbd5e1; border-radius: 4px; padding: 0 7px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px;"
+}
+
+fn tool_context_actions_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;"
+}
+
+fn tool_context_action_style(disabled: bool) -> &'static str {
+    if disabled {
+        "min-height: 40px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 5px; padding: 9px 10px; font-size: 13px; text-align: center;"
+    } else {
+        "min-height: 40px; border: 1px solid #3b3d4d; background: transparent; color: #d8ded8; border-radius: 5px; padding: 9px 10px; font-size: 13px; text-align: center;"
+    }
+}
+
+fn tool_context_toggle_style(locked: bool) -> &'static str {
+    if locked {
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 46px; border: 1px solid #303241; background: #20212b; color: #9aa4b7; border-radius: 5px; padding: 10px 12px; font-size: 14px; text-align: left;"
+    } else {
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 46px; border: 1px solid #3b3d4d; background: #292a35; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 14px; text-align: left;"
+    }
+}
+
+fn tool_context_screen_group_style() -> &'static str {
+    "display: grid; gap: 8px; margin: 0 0 18px; padding-top: 12px; border-top: 1px solid #303241;"
+}
+
+fn tool_context_screen_button_style(active: bool) -> &'static str {
+    if active {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #3b3d4d; background: #292f36; color: #f2f5f2; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left; cursor: default;"
+    } else {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #303241; background: transparent; color: #d8ded8; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left;"
+    }
+}
+
+fn tool_context_disabled_screen_button_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left; cursor: not-allowed;"
+}
+
+fn tool_more_group_style() -> &'static str {
+    "display: grid; gap: 8px; padding-left: 12px; border-left: 1px solid #343745;"
+}
+
+fn tool_aux_group_style() -> &'static str {
+    "display: grid; gap: 8px; margin: 2px 0 18px; padding-top: 12px; border-top: 1px solid #303241;"
+}
+
+fn tool_aux_button_style(active: bool) -> &'static str {
+    if active {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #3b3d4d; background: #292f36; color: #f2f5f2; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left;"
+    } else {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #303241; background: transparent; color: #d8ded8; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left;"
+    }
+}
+
+fn tool_footer_button_style(active: bool) -> &'static str {
+    if active {
+        "display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; min-height: 44px; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 6px; padding: 10px 14px; font-size: 14px; text-align: center;"
+    } else {
+        "display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; min-height: 44px; border: 1px solid #303241; background: #11121a; color: #d8ded8; border-radius: 6px; padding: 10px 14px; font-size: 14px; text-align: center;"
     }
 }
 
 fn tool_action_button_style(active: bool) -> &'static str {
     if active {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 5px; padding: 14px 16px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 6px; padding: 13px 16px; font-size: 15px; text-align: left;"
     } else {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 5px; padding: 14px 16px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 6px; padding: 13px 16px; font-size: 15px; text-align: left;"
     }
+}
+
+fn tool_action_disabled_button_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 6px; padding: 13px 16px; font-size: 15px; text-align: left; cursor: not-allowed;"
 }
 
 #[component]
@@ -3982,6 +5437,82 @@ fn analyze_enabled_with_optional_schema(mods: &[ModRecord]) -> PackConflictRepor
 }
 
 #[component]
+fn FlowSummaryPanel(flow_summary: PackFlowSummaryViewModel) -> Element {
+    rsx! {
+        section {
+            style: "display: grid; gap: 10px; padding: 12px 14px; border: 1px solid #28323d; border-radius: 6px; background: #151b21;",
+            header {
+                style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end;",
+                div {
+                    style: "min-width: 0;",
+                    h3 {
+                        style: "font-size: 14px; margin: 0 0 3px; color: #f2f5f2;",
+                        "User flows"
+                    }
+                    div {
+                        style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{flow_summary.file_count_label} / {flow_summary.read_error_count_label}"
+                    }
+                }
+            }
+            for flow in flow_summary.files.iter() {
+                article {
+                    key: "{flow.name}",
+                    style: "display: grid; gap: 5px; border: 1px solid #222b34; border-radius: 6px; padding: 8px 10px; background: #11171d;",
+                    div {
+                        style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center;",
+                        div {
+                            style: "font-size: 13px; color: #edf2f7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                            "{flow.name}"
+                        }
+                        div {
+                            style: "font-size: 12px; color: #9fb0c0; white-space: nowrap;",
+                            "{flow.graph_label}"
+                        }
+                    }
+                    div {
+                        style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{flow.detail_label}"
+                    }
+                    if !flow.options.is_empty() {
+                        div {
+                            style: "display: flex; flex-wrap: wrap; gap: 6px;",
+                            for option in flow.options.iter() {
+                                span {
+                                    key: "{option.id}",
+                                    style: "border: 1px solid #334150; border-radius: 4px; padding: 3px 6px; font-size: 12px; color: #cbd8e4; background: #18212a;",
+                                    "{option.label}"
+                                    if let Some(default_value) = &option.default_value_label {
+                                        span {
+                                            style: "color: #9fb0c0;",
+                                            " / {default_value}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for error in flow_summary.read_errors.iter() {
+                article {
+                    key: "{error.name}",
+                    style: "display: grid; gap: 3px; border: 1px solid #5a3440; border-radius: 6px; padding: 8px 10px; background: #201418;",
+                    div {
+                        style: "font-size: 13px; color: #fecdd3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{error.name}"
+                    }
+                    div {
+                        style: "font-size: 12px; color: #fca5a5; overflow-wrap: anywhere;",
+                        "{error.message}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn PackPanel(pack: PackViewModel) -> Element {
     rsx! {
         section {
@@ -3998,75 +5529,9 @@ fn PackPanel(pack: PackViewModel) -> Element {
                 }
             }
             if let Some(flow_summary) = &pack.flow_summary {
-                section {
-                    style: "display: grid; gap: 10px; padding: 12px 14px; border-bottom: 1px solid #28323d;",
-                    header {
-                        style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end;",
-                        div {
-                            style: "min-width: 0;",
-                            h3 {
-                                style: "font-size: 14px; margin: 0 0 3px;",
-                                "User flows"
-                            }
-                            div {
-                                style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{flow_summary.file_count_label} / {flow_summary.read_error_count_label}"
-                            }
-                        }
-                    }
-                    for flow in flow_summary.files.iter() {
-                        article {
-                            key: "{flow.name}",
-                            style: "display: grid; gap: 5px; border: 1px solid #222b34; border-radius: 6px; padding: 8px 10px; background: #11171d;",
-                            div {
-                                style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center;",
-                                div {
-                                    style: "font-size: 13px; color: #edf2f7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                    "{flow.name}"
-                                }
-                                div {
-                                    style: "font-size: 12px; color: #9fb0c0; white-space: nowrap;",
-                                    "{flow.graph_label}"
-                                }
-                            }
-                            div {
-                                style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{flow.detail_label}"
-                            }
-                            if !flow.options.is_empty() {
-                                div {
-                                    style: "display: flex; flex-wrap: wrap; gap: 6px;",
-                                    for option in flow.options.iter() {
-                                        span {
-                                            key: "{option.id}",
-                                            style: "border: 1px solid #334150; border-radius: 4px; padding: 3px 6px; font-size: 12px; color: #cbd8e4; background: #18212a;",
-                                            "{option.label}"
-                                            if let Some(default_value) = &option.default_value_label {
-                                                span {
-                                                    style: "color: #9fb0c0;",
-                                                    " / {default_value}"
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for error in flow_summary.read_errors.iter() {
-                        article {
-                            key: "{error.name}",
-                            style: "display: grid; gap: 3px; border: 1px solid #5a3440; border-radius: 6px; padding: 8px 10px; background: #201418;",
-                            div {
-                                style: "font-size: 13px; color: #fecdd3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{error.name}"
-                            }
-                            div {
-                                style: "font-size: 12px; color: #fca5a5; overflow-wrap: anywhere;",
-                                "{error.message}"
-                            }
-                        }
-                    }
+                div {
+                    style: "padding: 12px 14px; border-bottom: 1px solid #28323d;",
+                    FlowSummaryPanel { flow_summary: flow_summary.clone() }
                 }
             }
             if let Some(preview) = &pack.table_preview {
@@ -6672,39 +8137,100 @@ mod tests {
     use super::{
         APP_DIAGNOSTIC_LOG_FILE, AlphaReadinessReport, AlphaReadinessRow, AlphaReadinessStatus,
         DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput, LaunchOptionState, LibraryNavTarget,
-        LibraryToolTab, ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME,
-        STEAM_HELPER_COMMAND_LOG_ENV, STEAM_HELPER_COMMAND_LOG_FILE, SteamCommandAction,
-        SteamCommandPanelRow, SteamCommandPanelState, SteamRefreshResult, WorkspacePage,
-        app_brand_subtitle, app_brand_title, append_app_diagnostic_log_event_to_path,
-        append_pack_data_overwrite_packs, apply_saved_or_existing_game_mod_list,
-        apply_steam_metadata_to_mods, archive_filter_bar_style, archive_filter_button_style,
-        archive_table_header_style, archive_toolbar_button_style,
-        build_alpha_readiness_report_with_paths, build_windows_launch_options,
-        collection_row_button_style, collection_row_style, continue_save_button_style,
-        delete_category_config_for_state, dependency_names_summary, detail_action_button_style,
-        detail_metric_style, detail_source_tile_style, diagnostic_snapshot_text,
-        enabled_pack_paths_for_start_game, fetch_steam_metadata_safely,
-        first_existing_steam_helper_path, generated_pack_details, header_metric_style,
+        ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME, STEAM_HELPER_COMMAND_LOG_ENV,
+        STEAM_HELPER_COMMAND_LOG_FILE, SettingsFocus, SteamCommandAction, SteamCommandPanelRow,
+        SteamCommandPanelState, SteamRefreshResult, WorkspacePage, app_brand_subtitle,
+        app_brand_title, append_app_diagnostic_log_event_to_path, append_pack_data_overwrite_packs,
+        apply_saved_or_existing_game_mod_list, apply_steam_metadata_to_mods,
+        archive_empty_actions_style, archive_empty_body, archive_empty_body_style,
+        archive_empty_button_style, archive_empty_panel_style, archive_empty_title,
+        archive_empty_title_style, archive_filter_bar_style, archive_filter_button_style,
+        archive_filter_chip_style, archive_header_gear_icon_style, archive_header_gear_ring_style,
+        archive_header_gear_tooth_style, archive_header_icon_button_style,
+        archive_row_open_indicator_style, archive_source_action_row_style, archive_status_style,
+        archive_table_header_style, archive_toolbar_button_style, archive_utility_dock_style,
+        archive_workspace_style, build_alpha_readiness_report_with_paths,
+        build_windows_launch_options, collection_row_button_style, collection_row_style,
+        continue_save_button_style, default_tool_workspace_pages, delete_category_config_for_state,
+        dependency_names_summary, desktop_window_title, detail_action_button_style,
+        detail_action_grid_style, detail_category_assignment_style, detail_description_body_style,
+        detail_description_panel_style, detail_empty_actions_style, detail_empty_body_style,
+        detail_empty_panel_style, detail_empty_title_style, detail_header_actions_style,
+        detail_header_nav_button_style, detail_main_panel_style, detail_metric_style,
+        detail_metrics_grid_style, detail_page_content_style, detail_page_header_style,
+        detail_page_kicker_style, detail_position_label_style,
+        detail_primary_description_body_style, detail_primary_description_panel_style,
+        detail_record_path_style, detail_section_label_style, detail_side_column_style,
+        detail_side_meta_panel_style, detail_side_meta_row_style, detail_source_tile_caption_style,
+        detail_source_tile_style, detail_status_style, detail_tag_list_style,
+        detail_workspace_grid_style, diagnostic_snapshot_text, enabled_pack_paths_for_start_game,
+        fetch_steam_metadata_safely, first_existing_steam_helper_path, generated_pack_details,
         initial_app_state, launch_options_from_legacy_ts, launch_priority_status,
         launch_quick_button_style, launch_state_fingerprint, launch_status_with_close_on_play,
         legacy_ts_launch_option_import_summary, legacy_ts_launch_options_from_state,
-        library_nav_active, library_tool_tab_label, library_utility_button_style, mod_author_label,
-        mod_categories_label, mod_enable_button_style, mod_list_filter_label,
-        mod_row_matches_filter, mod_row_matches_query, mod_row_style, mod_source_label,
-        mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_badge_style,
-        nav_button_style, normalize_steam_helper_backend, read_existing_launch_mod_list_pack_names,
+        library_nav_active, library_settings_nav_visible, library_utility_button_style,
+        mod_author_label, mod_categories_label, mod_context_label, mod_detail_breadcrumb,
+        mod_detail_dependency_text, mod_detail_description_text, mod_detail_empty_body,
+        mod_detail_empty_title, mod_enable_button_style, mod_enable_knob_style,
+        mod_list_filter_label, mod_order_label, mod_row_matches_filter, mod_row_matches_query,
+        mod_row_style, mod_settings_action_disabled, mod_settings_action_title, mod_source_label,
+        mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_button_style,
+        nav_count_chip_style, nav_icon_dot_style, nav_icon_line_style, nav_icon_ring_style,
+        nav_icon_stack_style, nav_icon_tile_style, normalize_steam_helper_backend, play_icon_style,
+        play_primary_button_style, project_readme_path, read_existing_launch_mod_list_pack_names,
         relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
         run_steam_command_action, save_on_last_game_launch_preset_to_path,
-        selected_or_first_mod_row, selected_pack_from_optional_arg, settings_card_style,
-        settings_danger_button_style, settings_input_style, settings_primary_button_style,
-        source_tile_style, start_game_source_pack_paths, start_game_temp_packs_dir_for_config_dir,
-        steam_check_update_panel_state, steam_check_update_status, steam_command_panel_state,
-        steam_command_status, steam_helper_process_config, steam_probe_status,
-        steam_refresh_panel_state, steam_resubscribe_panel_state, steam_resubscribe_status,
-        toggle_label_style, tool_action_button_style, top_icon_button_style, workshop_id_summary,
-        workshop_ids_from_input, workshop_ids_from_mods,
+        secondary_page_breadcrumb, secondary_page_content_style, secondary_page_header_style,
+        secondary_page_kicker_style, secondary_status_style, selected_mod_folder_target,
+        selected_mod_neighbor_key, selected_mod_position_label, selected_or_first_mod_row,
+        selected_pack_from_optional_arg, settings_card_header_actions_style, settings_card_style,
+        settings_danger_button_style, settings_field_style, settings_focus_active,
+        settings_focus_breadcrumb, settings_focus_card_style, settings_focus_description,
+        settings_focus_route_chip_style, settings_focus_tab_label, settings_focus_tab_style,
+        settings_focus_tabs_style, settings_focus_title, settings_game_data_label,
+        settings_game_executable_label, settings_helper_backend_row_style,
+        settings_inline_field_style, settings_input_style, settings_launch_actions_copy_style,
+        settings_launch_actions_style, settings_launch_button_row_style,
+        settings_page_content_style, settings_page_header_style, settings_page_kicker_style,
+        settings_path_action_row_style, settings_primary_button_style, settings_toggle_knob_style,
+        settings_workspace_active, source_tile_style, start_game_source_pack_paths,
+        start_game_temp_packs_dir_for_config_dir, steam_check_update_panel_state,
+        steam_check_update_status, steam_command_panel_state, steam_command_status,
+        steam_helper_process_config, steam_probe_status, steam_refresh_panel_state,
+        steam_resubscribe_panel_state, steam_resubscribe_status, toggle_label_style,
+        tool_action_button_style, tool_action_disabled_button_style, tool_action_group_style,
+        tool_aux_button_style, tool_aux_group_style, tool_context_action_style,
+        tool_context_actions_style, tool_context_disabled_screen_button_style,
+        tool_context_label_style, tool_context_meta_chip_style, tool_context_meta_style,
+        tool_context_name_style, tool_context_panel_style, tool_context_path_style,
+        tool_context_screen_button_style, tool_context_screen_group_style,
+        tool_context_summary_style, tool_context_toggle_style, tool_footer_button_style,
+        tool_more_group_style, tool_other_screens_group_label, tool_settings_views_group_label,
+        tools_header_style, tools_rail_style, top_actions_style, top_bell_body_style,
+        top_bell_clapper_style, top_brand_title_style, top_download_arrow_style,
+        top_download_status_dot_style, top_download_stem_style, top_download_tray_style,
+        top_icon_button_style, top_icon_glyph_style, top_profile_body_style,
+        top_profile_head_style, top_search_icon_handle_style, top_search_icon_style,
+        top_search_should_route_to_mods, top_search_style, top_shell_header_style,
+        workshop_id_summary, workshop_ids_from_input, workshop_ids_from_mods,
+        workshop_url_for_mod_row,
     };
     use wh3mm_ui::ModRowViewModel;
+
+    #[test]
+    fn desktop_window_title_is_branded() {
+        assert_eq!(desktop_window_title(), "WH3 Mod Manager");
+        assert_ne!(desktop_window_title(), "Dioxus App");
+    }
+
+    #[test]
+    fn project_readme_path_targets_repo_readme() {
+        let readme_path = project_readme_path();
+        assert_eq!(
+            readme_path.file_name().and_then(|name| name.to_str()),
+            Some("README.md")
+        );
+    }
 
     #[test]
     fn mod_row_search_matches_name_path_category_and_tag() {
@@ -6776,6 +8302,10 @@ mod tests {
         assert!(mod_row_matches_filter(&hidden, ModListFilter::Hidden));
         assert!(!mod_row_matches_filter(&locked, ModListFilter::Disabled));
         assert_eq!(mod_list_filter_label(ModListFilter::Hidden), "Hidden");
+        assert_eq!(archive_empty_title(0), "No mods loaded");
+        assert_eq!(archive_empty_title(4), "No visible mods");
+        assert_eq!(archive_empty_body(0), "No source selected.");
+        assert!(archive_empty_body(4).contains("search or filters"));
     }
 
     #[test]
@@ -6810,26 +8340,181 @@ mod tests {
             selected_or_first_mod_row(&rows, Some("missing")),
             Some(first)
         );
+        assert_eq!(
+            selected_mod_position_label(&rows, Some("second"), true),
+            "Mod 2 of 2"
+        );
+        assert_eq!(
+            selected_mod_position_label(&rows, Some("second"), false),
+            "First visible / 2"
+        );
+        assert_eq!(
+            selected_mod_position_label(&rows, Some("missing"), false),
+            "2 mods"
+        );
+        assert_eq!(selected_mod_position_label(&[], None, false), "No mods");
+        assert_eq!(
+            selected_mod_neighbor_key(&rows, Some("first"), 1).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            selected_mod_neighbor_key(&rows, Some("second"), -1).as_deref(),
+            Some("first")
+        );
+        assert_eq!(selected_mod_neighbor_key(&rows, Some("first"), -1), None);
+        assert_eq!(selected_mod_neighbor_key(&rows, Some("second"), 1), None);
+        assert_eq!(selected_mod_neighbor_key(&rows, Some("missing"), 1), None);
+        assert_eq!(mod_detail_empty_title(0), "No mod selected");
+        assert_eq!(mod_detail_empty_title(2), "No visible mod selected");
+        assert!(mod_detail_empty_body(0).contains("Load game mods"));
+        assert!(mod_detail_empty_body(2).contains("Clear them"));
         assert_eq!(mod_state_label(&second), "enabled");
         assert_eq!(mod_categories_label(&second), "Gameplay, Balance");
     }
 
     #[test]
+    fn mod_order_label_uses_archive_order_not_filtered_position() {
+        let first = ModRowViewModel {
+            key: "first".to_string(),
+            display_name: "First".to_string(),
+            subtitle: "first.pack".to_string(),
+            enabled: false,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+        let second = ModRowViewModel {
+            key: "second".to_string(),
+            display_name: "Second".to_string(),
+            subtitle: "second.pack".to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+        let third = ModRowViewModel {
+            key: "third".to_string(),
+            display_name: "Third".to_string(),
+            subtitle: "third.pack".to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+        let rows = vec![first, second, third];
+
+        assert_eq!(mod_order_label(&rows, "second"), "2");
+        assert_eq!(mod_order_label(&rows, "third"), "3");
+        assert_eq!(mod_order_label(&rows, "missing"), "-");
+    }
+
+    #[test]
     fn tool_actions_are_styled_for_screen_navigation() {
-        assert_eq!(library_tool_tab_label(LibraryToolTab::None), "None");
-        assert_eq!(library_tool_tab_label(LibraryToolTab::Presets), "Presets");
-        assert_eq!(library_tool_tab_label(LibraryToolTab::Categories), "Cats");
-        assert_eq!(library_tool_tab_label(LibraryToolTab::Config), "Config");
+        assert_eq!(
+            default_tool_workspace_pages(),
+            [
+                WorkspacePage::Compatibility,
+                WorkspacePage::Settings,
+                WorkspacePage::ModDetail,
+                WorkspacePage::DbViewer,
+                WorkspacePage::Skills,
+            ]
+        );
         assert!(tool_action_button_style(true).contains("background: #3a3b48"));
         assert!(tool_action_button_style(false).contains("justify-content: space-between"));
+        assert!(tool_action_disabled_button_style().contains("cursor: not-allowed"));
+        assert!(tool_action_disabled_button_style().contains("color: #7f8798"));
+        assert!(!mod_settings_action_disabled(true));
+        assert!(mod_settings_action_disabled(false));
+        assert_eq!(
+            mod_settings_action_title(0, false, false),
+            "Load game mods before opening Mod Settings"
+        );
+        assert_eq!(
+            mod_settings_action_title(3, false, false),
+            "Clear search or filters before opening Mod Settings"
+        );
+        assert_eq!(
+            mod_settings_action_title(3, true, false),
+            "Open first visible mod settings"
+        );
+        assert_eq!(
+            mod_settings_action_title(3, true, true),
+            "Open selected mod settings"
+        );
+        assert_eq!(mod_context_label(true), "Selected Mod");
+        assert_eq!(mod_context_label(false), "First Visible Mod");
+        assert!(tools_rail_style().contains("grid-area: tools"));
+        assert!(tools_rail_style().contains("flex-direction: column"));
+        assert!(tools_header_style().contains("margin-bottom: 26px"));
+        assert!(play_primary_button_style().contains("min-height: 76px"));
+        assert!(play_primary_button_style().contains("justify-content: center"));
+        assert!(play_primary_button_style().contains("font-size: 24px"));
+        assert!(play_icon_style().contains("border-left: 14px solid currentColor"));
+        assert!(tool_action_group_style().contains("display: grid"));
+        assert!(tool_context_panel_style().contains("background: #1a1b25"));
+        assert!(tool_context_summary_style().contains("border-bottom"));
+        assert!(tool_context_label_style().contains("text-transform: uppercase"));
+        assert_eq!(tool_settings_views_group_label(), "Settings Views");
+        assert_eq!(tool_other_screens_group_label(), "Other Screens");
+        assert!(tool_context_name_style().contains("text-overflow: ellipsis"));
+        assert!(tool_context_path_style().contains("ui-monospace"));
+        assert!(tool_context_meta_style().contains("flex-wrap"));
+        assert!(tool_context_meta_chip_style().contains("text-transform: uppercase"));
+        assert!(tool_context_actions_style().contains("repeat(2"));
+        assert!(tool_context_action_style(false).contains("background: transparent"));
+        assert!(tool_context_action_style(true).contains("color: #7f8798"));
+        assert!(tool_context_toggle_style(false).contains("justify-content: space-between"));
+        assert!(tool_context_toggle_style(true).contains("color: #9aa4b7"));
+        assert!(tool_context_screen_group_style().contains("border-top"));
+        assert!(tool_context_screen_button_style(false).contains("min-height: 38px"));
+        assert!(tool_context_screen_button_style(false).contains("justify-content: space-between"));
+        assert!(tool_context_screen_button_style(true).contains("cursor: default"));
+        assert!(tool_context_screen_button_style(true).contains("background: #292f36"));
+        assert!(tool_context_disabled_screen_button_style().contains("min-height: 38px"));
+        assert!(tool_context_disabled_screen_button_style().contains("cursor: not-allowed"));
+        assert!(tool_more_group_style().contains("border-left"));
+        assert!(tool_aux_group_style().contains("border-top"));
+        assert!(tool_aux_group_style().contains("margin: 2px 0 18px"));
+        assert!(tool_aux_button_style(false).contains("min-height: 38px"));
+        assert!(tool_aux_button_style(false).contains("background: transparent"));
+        assert!(tool_aux_button_style(true).contains("background: #292f36"));
+        assert!(tool_footer_button_style(false).contains("background: #11121a"));
+        assert!(tool_footer_button_style(true).contains("background: #343541"));
         assert!(launch_quick_button_style().contains("min-height: 42px"));
-        assert!(continue_save_button_style(false).contains("min-height: 50px"));
+        assert!(continue_save_button_style(false).contains("min-height: 52px"));
         assert!(continue_save_button_style(true).contains("background: #292a35"));
-        assert!(header_metric_style().contains("min-height: 30px"));
         assert!(top_icon_button_style(true).contains("width: 38px"));
         assert!(top_icon_button_style(false).contains("flex: 0 0 auto"));
+        assert!(top_icon_glyph_style().contains("position: relative"));
+        assert!(top_icon_glyph_style().contains("color: currentColor"));
+        assert!(top_bell_body_style().contains("border-bottom: 0"));
+        assert!(top_bell_clapper_style().contains("border-radius: 999px"));
+        assert!(top_download_status_dot_style().contains("#65f58b"));
+        assert!(top_download_stem_style().contains("height: 10px"));
+        assert!(top_download_arrow_style().contains("rotate(45deg)"));
+        assert!(top_download_tray_style().contains("border-top: 0"));
+        assert!(top_profile_head_style().contains("border-radius: 999px"));
+        assert!(top_profile_body_style().contains("border-radius: 999px"));
         assert!(archive_toolbar_button_style(true).contains("#1f6feb"));
         assert!(archive_toolbar_button_style(false).contains("min-height: 30px"));
+        assert!(archive_utility_dock_style().contains("position: sticky"));
+        assert!(archive_utility_dock_style().contains("grid-template-columns"));
+        assert!(archive_filter_chip_style(false).contains("min-width: 130px"));
+        assert!(archive_filter_chip_style(true).contains("background: #343541"));
+        assert!(top_shell_header_style().contains("minmax(260px, 420px)"));
+        assert!(!top_shell_header_style().contains("minmax(250px, 1fr)"));
+        assert!(top_brand_title_style().contains("#65f58b"));
+        assert!(top_search_style().contains("background: #242531"));
+        assert!(top_search_icon_style().contains("border-radius: 999px"));
+        assert!(top_search_icon_handle_style().contains("rotate(45deg)"));
+        assert!(!top_search_should_route_to_mods(WorkspacePage::Mods));
+        assert!(top_search_should_route_to_mods(WorkspacePage::Settings));
+        assert!(top_search_should_route_to_mods(WorkspacePage::ModDetail));
+        assert!(top_actions_style().contains("justify-content: flex-end"));
     }
 
     #[test]
@@ -6838,50 +8523,81 @@ mod tests {
             LibraryNavTarget::AllMods,
             WorkspacePage::Mods,
             ModListFilter::All,
-            LibraryToolTab::None,
         ));
         assert!(!library_nav_active(
-            LibraryNavTarget::AllMods,
+            LibraryNavTarget::Enabled,
             WorkspacePage::Mods,
             ModListFilter::All,
-            LibraryToolTab::Presets,
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Collections,
             WorkspacePage::Collections,
             ModListFilter::All,
-            LibraryToolTab::None,
         ));
         assert!(!library_nav_active(
             LibraryNavTarget::AllMods,
             WorkspacePage::Mods,
-            ModListFilter::All,
-            LibraryToolTab::Categories,
+            ModListFilter::Hidden,
+        ));
+        assert!(library_nav_active(
+            LibraryNavTarget::AllMods,
+            WorkspacePage::ModDetail,
+            ModListFilter::Hidden,
+        ));
+        assert!(!library_nav_active(
+            LibraryNavTarget::Enabled,
+            WorkspacePage::ModDetail,
+            ModListFilter::Enabled,
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Categories,
             WorkspacePage::Categories,
             ModListFilter::All,
-            LibraryToolTab::None,
         ));
         assert!(!library_nav_active(
             LibraryNavTarget::Collections,
             WorkspacePage::Categories,
             ModListFilter::All,
-            LibraryToolTab::None,
         ));
-        assert!(library_nav_active(
-            LibraryNavTarget::Settings,
+        assert!(settings_focus_active(
             WorkspacePage::Settings,
-            ModListFilter::Enabled,
-            LibraryToolTab::None,
+            SettingsFocus::General,
+            SettingsFocus::General,
+        ));
+        assert!(settings_workspace_active(WorkspacePage::Settings));
+        assert!(!settings_workspace_active(WorkspacePage::Mods));
+        assert!(library_settings_nav_visible(WorkspacePage::Settings));
+        assert!(!library_settings_nav_visible(WorkspacePage::Mods));
+        assert!(!library_settings_nav_visible(WorkspacePage::ModDetail));
+        assert!(settings_focus_active(
+            WorkspacePage::Settings,
+            SettingsFocus::Launch,
+            SettingsFocus::Launch,
+        ));
+        assert!(!settings_focus_active(
+            WorkspacePage::Settings,
+            SettingsFocus::Launch,
+            SettingsFocus::General,
+        ));
+        assert!(!settings_focus_active(
+            WorkspacePage::Mods,
+            SettingsFocus::Diagnostics,
+            SettingsFocus::Diagnostics,
         ));
         assert_eq!(app_brand_title(), "Mod Archive");
         assert_eq!(
             app_brand_subtitle("WH3 Mod Manager"),
             "WH3 Mod Manager / Windows alpha"
         );
-        assert!(nav_badge_style().contains("width: 26px"));
+        assert!(nav_icon_tile_style(true).contains("grid-template-columns"));
+        assert!(nav_icon_tile_style(false).contains("#3d4a3e"));
+        assert!(nav_icon_dot_style().contains("border-radius: 999px"));
+        assert!(nav_icon_line_style().contains("grid-column: 1 / -1"));
+        assert!(nav_icon_stack_style().contains("box-shadow"));
+        assert!(nav_icon_ring_style().contains("border-radius: 999px"));
+        assert!(nav_count_chip_style(true).contains("min-width: 28px"));
+        assert!(nav_count_chip_style(true).contains("#25322b"));
+        assert!(nav_count_chip_style(false).contains("#20232d"));
         assert!(library_utility_button_style(true).contains("min-height: 38px"));
         assert!(library_utility_button_style(false).contains("background: transparent"));
     }
@@ -6926,15 +8642,39 @@ mod tests {
         assert!(source_tile_style(&workshop).contains("width: 42px"));
         assert!(mod_row_style(false).contains("minmax(0, 1.9fr)"));
         assert!(!mod_row_style(false).contains("154px"));
+        assert!(archive_status_style().contains("margin: 12px 10px"));
+        assert!(archive_workspace_style().contains("padding: 0 10px 24px"));
         assert!(archive_table_header_style().contains("minmax(0, 1.9fr)"));
+        assert!(archive_table_header_style().contains("38px"));
         assert!(!archive_table_header_style().contains("Actions"));
-        assert!(archive_filter_bar_style().contains("width: 100%"));
+        assert!(archive_empty_panel_style().contains("min-height: 118px"));
+        assert!(archive_empty_panel_style().contains("background: #151722"));
+        assert!(archive_empty_title_style().contains("font-size: 17px"));
+        assert!(archive_empty_body_style().contains("color: #9aa4b7"));
+        assert!(archive_empty_actions_style().contains("flex-wrap"));
+        assert!(archive_empty_button_style(true).contains("#65f58b"));
+        assert!(archive_empty_button_style(false).contains("#242936"));
+        assert!(archive_header_icon_button_style(false).contains("width: 34px"));
+        assert!(archive_header_icon_button_style(true).contains("#65f58b"));
+        assert!(archive_header_gear_icon_style().contains("position: relative"));
+        assert!(archive_header_gear_ring_style().contains("border-radius: 999px"));
+        assert!(archive_header_gear_tooth_style("top").contains("height: 5px"));
+        assert!(archive_header_gear_tooth_style("right").contains("width: 5px"));
+        assert!(archive_header_gear_tooth_style("unknown").is_empty());
+        assert!(archive_row_open_indicator_style(false).contains("height: 34px"));
+        assert!(archive_row_open_indicator_style(false).contains("place-items: center"));
+        assert!(archive_row_open_indicator_style(true).contains("#60a5fa"));
+        assert!(archive_filter_bar_style().contains("min-width: 0"));
+        assert!(archive_source_action_row_style().contains("justify-content: flex-end"));
+        assert!(archive_filter_chip_style(false).contains("justify-content: space-between"));
         assert!(archive_filter_button_style(true).contains("#60a5fa"));
         assert!(archive_filter_button_style(false).contains("min-width: 78px"));
         assert!(mod_row_style(false).contains("cursor: pointer"));
         assert!(mod_enable_button_style(true, false).contains("#65f58b"));
-        assert!(mod_enable_button_style(false, false).contains("#353a43"));
+        assert!(mod_enable_button_style(false, false).contains("width: 44px"));
         assert!(mod_enable_button_style(true, true).contains("#343946"));
+        assert!(mod_enable_knob_style(true, false).contains("translateX(20px)"));
+        assert!(mod_enable_knob_style(false, false).contains("translateX(0)"));
         assert!(nav_button_style(true).contains("border-left: 2px solid #65f58b"));
     }
 
@@ -6970,14 +8710,24 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let metadata = vec![WorkshopModData {
-            workshop_id: "111".to_string(),
-            title: "Workshop".to_string(),
-            author: "Groove Wizard".to_string(),
-            dependency_ids: Vec::new(),
-            dependency_id_to_name: Vec::new(),
-            last_changed_ms: 86_400_000,
-        }];
+        let metadata = vec![
+            WorkshopModData {
+                workshop_id: "111".to_string(),
+                title: "Workshop".to_string(),
+                author: "Groove Wizard".to_string(),
+                dependency_ids: Vec::new(),
+                dependency_id_to_name: vec![("222".to_string(), "Required Mod".to_string())],
+                last_changed_ms: 86_400_000,
+            },
+            WorkshopModData {
+                workshop_id: "222".to_string(),
+                title: "Workshop Path".to_string(),
+                author: "".to_string(),
+                dependency_ids: vec!["333".to_string(), "444".to_string()],
+                dependency_id_to_name: Vec::new(),
+                last_changed_ms: 0,
+            },
+        ];
 
         assert_eq!(mod_workshop_id_from_row(&workshop).as_deref(), Some("111"));
         assert_eq!(mod_workshop_id_from_row(&path_only).as_deref(), Some("222"));
@@ -6991,21 +8741,202 @@ mod tests {
             mod_updated_label(&local, &metadata, 3 * 86_400_000),
             "Local"
         );
+        assert_eq!(
+            mod_detail_description_text(&workshop, &metadata),
+            "Cached Steam Workshop metadata is available for this record."
+        );
+        assert_eq!(
+            mod_detail_dependency_text(&workshop, &metadata),
+            "Required Mod"
+        );
+        assert_eq!(
+            mod_detail_dependency_text(&path_only, &metadata),
+            "333, 444"
+        );
+        assert_eq!(
+            mod_detail_dependency_text(&local, &metadata),
+            "No workshop dependency metadata is cached for this record."
+        );
+        assert_eq!(
+            mod_detail_description_text(&local, &metadata),
+            "No description metadata is cached for this mod record."
+        );
         assert_eq!(relative_time_label(0, 3 * 86_400_000), "Unknown");
         assert_eq!(relative_time_label(3 * 86_400_000, 3 * 86_400_000), "Today");
     }
 
     #[test]
+    fn selected_mod_context_actions_use_real_path_and_workshop_id() {
+        let workshop = ModRowViewModel {
+            key: "workshop:111".to_string(),
+            display_name: "Workshop".to_string(),
+            subtitle:
+                r"C:\Program Files (x86)\Steam\steamapps\workshop\content\1142710\111\mod.pack"
+                    .to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: vec!["workshop".to_string()],
+        };
+        let local = ModRowViewModel {
+            key: "local".to_string(),
+            display_name: "Local".to_string(),
+            subtitle: "/mods/local_pack/local.pack".to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+
+        assert_eq!(
+            selected_mod_folder_target(&workshop).as_deref(),
+            Some(r"C:\Program Files (x86)\Steam\steamapps\workshop\content\1142710\111")
+        );
+        assert_eq!(
+            workshop_url_for_mod_row(&workshop).as_deref(),
+            Some("https://steamcommunity.com/sharedfiles/filedetails/?id=111")
+        );
+        assert_eq!(
+            selected_mod_folder_target(&local).as_deref(),
+            Some("/mods/local_pack")
+        );
+        assert_eq!(workshop_url_for_mod_row(&local), None);
+    }
+
+    #[test]
     fn settings_workspace_styles_match_card_and_toggle_language() {
         assert!(settings_card_style().contains("background: #1f202b"));
+        assert_eq!(
+            settings_focus_title(SettingsFocus::General),
+            "General Settings"
+        );
+        assert_eq!(
+            settings_focus_title(SettingsFocus::Launch),
+            "Launch Options"
+        );
+        assert_eq!(settings_focus_tab_label(SettingsFocus::General), "General");
+        assert_eq!(
+            settings_focus_tab_label(SettingsFocus::GamePaths),
+            "Game Paths"
+        );
+        assert_eq!(
+            settings_focus_tab_label(SettingsFocus::Launch),
+            "Launch Options"
+        );
+        assert_eq!(
+            settings_focus_tab_label(SettingsFocus::Diagnostics),
+            "Diagnostics"
+        );
+        assert_eq!(
+            settings_focus_breadcrumb(SettingsFocus::Launch),
+            "Settings / Launch Options"
+        );
+        assert_eq!(
+            settings_focus_breadcrumb(SettingsFocus::General),
+            "Settings / General"
+        );
+        assert_eq!(
+            settings_game_executable_label(None),
+            "No WH3 executable path selected"
+        );
+        assert_eq!(
+            settings_game_data_label(None),
+            "No WH3 data folder selected"
+        );
+        let windows_game_root =
+            PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III");
+        assert_eq!(
+            settings_game_executable_label(Some(&windows_game_root)),
+            r"C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III\Warhammer3.exe"
+        );
+        assert_eq!(
+            settings_game_data_label(Some(&windows_game_root)),
+            r"C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III\data"
+        );
+        let unix_game_root = PathBuf::from("/games/wh3");
+        assert_eq!(
+            settings_game_executable_label(Some(&unix_game_root)),
+            "/games/wh3/Warhammer3.exe"
+        );
+        assert_eq!(
+            settings_game_data_label(Some(&unix_game_root)),
+            "/games/wh3/data"
+        );
+        assert!(settings_focus_description(SettingsFocus::General).contains("import"));
+        assert!(settings_focus_description(SettingsFocus::Diagnostics).contains("snapshot"));
+        assert!(settings_focus_tabs_style().contains("repeat(4"));
+        assert!(settings_focus_tab_style(true).contains("#65f58b"));
+        assert!(settings_focus_tab_style(false).contains("#20212b"));
+        assert!(
+            settings_focus_card_style(SettingsFocus::Launch, SettingsFocus::Launch)
+                .contains("order: 0")
+        );
+        assert!(
+            settings_focus_card_style(SettingsFocus::General, SettingsFocus::Launch)
+                .contains("display: none")
+        );
+        assert!(secondary_page_header_style().contains("width: min(100%, 1040px)"));
+        assert!(secondary_page_header_style().contains("margin: 0 auto"));
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Compatibility),
+            "Mod Archive / Compatibility"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::DbViewer),
+            "Packs / DB Viewer"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Categories),
+            "Library / Categories"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Steam),
+            "Tools / Steam"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Checks),
+            "Tools / Checks"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Workshop),
+            "Tools / Workshop"
+        );
+        assert_eq!(secondary_page_breadcrumb(WorkspacePage::Mods), "");
+        assert!(secondary_page_kicker_style().contains("text-transform: uppercase"));
+        assert!(secondary_page_kicker_style().contains("#65f58b"));
+        assert!(secondary_status_style().contains("width: min(100%, 1040px)"));
+        assert!(secondary_status_style().contains("margin: 0 auto 14px"));
+        assert!(secondary_page_content_style().contains("gap: 22px"));
+        assert!(secondary_page_content_style().contains("padding: 0 40px 44px"));
+        assert!(settings_page_header_style().contains("margin: 0 auto"));
+        assert!(settings_page_kicker_style().contains("text-transform: uppercase"));
+        assert!(settings_page_kicker_style().contains("#65f58b"));
+        assert!(settings_page_content_style().contains("width: min(100%, 860px)"));
+        assert!(settings_field_style().contains("min-width: 0"));
+        assert!(!settings_inline_field_style().contains("border-bottom"));
+        assert!(settings_path_action_row_style().contains("104px"));
+        assert!(settings_helper_backend_row_style().contains("align-items: end"));
         assert!(settings_input_style().contains("box-sizing: border-box"));
         assert!(settings_primary_button_style().contains("#65f58b"));
         assert!(settings_danger_button_style().contains("#451a1a"));
+        assert!(settings_launch_actions_style().contains("border-top"));
+        assert!(settings_launch_actions_style().contains("minmax(250px"));
+        assert!(settings_launch_actions_copy_style().contains("line-height: 20px"));
+        assert!(settings_launch_button_row_style().contains("repeat(2"));
+        assert!(settings_card_header_actions_style().contains("flex-wrap"));
+        assert!(!settings_focus_route_chip_style().contains("Current screen"));
+        assert!(settings_focus_route_chip_style().contains("text-transform: uppercase"));
+        assert!(settings_focus_route_chip_style().contains("white-space: nowrap"));
         assert!(collection_row_style().contains("grid-template-columns"));
         assert!(collection_row_button_style(true).contains("#60a5fa"));
         assert!(collection_row_button_style(false).contains("#171b24"));
+        assert!(toggle_label_style(true).contains("width: 48px"));
         assert!(toggle_label_style(true).contains("#65f58b"));
         assert!(toggle_label_style(false).contains("#353a43"));
+        assert!(settings_toggle_knob_style(true).contains("translateX(22px)"));
+        assert!(settings_toggle_knob_style(false).contains("translateX(0)"));
         let workshop = ModRowViewModel {
             key: "workshop".to_string(),
             display_name: "Workshop".to_string(),
@@ -7017,7 +8948,44 @@ mod tests {
             tags: vec!["workshop".to_string()],
         };
         assert!(detail_source_tile_style(&workshop).contains("aspect-ratio: 1 / 1"));
+        assert!(detail_source_tile_style(&workshop).contains("min-height: 220px"));
+        assert!(detail_source_tile_caption_style().contains("text-overflow: ellipsis"));
+        assert_eq!(mod_detail_breadcrumb(), "Mod Archive / Mod Settings");
+        assert!(detail_page_header_style().contains("width: min(100%, 1040px)"));
+        assert!(detail_page_kicker_style().contains("text-transform: uppercase"));
+        assert!(detail_page_kicker_style().contains("#65f58b"));
+        assert!(detail_header_actions_style().contains("flex-wrap"));
+        assert!(detail_position_label_style().contains("white-space: nowrap"));
+        assert!(detail_header_nav_button_style(false).contains("background: #292a35"));
+        assert!(detail_header_nav_button_style(true).contains("cursor: not-allowed"));
+        assert!(detail_status_style().contains("margin: 0 auto"));
+        assert!(detail_empty_panel_style().contains("min-height: 180px"));
+        assert!(detail_empty_panel_style().contains("background: #1f202b"));
+        assert!(detail_empty_title_style().contains("font-size: 18px"));
+        assert!(detail_empty_body_style().contains("max-width: 620px"));
+        assert!(detail_empty_actions_style().contains("flex-wrap"));
+        assert!(detail_page_content_style().contains("width: min(100%, 1040px)"));
+        assert!(detail_workspace_grid_style().contains("260px"));
+        assert!(detail_side_column_style().contains("display: grid"));
+        assert!(detail_side_meta_panel_style().contains("background: #1f202b"));
+        assert!(detail_side_meta_row_style().contains("grid-template-columns"));
+        assert!(detail_side_meta_row_style().contains("minmax(0, 1fr)"));
+        assert!(detail_main_panel_style().contains("background: #1f202b"));
+        assert!(detail_metrics_grid_style().contains("auto-fit"));
+        assert!(detail_metrics_grid_style().contains("minmax(120px, 1fr)"));
+        assert!(detail_tag_list_style().contains("flex-wrap"));
         assert!(detail_metric_style().contains("border-top"));
+        assert!(detail_section_label_style().contains("uppercase"));
+        assert!(detail_primary_description_panel_style().contains("min-height: 150px"));
+        assert!(detail_primary_description_panel_style().contains("background: #1a1b26"));
+        assert!(detail_primary_description_body_style().contains("font-size: 14px"));
+        assert!(detail_record_path_style().contains("overflow"));
+        assert!(detail_record_path_style().contains("min-width: 0"));
+        assert!(detail_description_panel_style().contains("border-top"));
+        assert!(detail_description_body_style().contains("line-height: 19px"));
+        assert!(detail_category_assignment_style().contains("grid-template-columns"));
+        assert!(detail_category_assignment_style().contains("minmax(0, 1fr)"));
+        assert!(detail_action_grid_style().contains("auto-fit"));
         assert!(detail_action_button_style(false).contains("background: #343541"));
         assert!(detail_action_button_style(true).contains("background: #451a1a"));
     }

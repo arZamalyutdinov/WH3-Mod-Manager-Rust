@@ -4988,6 +4988,7 @@ name = "wh3mm-dioxus"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "dioxus-desktop",
  "rfd",
  "serde",
  "serde_json",
