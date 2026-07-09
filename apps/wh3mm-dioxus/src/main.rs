@@ -4354,11 +4354,8 @@ fn settings_game_child_path_label(
         return empty_label.to_string();
     }
 
-    if trimmed.contains('\\') {
-        format!("{trimmed}\\{child_name}")
-    } else {
-        Path::new(trimmed).join(child_name).display().to_string()
-    }
+    let separator = if trimmed.contains('\\') { '\\' } else { '/' };
+    format!("{trimmed}{separator}{child_name}")
 }
 
 fn settings_focus_tabs_style() -> &'static str {
