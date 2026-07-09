@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! First Dioxus desktop shell.
 //!
 //! This app intentionally depends on `wh3mm-core` and `wh3mm-ui` only through
