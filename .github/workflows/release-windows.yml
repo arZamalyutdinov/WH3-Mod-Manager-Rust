@@ -180,7 +180,7 @@ jobs:
 
           Copy-Item "apps\wh3mm-dioxus\target\release\wh3mm-dioxus.exe" (Join-Path $payload "wh3mm-dioxus.exe") -Force
           Copy-Item "target\release\wh3mm-steam-helper.exe" (Join-Path $helpers "wh3mm-steam-helper.exe") -Force
-          Copy-Item "schema\*" $schemaOut -Recurse -Force
+          Copy-Item "schema\schema_wh3.json.zst" $schemaOut -Force
           Copy-Item "WINDOWS-ALPHA-README.md" (Join-Path $payload "WINDOWS-ALPHA-README.md") -Force
 
           $steamDllCandidates = @(

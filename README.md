@@ -57,7 +57,7 @@ The staged payload contains:
 - `wh3mm-dioxus.exe`
 - `helpers/wh3mm-steam-helper.exe`
 - `helpers/steam_api64.dll`
-- `schema/`
+- `schema/schema_wh3.json.zst`
 - `WINDOWS-ALPHA-README.md`
 
 The Rust repo intentionally copies only `steam_api64.dll` and `steam_api64.lib` from the TS Steamworks folder. The TS `steamworksjs.win32-x64-msvc.node` module is Electron-specific and is not used by the Rust helper.
