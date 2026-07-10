@@ -6,13 +6,21 @@
 //! toolkit-neutral models. A future Slint app should be able to render the same
 //! `AppViewModel` without reimplementing domain behavior.
 
+mod components;
+
 use dioxus::prelude::*;
-use dioxus_desktop::{Config as DesktopConfig, WindowBuilder, tao::dpi::LogicalSize};
+use dioxus_desktop::{
+    Config as DesktopConfig, WindowBuilder,
+    tao::dpi::LogicalSize,
+    use_asset_handler,
+    wry::http::{Response as HttpResponse, StatusCode},
+};
 use futures_channel::oneshot;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,24 +28,26 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wh3mm_core::{
     AppState, CoreCommand, GameId, LegacyTsConfigSnapshot, LegacyTsLaunchOptions,
-    ModDiscoveryOptions, ModIdentity, ModRecord, ModUserConfig, PackConflictReport, PackContents,
-    PackDataOverwrite, PackFileMetadata, PackReadOptions, PreLaunchPackWrite, PresetConfig,
-    SteamWorkshopMetadataAdapter, SteamWorkshopRequestState, SteamWorkshopSafetyConfig,
-    WH3_START_GAME_PACK_NAME, WH3_START_GAME_SOURCE_PACK_NAMES, Wh3StartGamePackOptions,
-    WindowsLaunchOptions, WindowsLaunchPackGroup, WorkshopMetadataFetchStep, WorkshopModData,
-    add_mod_category, analyze_enabled_mod_conflicts, analyze_enabled_mod_conflicts_with_schema,
-    apply_mod_list_config, apply_mod_list_pack_names, apply_mod_user_config, apply_preset_config,
-    build_pack_data_overwrite_pack, build_wh3_start_game_pack_with_battle_permissions,
-    capture_game_folder_config, capture_mod_list_config, capture_mod_user_config,
-    capture_steam_helper_config_with_backend, delete_category_config, delete_preset_config,
-    discover_mods, normalize_workshop_id, parse_mod_list_pack_names, plan_windows_launch,
-    preset_names, read_db_rows_from_pack, read_game_folder_config, read_legacy_ts_config,
-    read_mod_list_config, read_mod_user_config, read_pack_contents_lossy, read_preset_config,
-    read_steam_helper_config, read_wh3_battle_permission_tables_from_packs,
-    read_whmm_flow_pack_summary, remove_mod_category, rename_category_config, resolve_table_schema,
-    set_category_color_config, upsert_preset_config, write_game_folder_config_atomic,
-    write_legacy_ts_config_atomic, write_mod_list_config_atomic, write_mod_user_config_atomic,
-    write_preset_config_atomic, write_steam_helper_config_atomic,
+    ModDiscoveryOptions, ModIdentity, ModRecord, ModSource, ModUserConfig, PackConflictReport,
+    PackContents, PackDataOverwrite, PackFileMetadata, PackReadOptions, PreLaunchPackWrite,
+    PresetConfig, SteamWorkshopMetadataAdapter, SteamWorkshopRequestState,
+    SteamWorkshopSafetyConfig, WH3_START_GAME_PACK_NAME, WH3_START_GAME_SOURCE_PACK_NAMES,
+    Wh3StartGamePackOptions, WindowsLaunchOptions, WindowsLaunchPackGroup, WorkshopMetadataCache,
+    WorkshopMetadataFetchStep, WorkshopModData, add_mod_category, analyze_enabled_mod_conflicts,
+    analyze_enabled_mod_conflicts_with_schema, apply_mod_list_config, apply_mod_list_pack_names,
+    apply_mod_user_config, apply_preset_config, build_pack_data_overwrite_pack,
+    build_wh3_start_game_pack_with_battle_permissions, capture_game_folder_config,
+    capture_mod_list_config, capture_mod_user_config, capture_steam_helper_config_with_backend,
+    delete_category_config, delete_preset_config, discover_mods, normalize_workshop_id,
+    parse_mod_list_pack_names, plan_windows_launch, preset_names, read_db_rows_from_pack,
+    read_game_folder_config, read_legacy_ts_config, read_mod_list_config, read_mod_user_config,
+    read_pack_contents_lossy, read_preset_config, read_steam_helper_config,
+    read_wh3_battle_permission_tables_from_packs, read_whmm_flow_pack_summary,
+    read_workshop_metadata_cache, remove_mod_category, rename_category_config,
+    resolve_table_schema, set_category_color_config, upsert_preset_config,
+    write_game_folder_config_atomic, write_legacy_ts_config_atomic, write_mod_list_config_atomic,
+    write_mod_user_config_atomic, write_preset_config_atomic, write_steam_helper_config_atomic,
+    write_workshop_metadata_cache_atomic,
 };
 use wh3mm_runtime::{
     LaunchPreparationOptions, SteamResubscribeResult, SteamResubscribeSafetyConfig,
@@ -50,9 +60,13 @@ use wh3mm_runtime::{
     spawn_prepared_windows_launch_with_options, validate_wh3_game_folder,
 };
 use wh3mm_ui::{
-    ModRowViewModel, PackFlowSummaryViewModel, PackViewModel, build_app_view_model,
-    build_db_table_preview_view_model, build_pack_contents_view_model,
-    build_pack_flow_summary_view_model,
+    ModRowViewModel, ModSortColumn, ModSortSpec, PackFlowSummaryViewModel, PackViewModel,
+    build_app_view_model, build_db_table_preview_view_model, build_mod_archive_rows,
+    build_pack_contents_view_model, build_pack_flow_summary_view_model,
+};
+
+use components::{
+    ArchiveSortButton, ArchiveThumbnail, COMPONENT_CSS, DetailThumbnail, DrawerBackdrop,
 };
 
 const MAX_TABLE_PREVIEW_ROWS: usize = 25;
@@ -63,6 +77,8 @@ const MOD_STATE_CONFIG_FILE: &str = "wh3mm_mod_state.json";
 const MOD_USER_CONFIG_FILE: &str = "wh3mm_mod_user_config.json";
 const PRESET_CONFIG_FILE: &str = "wh3mm_presets.json";
 const STEAM_HELPER_CONFIG_FILE: &str = "wh3mm_steam_helper.json";
+const WORKSHOP_METADATA_CACHE_FILE: &str = "wh3mm_workshop_metadata.json";
+const UI_PREFERENCES_FILE: &str = "wh3mm_ui_preferences.json";
 const DIAGNOSTICS_DIR_NAME: &str = "diagnostics";
 const APP_DIAGNOSTIC_LOG_FILE: &str = "wh3mm-dioxus.log";
 const PANIC_DIAGNOSTIC_LOG_FILE: &str = "wh3mm-crash.log";
@@ -75,6 +91,76 @@ const STEAM_HELPER_BACKEND_NATIVE: &str = "native";
 const STEAM_HELPER_BACKEND_FIXTURE: &str = "fixture";
 const PACKAGED_HELP_FILE: &str = "WINDOWS-ALPHA-README.md";
 const CLOSE_ON_PLAY_DELAY_SECS: u64 = 5;
+const WORKSHOP_METADATA_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const RESPONSIVE_SHELL_CSS: &str = r#"
+.app-shell-grid { min-width: 0; overflow-x: hidden; }
+.workspace-content { min-width: 0; overflow-x: hidden; }
+.responsive-nav-toggle { display: none !important; }
+.drawer-backdrop { display: none; }
+@media (max-width: 1279px) {
+  .app-shell-grid {
+    grid-template-columns: minmax(220px, 252px) minmax(0, 1fr) !important;
+    grid-template-areas: "library content" !important;
+  }
+  .responsive-tools-toggle { display: inline-grid !important; }
+  .tools-rail {
+    position: fixed !important;
+    top: 66px;
+    right: 0;
+    bottom: 0;
+    z-index: 45;
+    width: min(340px, 90vw);
+    box-sizing: border-box;
+    transform: translateX(102%);
+    transition: transform 150ms ease-out;
+    box-shadow: -18px 0 36px rgba(0, 0, 0, 0.34);
+  }
+  .tools-rail.drawer-open { transform: translateX(0); }
+  .drawer-backdrop.drawer-visible {
+    display: block;
+    position: fixed;
+    inset: 66px 0 0;
+    z-index: 40;
+    border: 0;
+    background: rgba(3, 6, 10, 0.54);
+  }
+}
+@media (max-width: 959px) {
+  .app-shell-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-areas: "content" !important;
+  }
+  .responsive-library-toggle { display: inline-grid !important; }
+  .library-rail {
+    position: fixed !important;
+    top: 66px;
+    left: 0;
+    bottom: 0;
+    z-index: 45;
+    width: min(280px, 88vw);
+    box-sizing: border-box;
+    transform: translateX(-102%);
+    transition: transform 150ms ease-out;
+    box-shadow: 18px 0 36px rgba(0, 0, 0, 0.34);
+  }
+  .library-rail.drawer-open { transform: translateX(0); }
+}
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct UiPreferences {
+    version: u32,
+    mod_sort: ModSortSpec,
+}
+
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            mod_sort: ModSortSpec::default(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LaunchPreview {
@@ -318,11 +404,14 @@ fn App() -> Element {
     let mut show_hidden = use_signal(|| false);
     let mut mod_search = use_signal(String::new);
     let mut mod_list_filter = use_signal(|| ModListFilter::All);
+    let mut mod_sort = use_signal(load_ui_sort_preference);
     let mut archive_filters_expanded = use_signal(|| false);
     let mut archive_actions_expanded = use_signal(|| false);
     let mut workspace_page = use_signal(initial_workspace_page);
     let mut settings_focus = use_signal(|| SettingsFocus::General);
     let mut tools_more_expanded = use_signal(|| false);
+    let mut tools_drawer_open = use_signal(|| false);
+    let mut library_drawer_open = use_signal(|| false);
     let mut selected_mod_key = use_signal(|| None::<String>);
     let mut conflict_report = use_signal(|| None::<PackConflictReport>);
     let mut launch_preview = use_signal(|| None::<LaunchPreview>);
@@ -331,11 +420,18 @@ fn App() -> Element {
     let mut steam_helper_path = use_signal(load_saved_steam_helper_path);
     let mut steam_helper_backend = use_signal(load_saved_steam_helper_backend);
     let mut steam_command_ids = use_signal(String::new);
-    let mut steam_metadata = use_signal(Vec::<WorkshopModData>::new);
+    let mut workshop_metadata_cache = use_signal(load_workshop_metadata_cache_or_default);
+    let mut steam_metadata = use_signal(load_cached_workshop_metadata);
     let mut subscribed_workshop_ids = use_signal(Vec::<String>::new);
     let mut last_steam_command = use_signal(|| None::<SteamCommandPanelState>);
     let mut steam_operation = use_signal(|| None::<String>);
+    let mut last_auto_metadata_request = use_signal(|| None::<String>);
     let mut last_logged_mod_status = use_signal(|| None::<String>);
+
+    use_asset_handler("mod-thumbnail", move |request, responder| {
+        let response = thumbnail_asset_http_response(&app_state.read().mods, request.uri().path());
+        responder.respond(response);
+    });
 
     use_effect(move || {
         let status = mod_status.read().clone();
@@ -351,7 +447,82 @@ fn App() -> Element {
         }
     });
 
+    use_effect(move || {
+        let _ = *workspace_page.read();
+        tools_drawer_open.set(false);
+        library_drawer_open.set(false);
+    });
+
+    use_effect(move || {
+        let workshop_ids = workshop_ids_from_mods(&app_state.read().mods);
+        if workshop_ids.is_empty() {
+            return;
+        }
+
+        let now_ms = current_unix_ms();
+        let ids_needing_refresh = workshop_metadata_cache.read().ids_needing_refresh(
+            &workshop_ids,
+            now_ms,
+            WORKSHOP_METADATA_CACHE_TTL_MS,
+        );
+        if ids_needing_refresh.is_empty() || steam_operation.read().is_some() {
+            return;
+        }
+
+        let helper_path = steam_helper_path.read().trim().to_string();
+        if validate_steam_helper_path(Path::new(&helper_path)).is_err() {
+            return;
+        }
+        let backend = steam_helper_backend.read().clone();
+        let request_key = format!("{helper_path}|{backend}|{}", ids_needing_refresh.join(","));
+        if last_auto_metadata_request.read().as_deref() == Some(request_key.as_str()) {
+            return;
+        }
+        last_auto_metadata_request.set(Some(request_key));
+        steam_operation.set(Some("Refreshing stale Workshop metadata".to_string()));
+
+        let receiver = run_in_background(move || {
+            fetch_metadata_from_helper(&ids_needing_refresh, Path::new(&helper_path), &backend)
+        });
+        spawn(async move {
+            match receiver.await {
+                Ok(Ok(result)) => {
+                    let mut cache = workshop_metadata_cache.read().clone();
+                    cache.merge(&result.metadata, current_unix_ms());
+                    cache.retain_ids(&workshop_ids);
+                    match write_workshop_metadata_cache_atomic(
+                        workshop_metadata_cache_path(),
+                        &cache,
+                    ) {
+                        Ok(()) => {
+                            steam_metadata.set(cache.metadata_for_ids(&workshop_ids));
+                            workshop_metadata_cache.set(cache);
+                            mod_status.set(Some(format!(
+                                "Updated {} Workshop metadata record{} in the background.",
+                                result.metadata.len(),
+                                plural_suffix(result.metadata.len())
+                            )));
+                        }
+                        Err(error) => mod_status.set(Some(format!(
+                            "Workshop metadata refreshed but could not be cached: {}",
+                            error.message
+                        ))),
+                    }
+                }
+                Ok(Err(error)) => mod_status.set(Some(format!(
+                    "Automatic Workshop metadata refresh was skipped: {error}"
+                ))),
+                Err(_) => mod_status.set(Some(
+                    "Automatic Workshop metadata refresh ended unexpectedly.".to_string(),
+                )),
+            }
+            steam_operation.set(None);
+        });
+    });
+
     let mut view_model = build_app_view_model(&app_state.read());
+    view_model.mods =
+        build_mod_archive_rows(&app_state.read(), &steam_metadata.read(), *mod_sort.read());
     let (selected_pack, status_message) = pack_selection.read().clone();
     view_model.selected_pack = selected_pack;
     view_model.status_message =
@@ -464,7 +635,10 @@ fn App() -> Element {
     let steam_command_log_path_label = steam_helper_command_log_path().display().to_string();
 
     rsx! {
+        style { dangerous_inner_html: RESPONSIVE_SHELL_CSS }
+        style { dangerous_inner_html: COMPONENT_CSS }
         main {
+            class: "app-root",
             style: "height: 100vh; min-height: 0; background: #0f1218; color: #f2f5f2; font-family: Inter, ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden;",
             header {
                 style: top_shell_header_style(),
@@ -481,9 +655,15 @@ fn App() -> Element {
                 }
                 div {
                     style: top_search_style(),
-                    span {
-                        style: top_search_icon_style(),
-                        span { style: top_search_icon_handle_style(), "" }
+                    svg {
+                        view_box: "0 0 24 24",
+                        width: "18",
+                        height: "18",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        circle { cx: "11", cy: "11", r: "7" }
+                        path { d: "m20 20-3.4-3.4" }
                     }
                     input {
                         style: "width: 100%; min-width: 0; height: 38px; border: 0; outline: 0; background: transparent; color: #edf2f7; font-size: 14px;",
@@ -502,49 +682,86 @@ fn App() -> Element {
                 div {
                     style: top_actions_style(),
                     button {
+                        class: "responsive-nav-toggle responsive-library-toggle",
+                        title: "Open library navigation",
+                        aria_label: "Open library navigation",
+                        style: top_icon_button_style(*library_drawer_open.read()),
+                        onclick: move |_| {
+                            let open = *library_drawer_open.read();
+                            library_drawer_open.set(!open);
+                            tools_drawer_open.set(false);
+                        },
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "M4 6h16M4 12h16M4 18h16" }
+                        }
+                    }
+                    button {
                         title: "Alpha readiness: {alpha_readiness_summary}",
+                        aria_label: "Open readiness checks",
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Checks),
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Checks);
                         },
-                        span {
-                            style: top_icon_glyph_style(),
-                            span { style: top_bell_body_style(), "" }
-                            span { style: top_bell_clapper_style(), "" }
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" }
+                            path { d: "M10 21h4" }
                         }
                     }
                     button {
                         title: "Workshop commands",
+                        aria_label: "Open Workshop commands",
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Workshop),
                         onclick: move |_| {
                             workspace_page.set(WorkspacePage::Workshop);
                         },
-                        span {
-                            style: top_icon_glyph_style(),
-                            span { style: top_download_status_dot_style(), "" }
-                            span { style: top_download_stem_style(), "" }
-                            span { style: top_download_arrow_style(), "" }
-                            span { style: top_download_tray_style(), "" }
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" }
                         }
                     }
                     button {
                         title: "Settings",
+                        aria_label: "Open settings",
                         style: top_icon_button_style(settings_workspace_active(current_workspace_page)),
                         onclick: move |_| {
                             settings_focus.set(SettingsFocus::General);
                             workspace_page.set(WorkspacePage::Settings);
                         },
-                        span {
-                            style: top_icon_glyph_style(),
-                            span { style: top_profile_head_style(), "" }
-                            span { style: top_profile_body_style(), "" }
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            circle { cx: "12", cy: "12", r: "3" }
+                            path { d: "M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.1 2.1-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V20h-3v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L6.6 17l.1-.1A1.7 1.7 0 0 0 7 15a1.7 1.7 0 0 0-1.6-1H5v-3h.4A1.7 1.7 0 0 0 7 10a1.7 1.7 0 0 0-.3-1.9L6.6 8l2.1-2.1.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V4h3v.7a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.4v3H21a1.7 1.7 0 0 0-1.6 1Z" }
+                        }
+                    }
+                    button {
+                        class: "responsive-nav-toggle responsive-tools-toggle",
+                        title: "Open Play and Tools",
+                        aria_label: "Open Play and Tools",
+                        style: top_icon_button_style(*tools_drawer_open.read()),
+                        onclick: move |_| {
+                            let open = *tools_drawer_open.read();
+                            tools_drawer_open.set(!open);
+                            library_drawer_open.set(false);
+                        },
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "m9 18 6-6-6-6" }
                         }
                     }
                 }
             }
             div {
+                class: "app-shell-grid",
                 style: "flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(220px, 252px) minmax(0, 1fr) minmax(288px, 340px); grid-template-areas: \"library content tools\"; overflow: hidden;",
                 aside {
+                    class: if *library_drawer_open.read() { "library-rail drawer-open" } else { "library-rail" },
                     style: "grid-area: library; min-width: 0; border-right: 1px solid #263041; background: #171b24; padding: 20px 14px; overflow-y: auto; display: flex; flex-direction: column;",
                     div {
                         style: "display: grid; gap: 4px; margin-bottom: 18px;",
@@ -733,6 +950,7 @@ fn App() -> Element {
                     }
                 }
                 aside {
+                    class: if *tools_drawer_open.read() { "tools-rail drawer-open" } else { "tools-rail" },
                     style: tools_rail_style(),
                     div {
                         style: tools_header_style(),
@@ -1213,6 +1431,13 @@ fn App() -> Element {
                         }
                     }
                 }
+                DrawerBackdrop {
+                    visible: *tools_drawer_open.read() || *library_drawer_open.read(),
+                    on_close: move |_| {
+                        tools_drawer_open.set(false);
+                        library_drawer_open.set(false);
+                    },
+                }
                 section {
                     style: "grid-area: content; min-width: 0; min-height: 0; overflow: auto; padding: 0; background: #11111a;",
                     if current_workspace_page == WorkspacePage::ModDetail {
@@ -1235,7 +1460,7 @@ fn App() -> Element {
                                 div {
                                     style: "font-size: 14px; line-height: 20px; color: #bccabb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
                                     if let Some(selected_mod) = selected_mod.as_ref() {
-                                        "Author: {mod_author_label(selected_mod, &current_steam_metadata)} / {selected_mod.subtitle}"
+                                        "Author: {mod_author_label(selected_mod)} / {selected_mod.subtitle}"
                                     } else {
                                         "Select a mod from the archive to inspect it here."
                                     }
@@ -1297,20 +1522,11 @@ fn App() -> Element {
                                     style: detail_workspace_grid_style(),
                                     div {
                                         style: detail_side_column_style(),
-                                        div {
-                                            style: detail_source_tile_style(&selected_mod),
-                                            strong {
-                                                style: "font-size: 24px; line-height: 30px;",
-                                                "{mod_source_label(&selected_mod)}"
-                                            }
-                                            span {
-                                                style: "font-size: 12px; text-transform: uppercase; letter-spacing: 0;",
-                                                "Source"
-                                            }
-                                            span {
-                                                style: detail_source_tile_caption_style(),
-                                                "{selected_mod.display_name}"
-                                            }
+                                        DetailThumbnail {
+                                            url: selected_mod.thumbnail_path.as_ref().map(|_| mod_thumbnail_url(&selected_mod)),
+                                            display_name: selected_mod.display_name.clone(),
+                                            source: selected_mod.source,
+                                            source_label: mod_source_label(&selected_mod),
                                         }
                                         div {
                                             style: detail_side_meta_panel_style(),
@@ -1331,12 +1547,12 @@ fn App() -> Element {
                                             div {
                                                 style: detail_side_meta_row_style(),
                                                 span { "Author" }
-                                                strong { "{mod_author_label(&selected_mod, &current_steam_metadata)}" }
+                                                strong { "{mod_author_label(&selected_mod)}" }
                                             }
                                             div {
                                                 style: detail_side_meta_row_style(),
                                                 span { "Updated" }
-                                                strong { "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}" }
+                                                strong { "{mod_updated_label(&selected_mod, current_time_ms)}" }
                                             }
                                             div {
                                                 style: detail_side_meta_row_style(),
@@ -1355,7 +1571,7 @@ fn App() -> Element {
                                             }
                                             div {
                                                 style: detail_primary_description_body_style(),
-                                                "{mod_detail_description_text(&selected_mod, &current_steam_metadata)}"
+                                                "{mod_detail_description_text(&selected_mod)}"
                                             }
                                         }
                                         div {
@@ -1389,7 +1605,7 @@ fn App() -> Element {
                                             div {
                                                 style: detail_metric_style(),
                                                 span { "Updated" }
-                                                strong { "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}" }
+                                                strong { "{mod_updated_label(&selected_mod, current_time_ms)}" }
                                             }
                                             div {
                                                 style: detail_metric_style(),
@@ -1999,17 +2215,30 @@ fn App() -> Element {
                                                     match receiver.await {
                                                         Ok(Ok((next_state, result))) => {
                                                             let command_panel = steam_refresh_panel_state(&result);
+                                                            let current_ids = workshop_ids_from_mods(&next_state.mods);
+                                                            let mut cache = workshop_metadata_cache.read().clone();
+                                                            cache.merge(&result.metadata, current_unix_ms());
+                                                            cache.retain_ids(&current_ids);
+                                                            let cache_status = write_workshop_metadata_cache_atomic(
+                                                                workshop_metadata_cache_path(),
+                                                                &cache,
+                                                            )
+                                                            .err()
+                                                            .map(|error| format!(" Cache write failed: {}", error.message))
+                                                            .unwrap_or_default();
                                                             let status = format!(
-                                                                "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.",
+                                                                "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.{}",
                                                                 result.subscribed_ids.len(),
                                                                 result.metadata.len(),
                                                                 result.requested_metadata_count,
                                                                 result.missing_metadata_count,
                                                                 result.filtered_unsubscribed_count,
-                                                                result.renamed_count
+                                                                result.renamed_count,
+                                                                cache_status,
                                                             );
                                                             subscribed_workshop_ids.set(result.subscribed_ids);
-                                                            steam_metadata.set(result.metadata);
+                                                            steam_metadata.set(cache.metadata_for_ids(&current_ids));
+                                                            workshop_metadata_cache.set(cache);
                                                             last_steam_command.set(Some(command_panel));
                                                             app_state.set(next_state);
                                                             mod_status.set(Some(status));
@@ -3261,7 +3490,13 @@ fn App() -> Element {
             if let Some(status_message) = view_model.status_message {
                 div {
                     style: archive_status_style(),
-                    "{status_message}"
+                    span { "{status_message}" }
+                    button {
+                        title: "Dismiss status",
+                        style: archive_status_dismiss_style(),
+                        onclick: move |_| mod_status.set(None),
+                        "×"
+                    }
                 }
             }
             div {
@@ -3270,12 +3505,27 @@ fn App() -> Element {
                     style: "display: grid; gap: 6px; min-width: 0;",
                     div {
                         style: archive_table_header_style(),
-                        div { "Ord" }
-                        div { "Status" }
-                        div { "Source" }
-                        div { "Pack / Mod Name" }
-                        div { "Author" }
-                        div { "Updated" }
+                        ArchiveSortButton {
+                            label: "Ord", column: ModSortColumn::Order, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        ArchiveSortButton {
+                            label: "Status", column: ModSortColumn::Status, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        div { "Thumb" }
+                        ArchiveSortButton {
+                            label: "Pack / Mod Name", column: ModSortColumn::Name, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        ArchiveSortButton {
+                            label: "Author", column: ModSortColumn::Author, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        ArchiveSortButton {
+                            label: "Updated", column: ModSortColumn::Updated, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
                         button {
                             title: "Sources and archive actions",
                             style: archive_header_icon_button_style(*archive_actions_expanded.read()),
@@ -3283,13 +3533,11 @@ fn App() -> Element {
                                 let expanded = *archive_actions_expanded.read();
                                 archive_actions_expanded.set(!expanded);
                             },
-                            span {
-                                style: archive_header_gear_icon_style(),
-                                span { style: archive_header_gear_ring_style(), "" }
-                                span { style: archive_header_gear_tooth_style("top"), "" }
-                                span { style: archive_header_gear_tooth_style("right"), "" }
-                                span { style: archive_header_gear_tooth_style("bottom"), "" }
-                                span { style: archive_header_gear_tooth_style("left"), "" }
+                            svg {
+                                view_box: "0 0 24 24", width: "18", height: "18",
+                                fill: "none", stroke: "currentColor", stroke_width: "2",
+                                circle { cx: "12", cy: "12", r: "3" }
+                                path { d: "M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.1 2.1-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V20h-3v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L6.6 17l.1-.1A1.7 1.7 0 0 0 7 15a1.7 1.7 0 0 0-1.6-1H5v-3h.4A1.7 1.7 0 0 0 7 10a1.7 1.7 0 0 0-.3-1.9L6.6 8l2.1-2.1.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V4h3v.7a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.4v3H21a1.7 1.7 0 0 0-1.6 1Z" }
                             }
                         }
                     }
@@ -3373,7 +3621,7 @@ fn App() -> Element {
                     for mod_row in filtered_mods.iter() {
                         article {
                             key: "{mod_row.key}",
-                            title: "Open Mod Settings for {mod_row.display_name}",
+                            title: "Open Mod Settings for {mod_row.display_name}\n{mod_row.subtitle}",
                             style: mod_row_style(explicitly_selected_mod_key.as_deref() == Some(mod_row.key.as_str())),
                             onclick: {
                                 let mod_key = mod_row.key.clone();
@@ -3384,7 +3632,7 @@ fn App() -> Element {
                             },
                             div {
                                 style: "font-size: 13px; color: #d5d9df; text-align: center; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                "{mod_order_label(&all_mod_rows, &mod_row.key)}"
+                                "{mod_row.load_order}"
                             }
                             button {
                                 title: "Enable or disable mod",
@@ -3411,9 +3659,12 @@ fn App() -> Element {
                                 },
                                 span { style: mod_enable_knob_style(mod_row.enabled, mod_row.locked), "" }
                             }
-                            div {
-                                style: source_tile_style(mod_row),
-                                "{mod_source_label(mod_row)}"
+                            ArchiveThumbnail {
+                                url: mod_row.thumbnail_path.as_ref().map(|_| mod_thumbnail_url(mod_row)),
+                                display_name: mod_row.display_name.clone(),
+                                source: mod_row.source,
+                                source_label: mod_source_label(mod_row),
+                                source_description: mod_source_description(mod_row),
                             }
                             div {
                                 style: "min-width: 0;",
@@ -3423,7 +3674,7 @@ fn App() -> Element {
                                 }
                                 div {
                                     style: "font-size: 12px; color: #9aa4b7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                    "{mod_row.subtitle}"
+                                    "{mod_row.pack_name}"
                                 }
                                 if !mod_row.categories.is_empty() {
                                     div {
@@ -3434,16 +3685,11 @@ fn App() -> Element {
                             }
                             div {
                                 style: "font-size: 13px; color: #d5d9df; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{mod_author_label(mod_row, &current_steam_metadata)}"
+                                "{mod_author_label(mod_row)}"
                             }
                             div {
                                 style: "font-size: 12px; color: #aeb8c8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                "{mod_updated_label(mod_row, &current_steam_metadata, current_time_ms)}"
-                            }
-                            div {
-                                title: "Open Mod Settings",
-                                style: archive_row_open_indicator_style(explicitly_selected_mod_key.as_deref() == Some(mod_row.key.as_str())),
-                                ">"
+                                "{mod_updated_label(mod_row, current_time_ms)}"
                             }
                         }
                     }
@@ -3863,14 +4109,6 @@ fn top_search_style() -> &'static str {
     "min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid #35374a; background: #242531; border-radius: 5px; padding: 0 10px;"
 }
 
-fn top_search_icon_style() -> &'static str {
-    "position: relative; width: 14px; height: 14px; flex: 0 0 auto; border: 2px solid #7d8ea3; border-radius: 999px; box-sizing: border-box;"
-}
-
-fn top_search_icon_handle_style() -> &'static str {
-    "position: absolute; width: 7px; height: 2px; right: -5px; bottom: -3px; background: #7d8ea3; border-radius: 999px; transform: rotate(45deg); transform-origin: center;"
-}
-
 fn top_actions_style() -> &'static str {
     "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #9fb0c0; font-size: 12px; white-space: nowrap;"
 }
@@ -3888,6 +4126,14 @@ fn mod_row_matches_query(mod_row: &ModRowViewModel, normalized_query: &str) -> b
             .subtitle
             .to_ascii_lowercase()
             .contains(normalized_query)
+        || mod_row
+            .pack_name
+            .to_ascii_lowercase()
+            .contains(normalized_query)
+        || mod_row
+            .author
+            .as_deref()
+            .is_some_and(|author| author.to_ascii_lowercase().contains(normalized_query))
         || mod_row
             .categories
             .iter()
@@ -4009,8 +4255,8 @@ fn archive_empty_body(total_mod_count: usize) -> &'static str {
 fn mod_order_label(all_rows: &[ModRowViewModel], mod_key: &str) -> String {
     all_rows
         .iter()
-        .position(|row| row.key == mod_key)
-        .map(|index| (index + 1).to_string())
+        .find(|row| row.key == mod_key)
+        .map(|row| row.load_order.to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -4057,14 +4303,18 @@ fn mod_list_filter_label(filter: ModListFilter) -> &'static str {
 
 fn mod_row_style(active: bool) -> &'static str {
     if active {
-        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #3b82f6; border-left: 3px solid #60a5fa; border-radius: 4px; padding: 7px 14px; background: #1d2631; cursor: pointer;"
+        "min-height: 60px; display: grid; grid-template-columns: 42px 64px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #3b82f6; border-left: 3px solid #60a5fa; border-radius: 4px; padding: 6px 14px; background: #1d2631; cursor: pointer;"
     } else {
-        "min-height: 54px; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #252b38; border-left: 3px solid transparent; border-radius: 4px; padding: 7px 14px; background: #171922; cursor: pointer;"
+        "min-height: 60px; display: grid; grid-template-columns: 42px 64px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #252b38; border-left: 3px solid transparent; border-radius: 4px; padding: 6px 14px; background: #171922; cursor: pointer;"
     }
 }
 
 fn archive_status_style() -> &'static str {
-    "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 12px 10px; color: #aeb8c8; font-size: 13px;"
+    "position: fixed; right: 24px; bottom: 24px; z-index: 50; max-width: min(520px, calc(100vw - 48px)); display: flex; align-items: flex-start; gap: 12px; border: 1px solid #3b4658; background: #1b202a; border-radius: 7px; padding: 10px 12px; color: #d7dee9; font-size: 13px; line-height: 18px; box-shadow: 0 12px 34px rgba(0, 0, 0, 0.38);"
+}
+
+fn archive_status_dismiss_style() -> &'static str {
+    "flex: 0 0 auto; border: 0; background: transparent; color: #aeb8c8; padding: 0 2px; font-size: 18px; line-height: 18px; cursor: pointer;"
 }
 
 fn archive_workspace_style() -> &'static str {
@@ -4072,7 +4322,7 @@ fn archive_workspace_style() -> &'static str {
 }
 
 fn archive_table_header_style() -> &'static str {
-    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 42px 72px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid #303746; background: #20242f; color: #cbd5e1; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 0;"
+    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 42px 64px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; padding: 9px 14px; border: 1px solid #303746; background: #20242f; color: #cbd5e1; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 0;"
 }
 
 fn archive_empty_panel_style() -> &'static str {
@@ -4104,40 +4354,6 @@ fn archive_header_icon_button_style(active: bool) -> &'static str {
         "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #65f58b; background: #17251a; color: #b7ffc7; border-radius: 5px; padding: 0;"
     } else {
         "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #3a4354; background: #242936; color: #d5dbe6; border-radius: 5px; padding: 0;"
-    }
-}
-
-fn archive_header_gear_icon_style() -> &'static str {
-    "position: relative; width: 18px; height: 18px; display: block;"
-}
-
-fn archive_header_gear_ring_style() -> &'static str {
-    "position: absolute; left: 4px; top: 4px; width: 10px; height: 10px; border: 2px solid currentColor; border-radius: 999px; box-sizing: border-box;"
-}
-
-fn archive_header_gear_tooth_style(position: &str) -> &'static str {
-    match position {
-        "top" => {
-            "position: absolute; left: 8px; top: 0; width: 2px; height: 5px; background: currentColor; border-radius: 2px;"
-        }
-        "right" => {
-            "position: absolute; right: 0; top: 8px; width: 5px; height: 2px; background: currentColor; border-radius: 2px;"
-        }
-        "bottom" => {
-            "position: absolute; left: 8px; bottom: 0; width: 2px; height: 5px; background: currentColor; border-radius: 2px;"
-        }
-        "left" => {
-            "position: absolute; left: 0; top: 8px; width: 5px; height: 2px; background: currentColor; border-radius: 2px;"
-        }
-        _ => "",
-    }
-}
-
-fn archive_row_open_indicator_style(active: bool) -> &'static str {
-    if active {
-        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 5px; font-size: 18px; line-height: 18px; font-weight: 800;"
-    } else {
-        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #303746; background: #202532; color: #9aa4b7; border-radius: 5px; font-size: 18px; line-height: 18px; font-weight: 800;"
     }
 }
 
@@ -4241,42 +4457,6 @@ fn top_icon_button_style(active: bool) -> &'static str {
     } else {
         "width: 38px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #303746; background: #1f2430; color: #cbd8cc; border-radius: 6px; padding: 0; font-size: 10px; font-weight: 750; letter-spacing: 0;"
     }
-}
-
-fn top_icon_glyph_style() -> &'static str {
-    "position: relative; width: 22px; height: 22px; display: block; color: currentColor;"
-}
-
-fn top_bell_body_style() -> &'static str {
-    "position: absolute; left: 6px; top: 4px; width: 10px; height: 12px; border: 2px solid currentColor; border-bottom: 0; border-radius: 10px 10px 3px 3px; box-sizing: border-box;"
-}
-
-fn top_bell_clapper_style() -> &'static str {
-    "position: absolute; left: 9px; top: 16px; width: 4px; height: 2px; border-radius: 999px; background: currentColor;"
-}
-
-fn top_download_status_dot_style() -> &'static str {
-    "position: absolute; right: 0; top: 0; width: 6px; height: 6px; border-radius: 999px; background: #65f58b;"
-}
-
-fn top_download_stem_style() -> &'static str {
-    "position: absolute; left: 10px; top: 4px; width: 2px; height: 10px; border-radius: 999px; background: currentColor;"
-}
-
-fn top_download_arrow_style() -> &'static str {
-    "position: absolute; left: 7px; top: 10px; width: 7px; height: 7px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); box-sizing: border-box;"
-}
-
-fn top_download_tray_style() -> &'static str {
-    "position: absolute; left: 5px; bottom: 2px; width: 12px; height: 3px; border: 2px solid currentColor; border-top: 0; border-radius: 0 0 3px 3px; box-sizing: border-box;"
-}
-
-fn top_profile_head_style() -> &'static str {
-    "position: absolute; left: 7px; top: 4px; width: 8px; height: 8px; border: 2px solid currentColor; border-radius: 999px; box-sizing: border-box;"
-}
-
-fn top_profile_body_style() -> &'static str {
-    "position: absolute; left: 4px; top: 13px; width: 14px; height: 7px; border: 2px solid currentColor; border-radius: 999px 999px 4px 4px; box-sizing: border-box;"
 }
 
 fn library_utility_button_style(active: bool) -> &'static str {
@@ -4557,55 +4737,117 @@ fn mod_enable_knob_style(enabled: bool, locked: bool) -> &'static str {
     }
 }
 
-fn mod_source_label(mod_row: &ModRowViewModel) -> &'static str {
-    if mod_row
-        .tags
-        .iter()
-        .any(|tag| tag.eq_ignore_ascii_case("workshop"))
-        || mod_row.subtitle.to_ascii_lowercase().contains("workshop")
-    {
-        "WS"
-    } else if mod_row.locked {
-        "CORE"
-    } else {
-        "MOD"
+fn set_mod_sort_column(
+    mod_sort: &mut Signal<ModSortSpec>,
+    mod_status: &mut Signal<Option<String>>,
+    column: ModSortColumn,
+) {
+    let next = mod_sort.read().after_column_click(column);
+    match save_ui_sort_preference(next) {
+        Ok(()) => mod_sort.set(next),
+        Err(error) => mod_status.set(Some(error)),
     }
 }
 
-fn mod_author_label(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
-    if let Some(metadata) = workshop_metadata_for_row(mod_row, metadata)
-        && !metadata.author.trim().is_empty()
-    {
-        return metadata.author.trim().to_string();
-    }
-
-    match mod_source_label(mod_row) {
-        "WS" => "Steam Workshop".to_string(),
-        "CORE" => "Core".to_string(),
-        _ => "Local".to_string(),
-    }
-}
-
-fn mod_updated_label(
-    mod_row: &ModRowViewModel,
-    metadata: &[WorkshopModData],
-    now_ms: u64,
-) -> String {
-    let Some(metadata) = workshop_metadata_for_row(mod_row, metadata) else {
-        return "Local".to_string();
+fn mod_thumbnail_url(mod_row: &ModRowViewModel) -> String {
+    let Some(thumbnail_path) = mod_row.thumbnail_path.as_deref() else {
+        return String::new();
     };
-    relative_time_label(metadata.last_changed_ms, now_ms)
+    format!(
+        "/mod-thumbnail/{}",
+        thumbnail_asset_token(&mod_row.key, thumbnail_path)
+    )
 }
 
-fn mod_detail_description_text(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
-    if workshop_metadata_for_row(mod_row, metadata).is_some() {
-        return "Cached Steam Workshop metadata is available for this record.".to_string();
-    }
+fn thumbnail_asset_token(key: &str, thumbnail_path: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    thumbnail_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
-    format!(
-        "No description metadata is cached for this {} record.",
-        mod_source_label(mod_row).to_ascii_lowercase()
-    )
+fn thumbnail_asset_http_response(mods: &[ModRecord], request_path: &str) -> HttpResponse<Vec<u8>> {
+    let mut segments = request_path.trim_matches('/').split('/');
+    let valid_handler = segments.next() == Some("mod-thumbnail");
+    let token = segments.next().filter(|token| !token.is_empty());
+    if !valid_handler || segments.next().is_some() {
+        return thumbnail_error_response(StatusCode::BAD_REQUEST);
+    }
+    let Some(token) = token else {
+        return thumbnail_error_response(StatusCode::BAD_REQUEST);
+    };
+
+    let thumbnail_path = mods.iter().find_map(|mod_record| {
+        let path = mod_record.thumbnail_path.as_deref()?;
+        (thumbnail_asset_token(&mod_record.identity.stable_key(), path) == token)
+            .then_some(PathBuf::from(path))
+    });
+    let Some(thumbnail_path) = thumbnail_path else {
+        return thumbnail_error_response(StatusCode::NOT_FOUND);
+    };
+    let mime = match thumbnail_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        _ => return thumbnail_error_response(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    };
+    let Ok(bytes) = fs::read(&thumbnail_path) else {
+        return thumbnail_error_response(StatusCode::NOT_FOUND);
+    };
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", mime)
+        .header("Cache-Control", "private, max-age=300")
+        .body(bytes)
+        .unwrap_or_else(|_| thumbnail_error_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn thumbnail_error_response(status: StatusCode) -> HttpResponse<Vec<u8>> {
+    HttpResponse::builder()
+        .status(status)
+        .body(Vec::new())
+        .unwrap_or_default()
+}
+
+fn mod_source_label(mod_row: &ModRowViewModel) -> &'static str {
+    match mod_row.source {
+        ModSource::Workshop => "WS",
+        ModSource::GameData => "DATA",
+        ModSource::GameDataModding => "MOD",
+        ModSource::Local => "LOCAL",
+    }
+}
+
+fn mod_source_description(mod_row: &ModRowViewModel) -> &'static str {
+    match mod_row.source {
+        ModSource::Workshop => "Steam Workshop mod",
+        ModSource::GameData => "Mod stored in the WH3 data folder",
+        ModSource::GameDataModding => "Mod stored in data/modding",
+        ModSource::Local => "Mod from an additional local folder",
+    }
+}
+
+fn mod_author_label(mod_row: &ModRowViewModel) -> String {
+    mod_row.author.clone().unwrap_or_else(|| "—".to_string())
+}
+
+fn mod_updated_label(mod_row: &ModRowViewModel, now_ms: u64) -> String {
+    let Some(updated_ms) = mod_row.updated_ms else {
+        return "—".to_string();
+    };
+    relative_time_label(updated_ms, now_ms)
+}
+
+fn mod_detail_description_text(mod_row: &ModRowViewModel) -> String {
+    mod_row
+        .description
+        .clone()
+        .unwrap_or_else(|| "No description is available for this mod.".to_string())
 }
 
 fn mod_detail_dependency_text(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
@@ -4649,6 +4891,14 @@ fn workshop_metadata_for_row<'a>(
 }
 
 fn mod_workshop_id_from_row(mod_row: &ModRowViewModel) -> Option<String> {
+    if let Some(workshop_id) = mod_row
+        .workshop_id
+        .as_deref()
+        .and_then(normalize_workshop_id)
+    {
+        return Some(workshop_id);
+    }
+
     if let Some(workshop_id) = mod_row
         .key
         .strip_prefix("workshop:")
@@ -4822,38 +5072,6 @@ fn current_unix_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
-}
-
-fn source_tile_style(mod_row: &ModRowViewModel) -> &'static str {
-    match mod_source_label(mod_row) {
-        "WS" => {
-            "width: 42px; height: 42px; display: grid; place-items: center; justify-self: start; border: 1px solid #2563eb; background: #172554; color: #bfdbfe; border-radius: 5px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0;"
-        }
-        "CORE" => {
-            "width: 42px; height: 42px; display: grid; place-items: center; justify-self: start; border: 1px solid #4b5563; background: #272b35; color: #d1d5db; border-radius: 5px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
-        }
-        _ => {
-            "width: 42px; height: 42px; display: grid; place-items: center; justify-self: start; border: 1px solid #166534; background: #10281a; color: #86efac; border-radius: 5px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
-        }
-    }
-}
-
-fn detail_source_tile_style(mod_row: &ModRowViewModel) -> &'static str {
-    match mod_source_label(mod_row) {
-        "WS" => {
-            "aspect-ratio: 1 / 1; min-height: 220px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #2563eb; background: #172554; color: #bfdbfe; border-radius: 8px; text-align: center; padding: 18px;"
-        }
-        "CORE" => {
-            "aspect-ratio: 1 / 1; min-height: 220px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #4b5563; background: #272b35; color: #d1d5db; border-radius: 8px; text-align: center; padding: 18px;"
-        }
-        _ => {
-            "aspect-ratio: 1 / 1; min-height: 220px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #166534; background: #10281a; color: #86efac; border-radius: 8px; text-align: center; padding: 18px;"
-        }
-    }
-}
-
-fn detail_source_tile_caption_style() -> &'static str {
-    "width: 100%; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #f8fafc; font-size: 13px; line-height: 18px; font-weight: 750;"
 }
 
 fn detail_page_header_style() -> &'static str {
@@ -6686,6 +6904,69 @@ fn steam_helper_config_read_path() -> PathBuf {
     config_file_read_path(STEAM_HELPER_CONFIG_FILE)
 }
 
+fn workshop_metadata_cache_path() -> PathBuf {
+    config_file_write_path(WORKSHOP_METADATA_CACHE_FILE)
+}
+
+fn workshop_metadata_cache_read_path() -> PathBuf {
+    config_file_read_path(WORKSHOP_METADATA_CACHE_FILE)
+}
+
+fn load_workshop_metadata_cache_or_default() -> WorkshopMetadataCache {
+    read_workshop_metadata_cache(workshop_metadata_cache_read_path()).unwrap_or_default()
+}
+
+fn load_cached_workshop_metadata() -> Vec<WorkshopModData> {
+    load_workshop_metadata_cache_or_default()
+        .entries
+        .into_iter()
+        .map(|entry| entry.metadata)
+        .collect()
+}
+
+fn ui_preferences_path() -> PathBuf {
+    config_file_write_path(UI_PREFERENCES_FILE)
+}
+
+fn ui_preferences_read_path() -> PathBuf {
+    config_file_read_path(UI_PREFERENCES_FILE)
+}
+
+fn load_ui_sort_preference() -> ModSortSpec {
+    load_ui_sort_preference_from(&ui_preferences_read_path())
+}
+
+fn load_ui_sort_preference_from(path: &Path) -> ModSortSpec {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
+        .filter(|preferences| preferences.version == 1)
+        .map(|preferences| preferences.mod_sort)
+        .unwrap_or_default()
+}
+
+fn save_ui_sort_preference(sort: ModSortSpec) -> Result<(), String> {
+    save_ui_sort_preference_to(&ui_preferences_path(), sort)
+}
+
+fn save_ui_sort_preference_to(path: &Path, sort: ModSortSpec) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create UI preferences folder: {error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(&UiPreferences {
+        version: 1,
+        mod_sort: sort,
+    })
+    .map_err(|error| format!("Could not encode UI preferences: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, bytes)
+        .map_err(|error| format!("Could not write UI preferences: {error}"))?;
+    fs::rename(&temp_path, path)
+        .map_err(|error| format!("Could not replace UI preferences: {error}"))?;
+    Ok(())
+}
+
 fn load_mods_from_folder(folder: PathBuf) -> wh3mm_core::CoreResult<(Vec<ModRecord>, String)> {
     let options = discovery_options_for_folder(folder.clone());
     let mut mods = discover_mods(&options)?;
@@ -6896,19 +7177,9 @@ fn refresh_steam_from_helper(
         .subscribed_workshop_ids()
         .map_err(|error| error.message)?;
 
-    let before_filter_len = state.mods.len();
-    if !subscribed_ids.is_empty() {
-        let subscribed_set = subscribed_ids.iter().cloned().collect::<BTreeSet<_>>();
-        state.mods.retain(|mod_record| {
-            mod_record
-                .identity
-                .workshop_id
-                .as_ref()
-                .is_none_or(|workshop_id| subscribed_set.contains(workshop_id))
-        });
-    }
-    let filtered_unsubscribed_count = before_filter_len.saturating_sub(state.mods.len());
-
+    // Refresh metadata for the current archive without deleting local/data rows
+    // whose inherited Workshop association is no longer subscribed.
+    let filtered_unsubscribed_count = 0;
     let workshop_ids = workshop_ids_from_mods(&state.mods);
     let mut metadata_adapter = TsSteamHelperMetadataAdapter::new(
         WH3_STEAM_APP_ID,
@@ -6925,6 +7196,19 @@ fn refresh_steam_from_helper(
         filtered_unsubscribed_count,
         renamed_count,
     })
+}
+
+fn fetch_metadata_from_helper(
+    workshop_ids: &[String],
+    helper_path: &Path,
+    backend: &str,
+) -> Result<SteamMetadataBatchResult, String> {
+    validate_steam_helper_path(helper_path)?;
+    let mut metadata_adapter = TsSteamHelperMetadataAdapter::new(
+        WH3_STEAM_APP_ID,
+        steam_helper_process_runner(helper_path, backend).map_err(|error| error.message)?,
+    );
+    fetch_steam_metadata_safely(&mut metadata_adapter, workshop_ids)
 }
 
 fn check_steam_updates_with_helper(
@@ -8291,8 +8575,8 @@ mod tests {
     use wh3mm_core::{
         AppState, DbCell, DbFieldSchema, DbFieldType, DbPrimitiveValue, DbRows, DbSchema,
         DbVersionSchema, GameId, LegacyTsLaunchOptions, ModIdentity, ModListConfig, ModRecord,
-        PackDataOverwrite, PackDataOverwriteOperation, PackDataOverwriteValue, PackFileWrite,
-        PersistedModState, PersistedPreset, PreLaunchPackWrite, PresetConfig,
+        ModSource, PackDataOverwrite, PackDataOverwriteOperation, PackDataOverwriteValue,
+        PackFileWrite, PersistedModState, PersistedPreset, PreLaunchPackWrite, PresetConfig,
         SteamWorkshopAdapterError, SteamWorkshopMetadataAdapter,
         WH3_MAKE_UNITS_GENERALS_TABLE_PATH, WH3_START_GAME_PACK_NAME, Wh3StartGamePackOptions,
         WorkshopModData, build_pfh5_pack_bytes, build_wh3_start_game_pack_with_battle_permissions,
@@ -8305,6 +8589,15 @@ mod tests {
         WindowsProcessPriorityClass, WindowsProcessPriorityUpdate,
     };
 
+    macro_rules! mod_row {
+        ($($field:tt)*) => {
+            ModRowViewModel {
+                $($field)*
+                ..Default::default()
+            }
+        };
+    }
+
     use super::{
         APP_DIAGNOSTIC_LOG_FILE, AlphaReadinessReport, AlphaReadinessRow, AlphaReadinessStatus,
         DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput, LaunchOptionState, LibraryNavTarget,
@@ -8316,15 +8609,14 @@ mod tests {
         archive_empty_actions_style, archive_empty_body, archive_empty_body_style,
         archive_empty_button_style, archive_empty_panel_style, archive_empty_title,
         archive_empty_title_style, archive_filter_bar_style, archive_filter_button_style,
-        archive_filter_chip_style, archive_header_gear_icon_style, archive_header_gear_ring_style,
-        archive_header_gear_tooth_style, archive_header_icon_button_style,
-        archive_row_open_indicator_style, archive_source_action_row_style, archive_status_style,
-        archive_table_header_style, archive_toolbar_button_style, archive_utility_dock_style,
-        archive_workspace_style, build_alpha_readiness_report_with_paths,
-        build_windows_launch_options, collection_row_button_style, collection_row_style,
-        continue_save_button_style, default_tool_workspace_pages, delete_category_config_for_state,
-        dependency_names_summary, desktop_window_title, detail_action_button_style,
-        detail_action_grid_style, detail_category_assignment_style, detail_description_body_style,
+        archive_filter_chip_style, archive_header_icon_button_style,
+        archive_source_action_row_style, archive_status_style, archive_table_header_style,
+        archive_toolbar_button_style, archive_utility_dock_style, archive_workspace_style,
+        build_alpha_readiness_report_with_paths, build_windows_launch_options,
+        collection_row_button_style, collection_row_style, continue_save_button_style,
+        default_tool_workspace_pages, delete_category_config_for_state, dependency_names_summary,
+        desktop_window_title, detail_action_button_style, detail_action_grid_style,
+        detail_category_assignment_style, detail_description_body_style,
         detail_description_panel_style, detail_empty_actions_style, detail_empty_body_style,
         detail_empty_panel_style, detail_empty_title_style, detail_header_actions_style,
         detail_header_nav_button_style, detail_main_panel_style, detail_metric_style,
@@ -8332,62 +8624,58 @@ mod tests {
         detail_page_kicker_style, detail_position_label_style,
         detail_primary_description_body_style, detail_primary_description_panel_style,
         detail_record_path_style, detail_section_label_style, detail_side_column_style,
-        detail_side_meta_panel_style, detail_side_meta_row_style, detail_source_tile_caption_style,
-        detail_source_tile_style, detail_status_style, detail_tag_list_style,
-        detail_workspace_grid_style, diagnostic_snapshot_text, enabled_pack_paths_for_start_game,
-        fetch_steam_metadata_safely, first_existing_steam_helper_path, generated_pack_details,
-        initial_app_state, launch_options_from_legacy_ts, launch_priority_status,
-        launch_quick_button_style, launch_state_fingerprint, launch_status_with_close_on_play,
+        detail_side_meta_panel_style, detail_side_meta_row_style, detail_status_style,
+        detail_tag_list_style, detail_workspace_grid_style, diagnostic_snapshot_text,
+        enabled_pack_paths_for_start_game, fetch_steam_metadata_safely,
+        first_existing_steam_helper_path, generated_pack_details, initial_app_state,
+        launch_options_from_legacy_ts, launch_priority_status, launch_quick_button_style,
+        launch_state_fingerprint, launch_status_with_close_on_play,
         legacy_ts_launch_option_import_summary, legacy_ts_launch_options_from_state,
         library_nav_active, library_settings_nav_visible, library_utility_button_style,
-        mod_author_label, mod_categories_label, mod_context_label, mod_detail_breadcrumb,
-        mod_detail_dependency_text, mod_detail_description_text, mod_detail_empty_body,
-        mod_detail_empty_title, mod_enable_button_style, mod_enable_knob_style,
-        mod_list_filter_label, mod_order_label, mod_row_matches_filter, mod_row_matches_query,
-        mod_row_style, mod_settings_action_disabled, mod_settings_action_title, mod_source_label,
-        mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_button_style,
-        nav_count_chip_style, nav_icon_dot_style, nav_icon_line_style, nav_icon_ring_style,
-        nav_icon_stack_style, nav_icon_tile_style, normalize_steam_helper_backend, play_icon_style,
-        play_primary_button_style, project_readme_path, project_readme_path_from,
-        read_existing_launch_mod_list_pack_names, relative_time_label,
-        rename_category_config_for_state, resolve_config_file_read_path, run_in_background,
-        run_steam_command_action, save_on_last_game_launch_preset_to_path, schema_path_from,
-        secondary_page_breadcrumb, secondary_page_content_style, secondary_page_header_style,
-        secondary_page_kicker_style, secondary_status_style, selected_mod_folder_target,
-        selected_mod_neighbor_key, selected_mod_position_label, selected_or_first_mod_row,
-        selected_pack_from_optional_arg, settings_card_header_actions_style, settings_card_style,
-        settings_danger_button_style, settings_field_style, settings_focus_active,
-        settings_focus_breadcrumb, settings_focus_card_style, settings_focus_description,
-        settings_focus_route_chip_style, settings_focus_tab_label, settings_focus_tab_style,
-        settings_focus_tabs_style, settings_focus_title, settings_game_data_label,
-        settings_game_executable_label, settings_helper_backend_row_style,
-        settings_inline_field_style, settings_input_style, settings_launch_actions_copy_style,
-        settings_launch_actions_style, settings_launch_button_row_style,
-        settings_page_content_style, settings_page_header_style, settings_page_kicker_style,
-        settings_path_action_row_style, settings_primary_button_style, settings_toggle_knob_style,
-        settings_workspace_active, source_tile_style, start_game_source_pack_paths,
+        load_ui_sort_preference_from, mod_author_label, mod_categories_label, mod_context_label,
+        mod_detail_breadcrumb, mod_detail_dependency_text, mod_detail_description_text,
+        mod_detail_empty_body, mod_detail_empty_title, mod_enable_button_style,
+        mod_enable_knob_style, mod_list_filter_label, mod_order_label, mod_row_matches_filter,
+        mod_row_matches_query, mod_row_style, mod_settings_action_disabled,
+        mod_settings_action_title, mod_source_label, mod_state_label, mod_updated_label,
+        mod_workshop_id_from_row, nav_button_style, nav_count_chip_style, nav_icon_dot_style,
+        nav_icon_line_style, nav_icon_ring_style, nav_icon_stack_style, nav_icon_tile_style,
+        normalize_steam_helper_backend, play_icon_style, play_primary_button_style,
+        project_readme_path, project_readme_path_from, read_existing_launch_mod_list_pack_names,
+        relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
+        run_in_background, run_steam_command_action, save_on_last_game_launch_preset_to_path,
+        save_ui_sort_preference_to, schema_path_from, secondary_page_breadcrumb,
+        secondary_page_content_style, secondary_page_header_style, secondary_page_kicker_style,
+        secondary_status_style, selected_mod_folder_target, selected_mod_neighbor_key,
+        selected_mod_position_label, selected_or_first_mod_row, selected_pack_from_optional_arg,
+        settings_card_header_actions_style, settings_card_style, settings_danger_button_style,
+        settings_field_style, settings_focus_active, settings_focus_breadcrumb,
+        settings_focus_card_style, settings_focus_description, settings_focus_route_chip_style,
+        settings_focus_tab_label, settings_focus_tab_style, settings_focus_tabs_style,
+        settings_focus_title, settings_game_data_label, settings_game_executable_label,
+        settings_helper_backend_row_style, settings_inline_field_style, settings_input_style,
+        settings_launch_actions_copy_style, settings_launch_actions_style,
+        settings_launch_button_row_style, settings_page_content_style, settings_page_header_style,
+        settings_page_kicker_style, settings_path_action_row_style, settings_primary_button_style,
+        settings_toggle_knob_style, settings_workspace_active, start_game_source_pack_paths,
         start_game_temp_packs_dir_for_config_dir, steam_check_update_panel_state,
         steam_check_update_status, steam_command_panel_state, steam_command_status,
         steam_helper_process_config, steam_probe_status, steam_refresh_panel_state,
-        steam_resubscribe_panel_state, steam_resubscribe_status, toggle_label_style,
-        tool_action_button_style, tool_action_disabled_button_style, tool_action_group_style,
-        tool_aux_button_style, tool_aux_group_style, tool_context_action_style,
-        tool_context_actions_style, tool_context_disabled_screen_button_style,
-        tool_context_label_style, tool_context_meta_chip_style, tool_context_meta_style,
-        tool_context_name_style, tool_context_panel_style, tool_context_path_style,
-        tool_context_screen_button_style, tool_context_screen_group_style,
-        tool_context_summary_style, tool_context_toggle_style, tool_footer_button_style,
-        tool_more_group_style, tool_other_screens_group_label, tool_settings_views_group_label,
-        tools_header_style, tools_rail_style, top_actions_style, top_bell_body_style,
-        top_bell_clapper_style, top_brand_title_style, top_download_arrow_style,
-        top_download_status_dot_style, top_download_stem_style, top_download_tray_style,
-        top_icon_button_style, top_icon_glyph_style, top_profile_body_style,
-        top_profile_head_style, top_search_icon_handle_style, top_search_icon_style,
-        top_search_should_route_to_mods, top_search_style, top_shell_header_style,
-        workshop_id_summary, workshop_ids_from_input, workshop_ids_from_mods,
-        workshop_url_for_mod_row,
+        steam_resubscribe_panel_state, steam_resubscribe_status, thumbnail_asset_http_response,
+        thumbnail_asset_token, toggle_label_style, tool_action_button_style,
+        tool_action_disabled_button_style, tool_action_group_style, tool_aux_button_style,
+        tool_aux_group_style, tool_context_action_style, tool_context_actions_style,
+        tool_context_disabled_screen_button_style, tool_context_label_style,
+        tool_context_meta_chip_style, tool_context_meta_style, tool_context_name_style,
+        tool_context_panel_style, tool_context_path_style, tool_context_screen_button_style,
+        tool_context_screen_group_style, tool_context_summary_style, tool_context_toggle_style,
+        tool_footer_button_style, tool_more_group_style, tool_other_screens_group_label,
+        tool_settings_views_group_label, tools_header_style, tools_rail_style, top_actions_style,
+        top_brand_title_style, top_icon_button_style, top_search_should_route_to_mods,
+        top_search_style, top_shell_header_style, workshop_id_summary, workshop_ids_from_input,
+        workshop_ids_from_mods, workshop_url_for_mod_row,
     };
-    use wh3mm_ui::ModRowViewModel;
+    use wh3mm_ui::{ModRowViewModel, ModSortColumn, ModSortSpec, SortDirection};
 
     #[test]
     fn desktop_window_title_is_branded() {
@@ -8423,6 +8711,102 @@ mod tests {
     }
 
     #[test]
+    fn ui_sort_preferences_round_trip_and_invalid_files_fall_back() {
+        let root = unique_temp_root("ui-sort-preferences");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("preferences.json");
+        let sort = ModSortSpec {
+            column: ModSortColumn::Updated,
+            direction: SortDirection::Descending,
+        };
+
+        save_ui_sort_preference_to(&path, sort).unwrap();
+        assert_eq!(load_ui_sort_preference_from(&path), sort);
+
+        fs::write(
+            &path,
+            br#"{"version":999,"mod_sort":{"column":"name","direction":"ascending"}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_ui_sort_preference_from(&path), ModSortSpec::default());
+        fs::write(&path, b"not-json").unwrap();
+        assert_eq!(load_ui_sort_preference_from(&path), ModSortSpec::default());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn thumbnail_asset_handler_serves_only_allowlisted_png_and_jpeg_files() {
+        let root = unique_temp_root("thumbnail-assets");
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("preview.png");
+        let jpeg = root.join("preview.JPEG");
+        fs::write(&png, b"png-bytes").unwrap();
+        fs::write(&jpeg, b"jpeg-bytes").unwrap();
+
+        let mut png_mod = mod_record("mods/png.pack", None, "PNG");
+        png_mod.thumbnail_path = Some(png.display().to_string());
+        let mut jpeg_mod = mod_record("mods/jpeg.pack", None, "JPEG");
+        jpeg_mod.thumbnail_path = Some(jpeg.display().to_string());
+        let mods = vec![png_mod, jpeg_mod];
+
+        let png_token = thumbnail_asset_token(
+            &mods[0].identity.stable_key(),
+            mods[0].thumbnail_path.as_deref().unwrap(),
+        );
+        let png_response =
+            thumbnail_asset_http_response(&mods, &format!("/mod-thumbnail/{png_token}"));
+        assert_eq!(png_response.status().as_u16(), 200);
+        assert_eq!(png_response.headers()["content-type"], "image/png");
+        assert_eq!(png_response.body(), b"png-bytes");
+
+        let jpeg_token = thumbnail_asset_token(
+            &mods[1].identity.stable_key(),
+            mods[1].thumbnail_path.as_deref().unwrap(),
+        );
+        let jpeg_response =
+            thumbnail_asset_http_response(&mods, &format!("/mod-thumbnail/{jpeg_token}"));
+        assert_eq!(jpeg_response.status().as_u16(), 200);
+        assert_eq!(jpeg_response.headers()["content-type"], "image/jpeg");
+
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, "/mod-thumbnail/not-allowlisted")
+                .status()
+                .as_u16(),
+            404
+        );
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, "/wrong-handler/token")
+                .status()
+                .as_u16(),
+            400
+        );
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, "/mod-thumbnail/token/extra")
+                .status()
+                .as_u16(),
+            400
+        );
+
+        fs::remove_file(&png).unwrap();
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, &format!("/mod-thumbnail/{png_token}"))
+                .status()
+                .as_u16(),
+            404
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn responsive_shell_collapses_both_rails_without_horizontal_scrolling() {
+        assert!(super::RESPONSIVE_SHELL_CSS.contains("max-width: 1279px"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains("max-width: 959px"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains(".tools-rail.drawer-open"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains(".library-rail.drawer-open"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains("overflow-x: hidden"));
+    }
+
+    #[test]
     fn packaged_resources_prefer_the_executable_directory() {
         let root = std::env::temp_dir().join(format!(
             "wh3mm-dioxus-packaged-resources-{}",
@@ -8451,7 +8835,7 @@ mod tests {
 
     #[test]
     fn mod_row_search_matches_name_path_category_and_tag() {
-        let row = ModRowViewModel {
+        let row = mod_row! {
             key: "mod-a".to_string(),
             display_name: "Community Balance".to_string(),
             subtitle: "workshop/content/1142710/123456789/mod.pack".to_string(),
@@ -8471,7 +8855,7 @@ mod tests {
 
     #[test]
     fn mod_list_filter_matches_expected_row_states() {
-        let enabled = ModRowViewModel {
+        let enabled = mod_row! {
             key: "enabled".to_string(),
             display_name: "Enabled".to_string(),
             subtitle: "enabled.pack".to_string(),
@@ -8481,7 +8865,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let disabled = ModRowViewModel {
+        let disabled = mod_row! {
             key: "disabled".to_string(),
             display_name: "Disabled".to_string(),
             subtitle: "disabled.pack".to_string(),
@@ -8491,7 +8875,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let locked = ModRowViewModel {
+        let locked = mod_row! {
             key: "locked".to_string(),
             display_name: "Locked".to_string(),
             subtitle: "locked.pack".to_string(),
@@ -8501,7 +8885,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let hidden = ModRowViewModel {
+        let hidden = mod_row! {
             key: "hidden".to_string(),
             display_name: "Hidden".to_string(),
             subtitle: "hidden.pack".to_string(),
@@ -8527,9 +8911,10 @@ mod tests {
 
     #[test]
     fn selected_mod_detail_helpers_prefer_selected_then_first_row() {
-        let first = ModRowViewModel {
+        let first = mod_row! {
             key: "first".to_string(),
             display_name: "First".to_string(),
+            load_order: 1,
             subtitle: "first.pack".to_string(),
             enabled: false,
             locked: false,
@@ -8537,9 +8922,10 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let second = ModRowViewModel {
+        let second = mod_row! {
             key: "second".to_string(),
             display_name: "Second".to_string(),
+            load_order: 2,
             subtitle: "second.pack".to_string(),
             enabled: true,
             locked: false,
@@ -8591,9 +8977,10 @@ mod tests {
 
     #[test]
     fn mod_order_label_uses_archive_order_not_filtered_position() {
-        let first = ModRowViewModel {
+        let first = mod_row! {
             key: "first".to_string(),
             display_name: "First".to_string(),
+            load_order: 1,
             subtitle: "first.pack".to_string(),
             enabled: false,
             locked: false,
@@ -8601,9 +8988,10 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let second = ModRowViewModel {
+        let second = mod_row! {
             key: "second".to_string(),
             display_name: "Second".to_string(),
+            load_order: 2,
             subtitle: "second.pack".to_string(),
             enabled: true,
             locked: false,
@@ -8611,9 +8999,10 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let third = ModRowViewModel {
+        let third = mod_row! {
             key: "third".to_string(),
             display_name: "Third".to_string(),
+            load_order: 3,
             subtitle: "third.pack".to_string(),
             enabled: true,
             locked: false,
@@ -8706,16 +9095,6 @@ mod tests {
         assert!(continue_save_button_style(true).contains("background: #292a35"));
         assert!(top_icon_button_style(true).contains("width: 38px"));
         assert!(top_icon_button_style(false).contains("flex: 0 0 auto"));
-        assert!(top_icon_glyph_style().contains("position: relative"));
-        assert!(top_icon_glyph_style().contains("color: currentColor"));
-        assert!(top_bell_body_style().contains("border-bottom: 0"));
-        assert!(top_bell_clapper_style().contains("border-radius: 999px"));
-        assert!(top_download_status_dot_style().contains("#65f58b"));
-        assert!(top_download_stem_style().contains("height: 10px"));
-        assert!(top_download_arrow_style().contains("rotate(45deg)"));
-        assert!(top_download_tray_style().contains("border-top: 0"));
-        assert!(top_profile_head_style().contains("border-radius: 999px"));
-        assert!(top_profile_body_style().contains("border-radius: 999px"));
         assert!(archive_toolbar_button_style(true).contains("#1f6feb"));
         assert!(archive_toolbar_button_style(false).contains("min-height: 30px"));
         assert!(archive_utility_dock_style().contains("position: sticky"));
@@ -8726,8 +9105,6 @@ mod tests {
         assert!(!top_shell_header_style().contains("minmax(250px, 1fr)"));
         assert!(top_brand_title_style().contains("#65f58b"));
         assert!(top_search_style().contains("background: #242531"));
-        assert!(top_search_icon_style().contains("border-radius: 999px"));
-        assert!(top_search_icon_handle_style().contains("rotate(45deg)"));
         assert!(!top_search_should_route_to_mods(WorkspacePage::Mods));
         assert!(top_search_should_route_to_mods(WorkspacePage::Settings));
         assert!(top_search_should_route_to_mods(WorkspacePage::ModDetail));
@@ -8821,9 +9198,10 @@ mod tests {
 
     #[test]
     fn archive_row_helpers_distinguish_source_and_status_styles() {
-        let workshop = ModRowViewModel {
+        let workshop = mod_row! {
             key: "workshop".to_string(),
             display_name: "Workshop".to_string(),
+            source: ModSource::Workshop,
             subtitle: "workshop/content/1142710/123/mod.pack".to_string(),
             enabled: true,
             locked: false,
@@ -8831,9 +9209,10 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let local = ModRowViewModel {
+        let local = mod_row! {
             key: "local".to_string(),
             display_name: "Local".to_string(),
+            source: ModSource::GameDataModding,
             subtitle: "data/modding/local.pack".to_string(),
             enabled: false,
             locked: false,
@@ -8841,9 +9220,10 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let locked = ModRowViewModel {
+        let locked = mod_row! {
             key: "core".to_string(),
             display_name: "Core".to_string(),
+            source: ModSource::GameData,
             subtitle: "data/core.pack".to_string(),
             enabled: true,
             locked: true,
@@ -8854,12 +9234,10 @@ mod tests {
 
         assert_eq!(mod_source_label(&workshop), "WS");
         assert_eq!(mod_source_label(&local), "MOD");
-        assert_eq!(mod_source_label(&locked), "CORE");
-        assert!(source_tile_style(&workshop).contains("#2563eb"));
-        assert!(source_tile_style(&workshop).contains("width: 42px"));
+        assert_eq!(mod_source_label(&locked), "DATA");
         assert!(mod_row_style(false).contains("minmax(0, 1.9fr)"));
         assert!(!mod_row_style(false).contains("154px"));
-        assert!(archive_status_style().contains("margin: 12px 10px"));
+        assert!(archive_status_style().contains("position: fixed"));
         assert!(archive_workspace_style().contains("padding: 0 10px 24px"));
         assert!(archive_table_header_style().contains("minmax(0, 1.9fr)"));
         assert!(archive_table_header_style().contains("38px"));
@@ -8873,14 +9251,6 @@ mod tests {
         assert!(archive_empty_button_style(false).contains("#242936"));
         assert!(archive_header_icon_button_style(false).contains("width: 34px"));
         assert!(archive_header_icon_button_style(true).contains("#65f58b"));
-        assert!(archive_header_gear_icon_style().contains("position: relative"));
-        assert!(archive_header_gear_ring_style().contains("border-radius: 999px"));
-        assert!(archive_header_gear_tooth_style("top").contains("height: 5px"));
-        assert!(archive_header_gear_tooth_style("right").contains("width: 5px"));
-        assert!(archive_header_gear_tooth_style("unknown").is_empty());
-        assert!(archive_row_open_indicator_style(false).contains("height: 34px"));
-        assert!(archive_row_open_indicator_style(false).contains("place-items: center"));
-        assert!(archive_row_open_indicator_style(true).contains("#60a5fa"));
         assert!(archive_filter_bar_style().contains("min-width: 0"));
         assert!(archive_source_action_row_style().contains("justify-content: flex-end"));
         assert!(archive_filter_chip_style(false).contains("justify-content: space-between"));
@@ -8897,9 +9267,14 @@ mod tests {
 
     #[test]
     fn archive_row_metadata_uses_real_workshop_author_and_update_age() {
-        let workshop = ModRowViewModel {
+        let workshop = mod_row! {
             key: "workshop:111".to_string(),
             display_name: "Workshop".to_string(),
+            source: ModSource::Workshop,
+            workshop_id: Some("111".to_string()),
+            author: Some("Groove Wizard".to_string()),
+            updated_ms: Some(86_400_000),
+            description: Some("Real description".to_string()),
             subtitle: "workshop/content/1142710/111/mod.pack".to_string(),
             enabled: true,
             locked: false,
@@ -8907,9 +9282,11 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let path_only = ModRowViewModel {
+        let path_only = mod_row! {
             key: "path".to_string(),
             display_name: "Workshop Path".to_string(),
+            source: ModSource::Workshop,
+            workshop_id: Some("222".to_string()),
             subtitle: "C:\\Steam\\steamapps\\workshop\\content\\1142710\\222\\mod.pack".to_string(),
             enabled: true,
             locked: false,
@@ -8917,9 +9294,10 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let local = ModRowViewModel {
+        let local = mod_row! {
             key: "local".to_string(),
             display_name: "Local".to_string(),
+            source: ModSource::GameDataModding,
             subtitle: "data/modding/local.pack".to_string(),
             enabled: false,
             locked: false,
@@ -8932,6 +9310,8 @@ mod tests {
                 workshop_id: "111".to_string(),
                 title: "Workshop".to_string(),
                 author: "Groove Wizard".to_string(),
+                description: "Real description".to_string(),
+                tags: vec!["mod".to_string()],
                 dependency_ids: Vec::new(),
                 dependency_id_to_name: vec![("222".to_string(), "Required Mod".to_string())],
                 last_changed_ms: 86_400_000,
@@ -8940,6 +9320,8 @@ mod tests {
                 workshop_id: "222".to_string(),
                 title: "Workshop Path".to_string(),
                 author: "".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
                 dependency_ids: vec!["333".to_string(), "444".to_string()],
                 dependency_id_to_name: Vec::new(),
                 last_changed_ms: 0,
@@ -8948,20 +9330,11 @@ mod tests {
 
         assert_eq!(mod_workshop_id_from_row(&workshop).as_deref(), Some("111"));
         assert_eq!(mod_workshop_id_from_row(&path_only).as_deref(), Some("222"));
-        assert_eq!(mod_author_label(&workshop, &metadata), "Groove Wizard");
-        assert_eq!(
-            mod_updated_label(&workshop, &metadata, 3 * 86_400_000),
-            "2 days ago"
-        );
-        assert_eq!(mod_author_label(&local, &metadata), "Local");
-        assert_eq!(
-            mod_updated_label(&local, &metadata, 3 * 86_400_000),
-            "Local"
-        );
-        assert_eq!(
-            mod_detail_description_text(&workshop, &metadata),
-            "Cached Steam Workshop metadata is available for this record."
-        );
+        assert_eq!(mod_author_label(&workshop), "Groove Wizard");
+        assert_eq!(mod_updated_label(&workshop, 3 * 86_400_000), "2 days ago");
+        assert_eq!(mod_author_label(&local), "—");
+        assert_eq!(mod_updated_label(&local, 3 * 86_400_000), "—");
+        assert_eq!(mod_detail_description_text(&workshop), "Real description");
         assert_eq!(
             mod_detail_dependency_text(&workshop, &metadata),
             "Required Mod"
@@ -8975,8 +9348,8 @@ mod tests {
             "No workshop dependency metadata is cached for this record."
         );
         assert_eq!(
-            mod_detail_description_text(&local, &metadata),
-            "No description metadata is cached for this mod record."
+            mod_detail_description_text(&local),
+            "No description is available for this mod."
         );
         assert_eq!(relative_time_label(0, 3 * 86_400_000), "Unknown");
         assert_eq!(relative_time_label(3 * 86_400_000, 3 * 86_400_000), "Today");
@@ -8984,7 +9357,7 @@ mod tests {
 
     #[test]
     fn selected_mod_context_actions_use_real_path_and_workshop_id() {
-        let workshop = ModRowViewModel {
+        let workshop = mod_row! {
             key: "workshop:111".to_string(),
             display_name: "Workshop".to_string(),
             subtitle:
@@ -8996,7 +9369,7 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let local = ModRowViewModel {
+        let local = mod_row! {
             key: "local".to_string(),
             display_name: "Local".to_string(),
             subtitle: "/mods/local_pack/local.pack".to_string(),
@@ -9154,19 +9527,6 @@ mod tests {
         assert!(toggle_label_style(false).contains("#353a43"));
         assert!(settings_toggle_knob_style(true).contains("translateX(22px)"));
         assert!(settings_toggle_knob_style(false).contains("translateX(0)"));
-        let workshop = ModRowViewModel {
-            key: "workshop".to_string(),
-            display_name: "Workshop".to_string(),
-            subtitle: "workshop/content/1142710/123/mod.pack".to_string(),
-            enabled: true,
-            locked: false,
-            hidden: false,
-            categories: Vec::new(),
-            tags: vec!["workshop".to_string()],
-        };
-        assert!(detail_source_tile_style(&workshop).contains("aspect-ratio: 1 / 1"));
-        assert!(detail_source_tile_style(&workshop).contains("min-height: 220px"));
-        assert!(detail_source_tile_caption_style().contains("text-overflow: ellipsis"));
         assert_eq!(mod_detail_breadcrumb(), "Mod Archive / Mod Settings");
         assert!(detail_page_header_style().contains("width: min(100%, 1040px)"));
         assert!(detail_page_kicker_style().contains("text-transform: uppercase"));
@@ -9375,6 +9735,9 @@ mod tests {
                 ModRecord {
                     identity: ModIdentity::new("data/core.pack", None::<String>, "core.pack"),
                     display_name: "Core".to_string(),
+                    source: ModSource::GameData,
+                    thumbnail_path: None,
+                    local_modified_ms: None,
                     enabled: true,
                     always_enabled: true,
                     hidden: false,
@@ -9388,6 +9751,9 @@ mod tests {
                         "mod.pack",
                     ),
                     display_name: "Workshop Mod".to_string(),
+                    source: ModSource::Workshop,
+                    thumbnail_path: None,
+                    local_modified_ms: None,
                     enabled: true,
                     always_enabled: false,
                     hidden: true,
@@ -10465,6 +10831,8 @@ mod tests {
                 workshop_id: "111".to_string(),
                 title: "A".to_string(),
                 author: "Author".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
                 dependency_ids: Vec::new(),
                 dependency_id_to_name: Vec::new(),
                 last_changed_ms: 0,
@@ -10772,6 +11140,13 @@ mod tests {
         ModRecord {
             identity: ModIdentity::new(path, workshop_id, name),
             display_name: name.to_string(),
+            source: if workshop_id.is_some() {
+                ModSource::Workshop
+            } else {
+                ModSource::Local
+            },
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled: false,
             always_enabled: false,
             hidden: false,
@@ -10785,6 +11160,8 @@ mod tests {
             workshop_id: workshop_id.to_string(),
             title: title.to_string(),
             author: String::new(),
+            description: String::new(),
+            tags: Vec::new(),
             dependency_ids: Vec::new(),
             dependency_id_to_name: Vec::new(),
             last_changed_ms: 0,

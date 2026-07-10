@@ -1428,6 +1428,9 @@ mod tests {
         let mods = vec![ModRecord {
             identity: ModIdentity::new("does-not-exist.pack", Option::<String>::None, "missing"),
             display_name: "missing".to_string(),
+            source: crate::domain::ModSource::Local,
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled: true,
             always_enabled: false,
             hidden: false,

@@ -45,14 +45,28 @@ include the helper command log with the report.
 ## 4. Verify the mod archive
 
 1. Load the WH3 game folder.
-2. Confirm local, data/modding, and Workshop packs appear without duplicates.
-3. Search and filter the archive; the `Ord` column must continue to show the
-   real load order rather than renumbering visible rows.
-4. Open **Mod Settings** from a row and test Previous/Next, enable/disable,
+2. Confirm CA packs listed by `data/manifest.txt` are absent while genuine
+   local, `data/modding`, extra-folder, and Workshop packs remain visible.
+3. Confirm Workshop images, titles, actual authors, and update times appear.
+   Restart once and verify cached metadata appears before any new Steam request.
+4. Sort by Order, Status, Pack / Mod Name, Author, and Updated in both
+   directions. Missing authors/times must remain last, the selected direction
+   must survive restart, and the `Ord` values must never change.
+5. Search and filter the archive and confirm sorting remains active without
+   changing launch order.
+6. Open **Mod Settings** from a row and test Previous/Next, enable/disable,
    move, lock, hide, and category assignment.
-5. Save a collection/preset, restart the app, and confirm enablement and order
+7. Save a collection/preset, restart the app, and confirm enablement and order
    are restored.
-6. Run **Compatibility** for the enabled set and record any pack read errors.
+8. Run **Compatibility** for the enabled set and record any pack read errors.
+
+Check the archive at 1920×1080, 1366×768, and the minimum window size. The
+tools rail should become a drawer below 1280 px and the library rail below
+960 px; no layout should clip or introduce horizontal scrolling.
+
+After automatic enrichment and one manual Refresh, inspect
+`wh3mm-steam-helper-commands.jsonl`. Requests must be batched and bounded, with
+no repeated metadata calls caused only by rendering or sorting the archive.
 
 ## 5. Verify launch preparation and WH3 start
 

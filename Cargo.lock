@@ -251,6 +251,7 @@ dependencies = [
 name = "wh3mm-ui"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "wh3mm-core",
 ]
 

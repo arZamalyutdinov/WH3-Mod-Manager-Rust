@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - codex/windows-alpha-validation
+      - codex/windows-feedback-ui-parity
     tags:
       - "v*"
   workflow_dispatch:
@@ -51,7 +52,7 @@ jobs:
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.publish_release }}" != "true" ]; then
             VALIDATION_BUILD="true"
-          elif [ "$EVENT_NAME" = "push" ] && [ "${{ github.ref }}" = "refs/heads/codex/windows-alpha-validation" ]; then
+          elif [ "$EVENT_NAME" = "push" ] && [[ "${{ github.ref }}" == refs/heads/codex/windows-* ]]; then
             VALIDATION_BUILD="true"
           fi
 

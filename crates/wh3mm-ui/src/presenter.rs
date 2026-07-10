@@ -1,15 +1,18 @@
 //! Pure functions that project core state into UI view models.
 
+use std::cmp::Ordering;
+
 use wh3mm_core::{
     AppState, DbPrimitiveValue, DbRows, DbTableMetadata, DbVersionSchema, PackContents,
     PackFileIndexEntry, PackFileKind, PackFileMetadata, PackIndex, WhmmFlowFileSummary,
-    WhmmFlowOptionSummary, WhmmFlowPackSummary,
+    WhmmFlowOptionSummary, WhmmFlowPackSummary, WorkshopModData,
 };
 
 use crate::view_model::{
     AppViewModel, DbTableColumnViewModel, DbTablePreviewViewModel, DbTableRowViewModel,
-    ModRowViewModel, PackFileRowViewModel, PackFlowErrorViewModel, PackFlowFileViewModel,
-    PackFlowOptionViewModel, PackFlowSummaryViewModel, PackViewModel,
+    ModRowViewModel, ModSortColumn, ModSortSpec, PackFileRowViewModel, PackFlowErrorViewModel,
+    PackFlowFileViewModel, PackFlowOptionViewModel, PackFlowSummaryViewModel, PackViewModel,
+    SortDirection,
 };
 
 /// Builds the main-window view model from core state.
@@ -17,11 +20,64 @@ use crate::view_model::{
 pub fn build_app_view_model(state: &AppState) -> AppViewModel {
     AppViewModel {
         title: "WH3 Mod Manager".to_string(),
-        mods: state.mods.iter().map(build_mod_row_view_model).collect(),
+        mods: build_mod_archive_rows(state, &[], ModSortSpec::default()),
         busy: false,
         status_message: None,
         selected_pack: None,
     }
+}
+
+/// Builds enriched, sorted archive rows without mutating core mod order.
+#[must_use]
+pub fn build_mod_archive_rows(
+    state: &AppState,
+    workshop_metadata: &[WorkshopModData],
+    sort: ModSortSpec,
+) -> Vec<ModRowViewModel> {
+    let mut rows = state
+        .mods
+        .iter()
+        .enumerate()
+        .map(|(index, mod_record)| {
+            build_mod_row_view_model(mod_record, index + 1, workshop_metadata)
+        })
+        .collect::<Vec<_>>();
+    sort_mod_archive_rows(&mut rows, sort);
+    rows
+}
+
+/// Sorts archive rows as a presentation-only projection.
+pub fn sort_mod_archive_rows(rows: &mut [ModRowViewModel], sort: ModSortSpec) {
+    rows.sort_by(|left, right| {
+        let primary = match sort.column {
+            ModSortColumn::Order => {
+                compare_values(&left.load_order, &right.load_order, sort.direction)
+            }
+            ModSortColumn::Status => compare_values(
+                &usize::from(!left.enabled),
+                &usize::from(!right.enabled),
+                sort.direction,
+            ),
+            ModSortColumn::Name => {
+                compare_text(&left.display_name, &right.display_name, sort.direction)
+            }
+            ModSortColumn::Author => compare_optional_text(
+                left.author.as_deref(),
+                right.author.as_deref(),
+                sort.direction,
+            ),
+            ModSortColumn::Updated => compare_optional_values(
+                left.updated_ms.as_ref(),
+                right.updated_ms.as_ref(),
+                sort.direction,
+            ),
+        };
+
+        primary
+            .then_with(|| left.load_order.cmp(&right.load_order))
+            .then_with(|| compare_text(&left.pack_name, &right.pack_name, SortDirection::Ascending))
+            .then_with(|| left.subtitle.cmp(&right.subtitle))
+    });
 }
 
 /// Builds a selected-pack view model from core parser output.
@@ -170,16 +226,106 @@ fn graph_toggle_label(file: &WhmmFlowFileSummary) -> String {
     }
 }
 
-fn build_mod_row_view_model(mod_record: &wh3mm_core::ModRecord) -> ModRowViewModel {
+fn build_mod_row_view_model(
+    mod_record: &wh3mm_core::ModRecord,
+    load_order: usize,
+    workshop_metadata: &[WorkshopModData],
+) -> ModRowViewModel {
+    let metadata = mod_record
+        .identity
+        .workshop_id
+        .as_deref()
+        .and_then(|workshop_id| {
+            workshop_metadata
+                .iter()
+                .find(|metadata| metadata.workshop_id == workshop_id)
+        });
+    let pack_name = mod_record
+        .identity
+        .path
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&mod_record.identity.name)
+        .to_string();
+    let display_name = metadata
+        .map(|metadata| metadata.title.trim())
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&mod_record.display_name)
+        .to_string();
+    let author = metadata
+        .map(|metadata| metadata.author.trim())
+        .filter(|author| !author.is_empty())
+        .map(str::to_string);
+    let description = metadata
+        .map(|metadata| metadata.description.trim())
+        .filter(|description| !description.is_empty())
+        .map(str::to_string);
+    let mut tags = mod_record.tags.clone();
+    if let Some(metadata) = metadata {
+        for tag in &metadata.tags {
+            if !tag.trim().is_empty() && !tags.iter().any(|existing| existing == tag) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+
     ModRowViewModel {
         key: mod_record.identity.stable_key(),
-        display_name: mod_record.display_name.clone(),
+        display_name,
+        load_order,
+        pack_name,
+        source: mod_record.source,
+        workshop_id: mod_record.identity.workshop_id.clone(),
+        thumbnail_path: mod_record.thumbnail_path.clone(),
+        author,
+        updated_ms: metadata
+            .and_then(|metadata| (metadata.last_changed_ms > 0).then_some(metadata.last_changed_ms))
+            .or(mod_record.local_modified_ms),
+        description,
         subtitle: mod_record.identity.path.clone(),
         enabled: mod_record.effectively_enabled(),
         locked: mod_record.always_enabled,
         hidden: mod_record.hidden,
         categories: mod_record.categories.clone(),
-        tags: mod_record.tags.clone(),
+        tags,
+    }
+}
+
+fn compare_values<T: Ord>(left: &T, right: &T, direction: SortDirection) -> Ordering {
+    match direction {
+        SortDirection::Ascending => left.cmp(right),
+        SortDirection::Descending => right.cmp(left),
+    }
+}
+
+fn compare_text(left: &str, right: &str, direction: SortDirection) -> Ordering {
+    compare_values(&left.to_lowercase(), &right.to_lowercase(), direction)
+}
+
+fn compare_optional_text(
+    left: Option<&str>,
+    right: Option<&str>,
+    direction: SortDirection,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_text(left, right, direction),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_optional_values<T: Ord>(
+    left: Option<&T>,
+    right: Option<&T>,
+    direction: SortDirection,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_values(left, right, direction),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -274,14 +420,15 @@ mod tests {
 
     use wh3mm_core::{
         AppState, DbCell, DbFieldSchema, DbFieldType, DbPrimitiveValue, DbRows, DbTableMetadata,
-        DbVersionSchema, GameId, LocFileMetadata, ModIdentity, ModRecord, PackContents,
+        DbVersionSchema, GameId, LocFileMetadata, ModIdentity, ModRecord, ModSource, PackContents,
         PackFileIndexEntry, PackFileMetadata, PackIndex, WhmmFlowFileReadError,
-        WhmmFlowFileSummary, WhmmFlowOptionSummary, WhmmFlowPackSummary,
+        WhmmFlowFileSummary, WhmmFlowOptionSummary, WhmmFlowPackSummary, WorkshopModData,
     };
 
     use super::{
-        build_app_view_model, build_db_table_preview_view_model, build_pack_contents_view_model,
-        build_pack_flow_summary_view_model, build_pack_view_model,
+        ModRowViewModel, ModSortColumn, ModSortSpec, SortDirection, build_app_view_model,
+        build_db_table_preview_view_model, build_mod_archive_rows, build_pack_contents_view_model,
+        build_pack_flow_summary_view_model, build_pack_view_model, sort_mod_archive_rows,
     };
 
     #[test]
@@ -291,6 +438,9 @@ mod tests {
             vec![ModRecord {
                 identity: ModIdentity::new("data/mod.pack", Some("42"), "mod"),
                 display_name: "My Mod".to_string(),
+                source: wh3mm_core::ModSource::GameData,
+                thumbnail_path: None,
+                local_modified_ms: None,
                 enabled: false,
                 always_enabled: true,
                 hidden: false,
@@ -308,6 +458,191 @@ mod tests {
         assert!(row.locked);
         assert!(!row.hidden);
         assert_eq!(row.tags, ["core"]);
+    }
+
+    #[test]
+    fn archive_sort_clicks_use_column_defaults_then_toggle() {
+        let sort = ModSortSpec::default();
+        assert_eq!(
+            sort.after_column_click(ModSortColumn::Updated),
+            ModSortSpec {
+                column: ModSortColumn::Updated,
+                direction: SortDirection::Descending,
+            }
+        );
+        assert_eq!(
+            sort.after_column_click(ModSortColumn::Order),
+            ModSortSpec {
+                column: ModSortColumn::Order,
+                direction: SortDirection::Descending,
+            }
+        );
+        assert_eq!(
+            sort.after_column_click(ModSortColumn::Author),
+            ModSortSpec {
+                column: ModSortColumn::Author,
+                direction: SortDirection::Ascending,
+            }
+        );
+    }
+
+    #[test]
+    fn archive_sorting_covers_all_columns_and_directions() {
+        let original = vec![
+            archive_row(2, "beta.pack", "Beta", false, Some("Zed"), Some(200)),
+            archive_row(1, "alpha.pack", "Alpha", true, Some("Amy"), Some(100)),
+            archive_row(3, "gamma.pack", "Gamma", false, None, None),
+        ];
+
+        let cases = [
+            (
+                ModSortColumn::Order,
+                SortDirection::Ascending,
+                vec![1, 2, 3],
+            ),
+            (
+                ModSortColumn::Order,
+                SortDirection::Descending,
+                vec![3, 2, 1],
+            ),
+            (
+                ModSortColumn::Status,
+                SortDirection::Ascending,
+                vec![1, 2, 3],
+            ),
+            (
+                ModSortColumn::Status,
+                SortDirection::Descending,
+                vec![2, 3, 1],
+            ),
+            (ModSortColumn::Name, SortDirection::Ascending, vec![1, 2, 3]),
+            (
+                ModSortColumn::Name,
+                SortDirection::Descending,
+                vec![3, 2, 1],
+            ),
+            (
+                ModSortColumn::Author,
+                SortDirection::Ascending,
+                vec![1, 2, 3],
+            ),
+            (
+                ModSortColumn::Author,
+                SortDirection::Descending,
+                vec![2, 1, 3],
+            ),
+            (
+                ModSortColumn::Updated,
+                SortDirection::Ascending,
+                vec![1, 2, 3],
+            ),
+            (
+                ModSortColumn::Updated,
+                SortDirection::Descending,
+                vec![2, 1, 3],
+            ),
+        ];
+
+        for (column, direction, expected) in cases {
+            let mut rows = original.clone();
+            sort_mod_archive_rows(&mut rows, ModSortSpec { column, direction });
+            assert_eq!(
+                rows.iter().map(|row| row.load_order).collect::<Vec<_>>(),
+                expected,
+                "failed for {column:?} {direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_projection_enriches_rows_without_mutating_launch_order() {
+        let mods = vec![
+            ModRecord {
+                identity: ModIdentity::new("data/zeta.pack", Some("22"), "zeta"),
+                display_name: "zeta".to_string(),
+                source: ModSource::GameData,
+                thumbnail_path: Some("data/zeta.png".to_string()),
+                local_modified_ms: Some(10),
+                enabled: false,
+                always_enabled: false,
+                hidden: false,
+                categories: Vec::new(),
+                tags: vec!["local".to_string()],
+            },
+            ModRecord {
+                identity: ModIdentity::new("content/11/alpha.pack", Some("11"), "alpha"),
+                display_name: "alpha".to_string(),
+                source: ModSource::Workshop,
+                thumbnail_path: None,
+                local_modified_ms: Some(20),
+                enabled: true,
+                always_enabled: false,
+                hidden: false,
+                categories: Vec::new(),
+                tags: Vec::new(),
+            },
+        ];
+        let state = AppState::with_mods(GameId::Warhammer3, mods);
+        let original_paths = state
+            .mods
+            .iter()
+            .map(|record| record.identity.path.clone())
+            .collect::<Vec<_>>();
+        let metadata = vec![WorkshopModData {
+            workshop_id: "22".to_string(),
+            title: "Steam Zeta".to_string(),
+            author: "Author".to_string(),
+            description: "Description".to_string(),
+            tags: vec!["Units".to_string()],
+            dependency_ids: Vec::new(),
+            dependency_id_to_name: Vec::new(),
+            last_changed_ms: 30,
+        }];
+
+        let rows = build_mod_archive_rows(
+            &state,
+            &metadata,
+            ModSortSpec {
+                column: ModSortColumn::Name,
+                direction: SortDirection::Ascending,
+            },
+        );
+
+        assert_eq!(rows[0].pack_name, "alpha.pack");
+        assert_eq!(rows[1].display_name, "Steam Zeta");
+        assert_eq!(rows[1].author.as_deref(), Some("Author"));
+        assert_eq!(rows[1].updated_ms, Some(30));
+        assert_eq!(rows[1].thumbnail_path.as_deref(), Some("data/zeta.png"));
+        assert!(rows[1].tags.contains(&"Units".to_string()));
+        assert_eq!(
+            state
+                .mods
+                .iter()
+                .map(|record| record.identity.path.clone())
+                .collect::<Vec<_>>(),
+            original_paths
+        );
+    }
+
+    fn archive_row(
+        load_order: usize,
+        pack_name: &str,
+        display_name: &str,
+        enabled: bool,
+        author: Option<&str>,
+        updated_ms: Option<u64>,
+    ) -> ModRowViewModel {
+        ModRowViewModel {
+            key: pack_name.to_string(),
+            display_name: display_name.to_string(),
+            load_order,
+            pack_name: pack_name.to_string(),
+            author: author.map(str::to_string),
+            updated_ms,
+            subtitle: format!("path/{pack_name}"),
+            enabled,
+            ..ModRowViewModel::default()
+        }
     }
 
     #[test]

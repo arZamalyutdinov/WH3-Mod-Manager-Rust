@@ -33,7 +33,7 @@ pub use db::{
     read_db_rows_from_pack, read_db_rows_from_payload, write_db_rows_to_payload,
 };
 pub use discovery::{ModDiscoveryOptions, discover_mods};
-pub use domain::{GameId, ModIdentity, ModRecord};
+pub use domain::{GameId, ModIdentity, ModRecord, ModSource};
 pub use flows::{
     WHMM_FLOW_FILE_PREFIX, WhmmFlowFileReadError, WhmmFlowFileSummary, WhmmFlowOptionSummary,
     WhmmFlowPackSummary, is_whmm_flow_file_name, read_whmm_flow_file_names,
@@ -61,10 +61,11 @@ pub use persistence::{
     capture_preset_config, capture_steam_helper_config, capture_steam_helper_config_with_backend,
     delete_category_config, delete_preset_config, parse_mod_list_pack_names, preset_names,
     read_game_folder_config, read_mod_list_config, read_mod_user_config, read_preset_config,
-    read_steam_helper_config, remove_mod_category, rename_category_config,
-    set_category_color_config, upsert_preset_config, write_game_folder_config_atomic,
-    write_mod_list_config_atomic, write_mod_user_config_atomic, write_preset_config_atomic,
-    write_steam_helper_config_atomic,
+    read_steam_helper_config, read_workshop_metadata_cache, remove_mod_category,
+    rename_category_config, set_category_color_config, upsert_preset_config,
+    write_game_folder_config_atomic, write_mod_list_config_atomic, write_mod_user_config_atomic,
+    write_preset_config_atomic, write_steam_helper_config_atomic,
+    write_workshop_metadata_cache_atomic,
 };
 pub use ports::{CoreError, CoreResult, ModRepository};
 pub use schema::{
@@ -82,9 +83,9 @@ pub use start_game::{
 pub use steam::{
     CachedWorkshopData, QueueWorkshopIdsResult, RetryDelayPlan, SteamWorkshopAdapterError,
     SteamWorkshopAdapterErrorKind, SteamWorkshopMetadataAdapter, SteamWorkshopRequestState,
-    SteamWorkshopSafetyConfig, WorkshopBatchPlan, WorkshopMetadataFetchStep, WorkshopModData,
-    normalize_workshop_id, parse_ts_steam_helper_mod_data_response,
-    ts_steam_helper_dependency_ids_needing_titles,
+    SteamWorkshopSafetyConfig, WorkshopBatchPlan, WorkshopMetadataCache,
+    WorkshopMetadataCacheEntry, WorkshopMetadataFetchStep, WorkshopModData, normalize_workshop_id,
+    parse_ts_steam_helper_mod_data_response, ts_steam_helper_dependency_ids_needing_titles,
 };
 pub use ts_config::{
     LegacyTsConfigSnapshot, LegacyTsLaunchOptions, export_legacy_ts_config_bytes,
