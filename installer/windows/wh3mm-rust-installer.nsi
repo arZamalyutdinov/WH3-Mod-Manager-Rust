@@ -1,5 +1,5 @@
 !ifndef APP_VERSION
-!define APP_VERSION "0.1.0-alpha"
+!define APP_VERSION "1.0.0"
 !endif
 
 !ifndef PAYLOAD_DIR
@@ -8,6 +8,10 @@
 
 !ifndef OUT_FILE
 !define OUT_FILE "WH3-Mod-Manager-Rust-Installer.exe"
+!endif
+
+!ifndef APP_ICON
+!error "APP_ICON must point to the WH3 Mod Manager .ico file."
 !endif
 
 Unicode true
@@ -19,6 +23,8 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 BrandingText "WH3 Mod Manager Rust ${APP_VERSION}"
 
+!define MUI_ICON "${APP_ICON}"
+!define MUI_UNICON "${APP_ICON}"
 !include "MUI2.nsh"
 
 !define MUI_ABORTWARNING
@@ -42,11 +48,12 @@ Section "WH3 Mod Manager Rust" SecMain
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\WH3 Mod Manager Rust"
-  CreateShortcut "$SMPROGRAMS\WH3 Mod Manager Rust\WH3 Mod Manager Rust.lnk" "$INSTDIR\wh3mm-dioxus.exe"
+  CreateShortcut "$SMPROGRAMS\WH3 Mod Manager Rust\WH3 Mod Manager Rust.lnk" "$INSTDIR\wh3mm-dioxus.exe" "" "$INSTDIR\wh3mm-dioxus.exe" 0
 
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "DisplayName" "WH3 Mod Manager Rust"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "Publisher" "WH3 Mod Manager"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "DisplayIcon" "$INSTDIR\wh3mm-dioxus.exe,0"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\WH3 Mod Manager Rust" "NoModify" 1
@@ -54,7 +61,7 @@ Section "WH3 Mod Manager Rust" SecMain
 SectionEnd
 
 Section /o "Desktop shortcut" SecDesktopShortcut
-  CreateShortcut "$DESKTOP\WH3 Mod Manager Rust.lnk" "$INSTDIR\wh3mm-dioxus.exe"
+  CreateShortcut "$DESKTOP\WH3 Mod Manager Rust.lnk" "$INSTDIR\wh3mm-dioxus.exe" "" "$INSTDIR\wh3mm-dioxus.exe" 0
 SectionEnd
 
 Section "Uninstall"

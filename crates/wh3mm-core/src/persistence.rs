@@ -1,7 +1,7 @@
 //! Active mod-list persistence.
 //!
 //! The legacy TypeScript app stores this inside a much larger `config.json`
-//! preset structure. The Rust prototype starts with a narrow equivalent for
+//! preset structure. The Rust application uses a focused equivalent for
 //! restoring discovered mods' enablement and order.
 
 use std::collections::BTreeMap;

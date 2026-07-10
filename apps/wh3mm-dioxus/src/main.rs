@@ -10,12 +10,14 @@ mod components;
 
 use dioxus::prelude::*;
 use dioxus_desktop::{
-    Config as DesktopConfig, WindowBuilder,
+    Config as DesktopConfig, WindowBuilder, icon_from_memory,
     tao::dpi::LogicalSize,
     use_asset_handler,
     wry::http::{Response as HttpResponse, StatusCode},
 };
 use futures_channel::oneshot;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -70,6 +72,7 @@ use components::{
 };
 
 const MAX_TABLE_PREVIEW_ROWS: usize = 25;
+const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/modmanager.ico");
 const APP_CONFIG_DIR_NAME: &str = "WH3 Mod Manager Rust";
 const APP_CONFIG_DIR_ENV: &str = "WH3MM_CONFIG_DIR";
 const GAME_FOLDER_CONFIG_FILE: &str = "wh3mm_game_folder.json";
@@ -89,9 +92,15 @@ const STEAM_HELPER_BACKEND_ENV: &str = "WH3MM_STEAM_HELPER_BACKEND";
 const STEAM_HELPER_COMMAND_LOG_ENV: &str = "WH3MM_STEAM_HELPER_COMMAND_LOG";
 const STEAM_HELPER_BACKEND_NATIVE: &str = "native";
 const STEAM_HELPER_BACKEND_FIXTURE: &str = "fixture";
-const PACKAGED_HELP_FILE: &str = "WINDOWS-ALPHA-README.md";
+const PACKAGED_HELP_FILE: &str = "WINDOWS-VERIFICATION.md";
 const CLOSE_ON_PLAY_DELAY_SECS: u64 = 5;
 const WORKSHOP_METADATA_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/arZamalyutdinov/WH3-Mod-Manager-Rust/releases/latest";
+const RELEASE_TAG_BASE_URL: &str =
+    "https://github.com/arZamalyutdinov/WH3-Mod-Manager-Rust/releases/tag";
+const UPDATE_CHECK_CONNECT_TIMEOUT_SECS: u64 = 4;
+const UPDATE_CHECK_TIMEOUT_SECS: u64 = 8;
 const RESPONSIVE_SHELL_CSS: &str = r#"
 .app-shell-grid { min-width: 0; overflow-x: hidden; }
 .workspace-content { min-width: 0; overflow-x: hidden; }
@@ -212,6 +221,28 @@ struct SteamRefreshResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateCheckState {
+    NotChecked,
+    Checking,
+    Current {
+        latest_version: String,
+    },
+    Available {
+        version: String,
+        release_url: String,
+    },
+    NoPublishedRelease,
+    Failed(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubLatestRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LegacyTsConfigImportResult {
     mods: Vec<ModRecord>,
     game_folder: Option<PathBuf>,
@@ -278,20 +309,20 @@ struct SteamRuntimeRedistributableStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AlphaReadinessReport {
+struct ReadinessReport {
     summary: String,
-    rows: Vec<AlphaReadinessRow>,
+    rows: Vec<ReadinessRow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AlphaReadinessRow {
+struct ReadinessRow {
     label: String,
-    status: AlphaReadinessStatus,
+    status: ReadinessStatus,
     detail: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum AlphaReadinessStatus {
+enum ReadinessStatus {
     Ready,
     Warning,
     Error,
@@ -305,7 +336,7 @@ struct DiagnosticSnapshotInput<'a> {
     launch_options: &'a LaunchOptionState,
     launch_save_name: &'a str,
     status_message: Option<&'a str>,
-    readiness: &'a AlphaReadinessReport,
+    readiness: &'a ReadinessReport,
     launch_preview: Option<&'a LaunchPreview>,
     last_steam_command: Option<&'a SteamCommandPanelState>,
 }
@@ -352,18 +383,39 @@ enum LibraryNavTarget {
 
 fn main() {
     install_panic_diagnostic_hook();
+    let _ = append_app_diagnostic_log_event("application started");
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            DesktopConfig::new()
-                .with_window(
-                    WindowBuilder::new()
-                        .with_title(desktop_window_title())
-                        .with_inner_size(LogicalSize::new(1600.0, 1000.0))
-                        .with_min_inner_size(LogicalSize::new(1180.0, 760.0)),
-                )
-                .with_menu(None),
-        )
+        .with_cfg(desktop_config())
         .launch(App);
+}
+
+fn desktop_config() -> DesktopConfig {
+    let config = DesktopConfig::new()
+        .with_window(
+            WindowBuilder::new()
+                .with_title(desktop_window_title())
+                .with_inner_size(LogicalSize::new(1600.0, 1000.0))
+                .with_min_inner_size(LogicalSize::new(1180.0, 760.0)),
+        )
+        .with_menu(None);
+
+    match desktop_app_icon() {
+        Some(icon) => config.with_icon(icon),
+        None => config,
+    }
+}
+
+fn desktop_app_icon() -> Option<dioxus_desktop::tao::window::Icon> {
+    #[cfg(target_os = "windows")]
+    {
+        use dioxus_desktop::tao::platform::windows::IconExtWindows;
+
+        if let Ok(icon) = dioxus_desktop::tao::window::Icon::from_resource(1, None) {
+            return Some(icon);
+        }
+    }
+
+    icon_from_memory(APP_ICON_BYTES).ok()
 }
 
 fn desktop_window_title() -> &'static str {
@@ -395,7 +447,7 @@ fn App() -> Element {
     let mut pack_selection = use_signal(selected_pack_from_args);
     let mut mod_status = use_signal(|| None::<String>);
     let mut game_folder = use_signal(load_saved_game_folder);
-    let mut preset_name = use_signal(|| "Prototype preset".to_string());
+    let mut preset_name = use_signal(|| "Default".to_string());
     let mut saved_presets = use_signal(load_preset_names);
     let mut category_name = use_signal(|| "Core".to_string());
     let mut selected_category_name = use_signal(|| "Core".to_string());
@@ -413,7 +465,8 @@ fn App() -> Element {
     let mut tools_drawer_open = use_signal(|| false);
     let mut library_drawer_open = use_signal(|| false);
     let mut selected_mod_key = use_signal(|| None::<String>);
-    let mut conflict_report = use_signal(|| None::<PackConflictReport>);
+    let conflict_report = use_signal(|| None::<PackConflictReport>);
+    let compatibility_operation = use_signal(|| None::<String>);
     let mut launch_preview = use_signal(|| None::<LaunchPreview>);
     let mut launch_options = use_signal(LaunchOptionState::default);
     let mut launch_save_name = use_signal(String::new);
@@ -427,6 +480,11 @@ fn App() -> Element {
     let mut steam_operation = use_signal(|| None::<String>);
     let mut last_auto_metadata_request = use_signal(|| None::<String>);
     let mut last_logged_mod_status = use_signal(|| None::<String>);
+    let update_check_state = use_signal(|| UpdateCheckState::NotChecked);
+
+    use_asset_handler("app-icon", move |request, responder| {
+        responder.respond(app_icon_http_response(request.uri().path()));
+    });
 
     use_asset_handler("mod-thumbnail", move |request, responder| {
         let response = thumbnail_asset_http_response(&app_state.read().mods, request.uri().path());
@@ -451,6 +509,12 @@ fn App() -> Element {
         let _ = *workspace_page.read();
         tools_drawer_open.set(false);
         library_drawer_open.set(false);
+    });
+
+    use_effect(move || {
+        if *update_check_state.read() == UpdateCheckState::NotChecked {
+            start_release_update_check(update_check_state, mod_status, false);
+        }
     });
 
     use_effect(move || {
@@ -542,7 +606,10 @@ fn App() -> Element {
     let archive_filter_count = usize::from(current_mod_filter != ModListFilter::All)
         + usize::from(!mod_search_query.is_empty());
     let current_settings_focus = *settings_focus.read();
+    let current_update_check_state = update_check_state.read().clone();
     let steam_operation_in_progress = steam_operation.read().is_some();
+    let current_compatibility_operation = compatibility_operation.read().clone();
+    let compatibility_operation_in_progress = current_compatibility_operation.is_some();
     let filtered_mods = if mod_search_query.is_empty() {
         visible_rows
     } else {
@@ -609,11 +676,11 @@ fn App() -> Element {
     let current_game_data_label = settings_game_data_label(selected_game_folder.as_deref());
     let readiness_game_folder = selected_game_folder.clone();
     let readiness_helper_path = steam_helper_path.read().clone();
-    let alpha_readiness = build_alpha_readiness_report(
+    let readiness = build_readiness_report(
         readiness_game_folder.as_deref(),
         readiness_helper_path.trim(),
     );
-    let alpha_readiness_summary = alpha_readiness.summary.clone();
+    let readiness_summary = readiness.summary.clone();
     let saved_category_count = saved_categories.read().len();
     let saved_preset_count = saved_presets.read().len();
     let category_summaries = saved_categories
@@ -643,14 +710,25 @@ fn App() -> Element {
             header {
                 style: top_shell_header_style(),
                 div {
-                    style: "min-width: 0; display: grid; gap: 2px;",
-                    h1 {
-                        style: top_brand_title_style(),
-                        "{app_brand_title()}"
+                    style: "min-width: 0; display: flex; align-items: center; gap: 10px;",
+                    img {
+                        src: "/app-icon/modmanager.ico",
+                        alt: "",
+                        aria_hidden: "true",
+                        width: "32",
+                        height: "32",
+                        style: "width: 32px; height: 32px; flex: 0 0 32px; object-fit: contain;"
                     }
                     div {
-                        style: "font-size: 11px; line-height: 14px; color: #94a89b; text-transform: uppercase;",
-                        "{app_brand_subtitle(&view_model.title)}"
+                        style: "min-width: 0; display: grid; gap: 2px;",
+                        h1 {
+                            style: top_brand_title_style(),
+                            "{app_brand_title()}"
+                        }
+                        div {
+                            style: "font-size: 11px; line-height: 14px; color: #94a89b; text-transform: uppercase;",
+                            "{app_brand_subtitle(&view_model.title)}"
+                        }
                     }
                 }
                 div {
@@ -681,6 +759,25 @@ fn App() -> Element {
                 }
                 div {
                     style: top_actions_style(),
+                    if let UpdateCheckState::Available { version, release_url } = current_update_check_state.clone() {
+                        button {
+                            title: "Open WH3 Mod Manager v{version} on GitHub",
+                            aria_label: "Update WH3 Mod Manager to version {version}",
+                            style: top_update_button_style(),
+                            onclick: move |_| {
+                                match open_release_update(&release_url) {
+                                    Ok(status) => mod_status.set(Some(status)),
+                                    Err(error) => mod_status.set(Some(error)),
+                                }
+                            },
+                            svg {
+                                view_box: "0 0 24 24", width: "17", height: "17",
+                                fill: "none", stroke: "currentColor", stroke_width: "2",
+                                path { d: "M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" }
+                            }
+                            span { "Update v{version}" }
+                        }
+                    }
                     button {
                         class: "responsive-nav-toggle responsive-library-toggle",
                         title: "Open library navigation",
@@ -698,7 +795,7 @@ fn App() -> Element {
                         }
                     }
                     button {
-                        title: "Alpha readiness: {alpha_readiness_summary}",
+                        title: "System readiness: {readiness_summary}",
                         aria_label: "Open readiness checks",
                         style: top_icon_button_style(current_workspace_page == WorkspacePage::Checks),
                         onclick: move |_| {
@@ -771,7 +868,7 @@ fn App() -> Element {
                         }
                         div {
                             style: "font-size: 11px; line-height: 15px; color: #9fb0a3; text-transform: uppercase;",
-                            "Windows alpha"
+                            "Windows"
                         }
                     }
                     nav {
@@ -1143,14 +1240,23 @@ fn App() -> Element {
                                 span { ">" }
                             }
                             button {
-                                style: tool_context_screen_button_style(false),
-                                onclick: move |_| {
-                                    let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                                    mod_status.set(Some(conflict_status(&report)));
-                                    conflict_report.set(Some(report));
-                                    workspace_page.set(WorkspacePage::Compatibility);
+                                title: if compatibility_operation_in_progress { "Compatibility analysis is already running" } else { "Analyze enabled mods and open compatibility" },
+                                style: if compatibility_operation_in_progress {
+                                    tool_context_disabled_screen_button_style()
+                                } else {
+                                    tool_context_screen_button_style(false)
                                 },
-                                span { "Compatibility" }
+                                disabled: compatibility_operation_in_progress,
+                                onclick: move |_| {
+                                    start_compatibility_analysis(
+                                        app_state,
+                                        compatibility_operation,
+                                        mod_status,
+                                        conflict_report,
+                                        workspace_page,
+                                    );
+                                },
+                                span { if compatibility_operation_in_progress { "Analyzing..." } else { "Compatibility" } }
                                 span { ">" }
                             }
                             button {
@@ -1244,14 +1350,22 @@ fn App() -> Element {
                             }
                             button {
                                 title: "Analyze enabled mods and open compatibility",
-                                style: tool_context_screen_button_style(false),
-                                onclick: move |_| {
-                                    let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                                    mod_status.set(Some(conflict_status(&report)));
-                                    conflict_report.set(Some(report));
-                                    workspace_page.set(WorkspacePage::Compatibility);
+                                style: if compatibility_operation_in_progress {
+                                    tool_context_disabled_screen_button_style()
+                                } else {
+                                    tool_context_screen_button_style(false)
                                 },
-                                span { "Compatibility" }
+                                disabled: compatibility_operation_in_progress,
+                                onclick: move |_| {
+                                    start_compatibility_analysis(
+                                        app_state,
+                                        compatibility_operation,
+                                        mod_status,
+                                        conflict_report,
+                                        workspace_page,
+                                    );
+                                },
+                                span { if compatibility_operation_in_progress { "Analyzing..." } else { "Compatibility" } }
                                 span { ">" }
                             }
                             button {
@@ -1298,13 +1412,17 @@ fn App() -> Element {
                         style: tool_action_group_style(),
                         button {
                             style: tool_action_button_style(current_workspace_page == WorkspacePage::Compatibility),
+                            disabled: compatibility_operation_in_progress,
                             onclick: move |_| {
-                                let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                                mod_status.set(Some(conflict_status(&report)));
-                                conflict_report.set(Some(report));
-                                workspace_page.set(WorkspacePage::Compatibility);
+                                start_compatibility_analysis(
+                                    app_state,
+                                    compatibility_operation,
+                                    mod_status,
+                                    conflict_report,
+                                    workspace_page,
+                                );
                             },
-                            span { "Check Compatibility" }
+                            span { if compatibility_operation_in_progress { "Analyzing..." } else { "Check Compatibility" } }
                             span { ">" }
                         }
                         button {
@@ -1839,8 +1957,8 @@ fn App() -> Element {
                         }
                         div {
                             style: secondary_page_content_style(),
-                            AlphaReadinessPanel {
-                                report: alpha_readiness.clone()
+                            ReadinessPanel {
+                                report: readiness.clone()
                             }
                         }
                     } else if current_workspace_page == WorkspacePage::Compatibility {
@@ -1877,12 +1995,21 @@ fn App() -> Element {
                                     }
                                     button {
                                         style: settings_primary_button_style(),
+                                        disabled: compatibility_operation_in_progress,
                                         onclick: move |_| {
-                                            let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                                            mod_status.set(Some(conflict_status(&report)));
-                                            conflict_report.set(Some(report));
+                                            start_compatibility_analysis(
+                                                app_state,
+                                                compatibility_operation,
+                                                mod_status,
+                                                conflict_report,
+                                                workspace_page,
+                                            );
                                         },
-                                        "Run analysis"
+                                        if compatibility_operation_in_progress {
+                                            "Analyzing..."
+                                        } else {
+                                            "Run analysis"
+                                        }
                                     }
                                 }
                                 div {
@@ -1890,6 +2017,14 @@ fn App() -> Element {
                                     div {
                                         style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
                                         "{launch_enabled_mod_count} enabled mods will be analyzed. Results stay on this screen so the archive can remain focused on mod ordering."
+                                    }
+                                    if let Some(operation) = current_compatibility_operation.as_deref() {
+                                        div {
+                                            role: "status",
+                                            aria_live: "polite",
+                                            style: "margin-top: 12px; border: 1px solid #36513d; background: #17251a; border-radius: 5px; padding: 10px 12px; color: #d8ffe1; font-size: 13px; line-height: 19px;",
+                                            "{operation}. The app remains available while this runs."
+                                        }
                                     }
                                 }
                             }
@@ -2754,7 +2889,7 @@ fn App() -> Element {
                                                         let next_name = if names.iter().any(|saved_name| saved_name == &name) {
                                                             name
                                                         } else {
-                                                            names.first().cloned().unwrap_or_else(|| "Prototype preset".to_string())
+                                                            names.first().cloned().unwrap_or_else(|| "Default".to_string())
                                                         };
                                                         preset_name.set(next_name);
                                                         saved_presets.set(names);
@@ -2905,6 +3040,45 @@ fn App() -> Element {
                                             span {
                                                 style: settings_toggle_knob_style(*show_hidden.read()),
                                                 ""
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: settings_row_style(),
+                                        div {
+                                            style: "display: grid; gap: 4px; min-width: 0;",
+                                            strong { "Application updates" }
+                                            span {
+                                                style: "font-size: 13px; color: #aeb8c8; overflow-wrap: anywhere;",
+                                                "{update_check_status_label(&current_update_check_state)}"
+                                            }
+                                        }
+                                        div {
+                                            style: "display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end;",
+                                            if let UpdateCheckState::Available { version, release_url } = current_update_check_state.clone() {
+                                                button {
+                                                    style: settings_primary_button_style(),
+                                                    title: "Open the v{version} release on GitHub",
+                                                    onclick: move |_| {
+                                                        match open_release_update(&release_url) {
+                                                            Ok(status) => mod_status.set(Some(status)),
+                                                            Err(error) => mod_status.set(Some(error)),
+                                                        }
+                                                    },
+                                                    "Open v{version}"
+                                                }
+                                            }
+                                            button {
+                                                style: settings_secondary_button_style(),
+                                                disabled: current_update_check_state == UpdateCheckState::Checking,
+                                                onclick: move |_| {
+                                                    start_release_update_check(update_check_state, mod_status, true);
+                                                },
+                                                if current_update_check_state == UpdateCheckState::Checking {
+                                                    "Checking..."
+                                                } else {
+                                                    "Check now"
+                                                }
                                             }
                                         }
                                     }
@@ -3423,7 +3597,7 @@ fn App() -> Element {
                                                     mod_status_snapshot.as_deref(),
                                                     pack_status_snapshot.as_deref(),
                                                 );
-                                                let readiness_snapshot = build_alpha_readiness_report(
+                                                let readiness_snapshot = build_readiness_report(
                                                     game_folder_snapshot.as_deref(),
                                                     helper_path_snapshot.trim(),
                                                 );
@@ -3810,13 +3984,21 @@ fn App() -> Element {
                             }
                             button {
                                 style: archive_toolbar_button_style(false),
+                                disabled: compatibility_operation_in_progress,
                                 onclick: move |_| {
-                                    let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                                    mod_status.set(Some(conflict_status(&report)));
-                                    conflict_report.set(Some(report));
-                                    workspace_page.set(WorkspacePage::Compatibility);
+                                    start_compatibility_analysis(
+                                        app_state,
+                                        compatibility_operation,
+                                        mod_status,
+                                        conflict_report,
+                                        workspace_page,
+                                    );
                                 },
-                                "Analyze"
+                                if compatibility_operation_in_progress {
+                                    "Analyzing..."
+                                } else {
+                                    "Analyze"
+                                }
                             }
                         }
                     }
@@ -4006,7 +4188,7 @@ fn diagnostic_snapshot_text(input: &DiagnosticSnapshotInput<'_>) -> String {
         lines.push(format!(
             "readiness.{}={}: {}",
             row.label,
-            alpha_readiness_status_label(&row.status),
+            readiness_status_label(&row.status),
             row.detail
         ));
     }
@@ -4057,11 +4239,11 @@ fn diagnostic_snapshot_text(input: &DiagnosticSnapshotInput<'_>) -> String {
     lines.join("\n")
 }
 
-fn alpha_readiness_status_label(status: &AlphaReadinessStatus) -> &'static str {
+fn readiness_status_label(status: &ReadinessStatus) -> &'static str {
     match status {
-        AlphaReadinessStatus::Ready => "READY",
-        AlphaReadinessStatus::Warning => "CHECK",
-        AlphaReadinessStatus::Error => "ERROR",
+        ReadinessStatus::Ready => "READY",
+        ReadinessStatus::Warning => "CHECK",
+        ReadinessStatus::Error => "ERROR",
     }
 }
 
@@ -4082,7 +4264,7 @@ fn app_brand_title() -> &'static str {
 }
 
 fn app_brand_subtitle(app_title: &str) -> String {
-    format!("{app_title} / Windows alpha")
+    format!("{app_title} / Windows")
 }
 
 fn top_search_should_route_to_mods(workspace_page: WorkspacePage) -> bool {
@@ -4111,6 +4293,10 @@ fn top_search_style() -> &'static str {
 
 fn top_actions_style() -> &'static str {
     "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #9fb0c0; font-size: 12px; white-space: nowrap;"
+}
+
+fn top_update_button_style() -> &'static str {
+    "height: 36px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid #4ade80; background: #183b25; color: #86efac; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 750; white-space: nowrap;"
 }
 
 fn mod_row_matches_query(mod_row: &ModRowViewModel, normalized_query: &str) -> bool {
@@ -4766,6 +4952,19 @@ fn thumbnail_asset_token(key: &str, thumbnail_path: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn app_icon_http_response(request_path: &str) -> HttpResponse<Vec<u8>> {
+    if request_path != "/app-icon/modmanager.ico" {
+        return thumbnail_error_response(StatusCode::NOT_FOUND);
+    }
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "image/x-icon")
+        .header("Cache-Control", "public, max-age=31536000, immutable")
+        .body(APP_ICON_BYTES.to_vec())
+        .unwrap_or_else(|_| thumbnail_error_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
 fn thumbnail_asset_http_response(mods: &[ModRecord], request_path: &str) -> HttpResponse<Vec<u8>> {
     let mut segments = request_path.trim_matches('/').split('/');
     let valid_handler = segments.next() == Some("mod-thumbnail");
@@ -4989,7 +5188,7 @@ fn project_readme_path_from(app_dir: Option<&Path>, cwd: &Path) -> PathBuf {
     candidates.extend([
         cwd.join(PACKAGED_HELP_FILE),
         cwd.join("README.md"),
-        cwd.join("../../WINDOWS-ALPHA-README.md"),
+        cwd.join("../../WINDOWS-VERIFICATION.md"),
         cwd.join("../../README.md"),
     ]);
 
@@ -5018,6 +5217,16 @@ fn open_system_target(target: &str) -> Result<(), String> {
             "Could not open {target}: opener exited with {status}"
         ))
     }
+}
+
+fn open_release_update(release_url: &str) -> Result<String, String> {
+    let expected_prefix = format!("{RELEASE_TAG_BASE_URL}/");
+    if !release_url.starts_with(&expected_prefix) {
+        return Err("Refused to open an untrusted update address.".to_string());
+    }
+
+    open_system_target(release_url)?;
+    Ok("Opened the latest WH3 Mod Manager release on GitHub.".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -5339,7 +5548,7 @@ fn tool_action_disabled_button_style() -> &'static str {
 }
 
 #[component]
-fn AlphaReadinessPanel(report: AlphaReadinessReport) -> Element {
+fn ReadinessPanel(report: ReadinessReport) -> Element {
     rsx! {
         section {
             style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
@@ -5347,7 +5556,7 @@ fn AlphaReadinessPanel(report: AlphaReadinessReport) -> Element {
                 style: "display: grid; gap: 3px;",
                 h3 {
                     style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Alpha readiness"
+                    "System readiness"
                 }
                 div {
                     style: "font-size: 12px; color: #cbd8cc; overflow-wrap: anywhere;",
@@ -5366,12 +5575,12 @@ fn AlphaReadinessPanel(report: AlphaReadinessReport) -> Element {
                                 style: "font-size: 12px; color: #edf2f7; font-weight: 650;",
                                 "{row.label}"
                             }
-                            if row.status == AlphaReadinessStatus::Ready {
+                            if row.status == ReadinessStatus::Ready {
                                 span {
                                     style: "font-size: 11px; color: #86efac; text-transform: uppercase;",
                                     "Ready"
                                 }
-                            } else if row.status == AlphaReadinessStatus::Warning {
+                            } else if row.status == ReadinessStatus::Warning {
                                 span {
                                     style: "font-size: 11px; color: #fde68a; text-transform: uppercase;",
                                     "Check"
@@ -5793,6 +6002,85 @@ fn conflict_status(report: &PackConflictReport) -> String {
         report.script_read_errors.len(),
         report.file_reference_read_errors.len()
     )
+}
+
+fn start_compatibility_analysis(
+    app_state: Signal<AppState>,
+    mut compatibility_operation: Signal<Option<String>>,
+    mut mod_status: Signal<Option<String>>,
+    mut conflict_report: Signal<Option<PackConflictReport>>,
+    mut workspace_page: Signal<WorkspacePage>,
+) {
+    if compatibility_operation.read().is_some() {
+        return;
+    }
+
+    let mods = app_state.read().mods.clone();
+    let enabled_mod_count = mods
+        .iter()
+        .filter(|mod_record| mod_record.effectively_enabled())
+        .count();
+    let input_fingerprint = compatibility_input_fingerprint(&mods);
+    let operation = format!(
+        "Analyzing {enabled_mod_count} enabled mod{}",
+        plural_suffix(enabled_mod_count)
+    );
+
+    conflict_report.set(None);
+    compatibility_operation.set(Some(operation.clone()));
+    mod_status.set(Some(format!("{operation} in the background...")));
+    workspace_page.set(WorkspacePage::Compatibility);
+
+    let started_at = Instant::now();
+    let receiver = run_in_background(move || analyze_enabled_with_optional_schema(&mods));
+    spawn(async move {
+        let status = match receiver.await {
+            Ok(report) => {
+                let elapsed = compatibility_analysis_elapsed_label(started_at.elapsed());
+                let current_fingerprint =
+                    compatibility_input_fingerprint(&app_state.read().mods);
+                if current_fingerprint == input_fingerprint {
+                    let summary = conflict_status(&report);
+                    conflict_report.set(Some(report));
+                    format!("Compatibility analysis finished in {elapsed}. {summary}")
+                } else {
+                    format!(
+                        "Compatibility analysis finished in {elapsed}, but the enabled mod set changed while it was running. The stale result was discarded; run analysis again."
+                    )
+                }
+            }
+            Err(_) => {
+                "Compatibility analysis stopped unexpectedly. Check wh3mm-crash.log for a background-worker panic."
+                    .to_string()
+            }
+        };
+
+        mod_status.set(Some(status));
+        compatibility_operation.set(None);
+    });
+}
+
+fn compatibility_input_fingerprint(mods: &[ModRecord]) -> String {
+    mods.iter()
+        .filter(|mod_record| mod_record.effectively_enabled())
+        .map(|mod_record| {
+            format!(
+                "{}|{}|{}",
+                mod_record.identity.stable_key(),
+                mod_record.identity.path,
+                mod_record.display_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compatibility_analysis_elapsed_label(elapsed: Duration) -> String {
+    if elapsed.as_secs() == 0 {
+        return format!("{} ms", elapsed.as_millis());
+    }
+
+    format!("{:.1} s", elapsed.as_secs_f64())
 }
 
 fn analyze_enabled_with_optional_schema(mods: &[ModRecord]) -> PackConflictReport {
@@ -6609,31 +6897,23 @@ fn load_saved_steam_helper_backend() -> String {
     STEAM_HELPER_BACKEND_NATIVE.to_string()
 }
 
-fn build_alpha_readiness_report(
-    game_folder: Option<&Path>,
-    helper_path: &str,
-) -> AlphaReadinessReport {
-    build_alpha_readiness_report_with_paths(
-        game_folder,
-        helper_path,
-        &schema_path(),
-        &app_config_dir(),
-    )
+fn build_readiness_report(game_folder: Option<&Path>, helper_path: &str) -> ReadinessReport {
+    build_readiness_report_with_paths(game_folder, helper_path, &schema_path(), &app_config_dir())
 }
 
-fn build_alpha_readiness_report_with_paths(
+fn build_readiness_report_with_paths(
     game_folder: Option<&Path>,
     helper_path: &str,
     schema_path: &Path,
     config_dir: &Path,
-) -> AlphaReadinessReport {
+) -> ReadinessReport {
     let mut rows = Vec::new();
     rows.push(readiness_row(
         "Config",
         if config_dir.is_dir() {
-            AlphaReadinessStatus::Ready
+            ReadinessStatus::Ready
         } else {
-            AlphaReadinessStatus::Warning
+            ReadinessStatus::Warning
         },
         if config_dir.is_dir() {
             format!("Using {}", config_dir.display())
@@ -6644,9 +6924,9 @@ fn build_alpha_readiness_report_with_paths(
     rows.push(readiness_row(
         "Schema",
         if schema_path.is_file() {
-            AlphaReadinessStatus::Ready
+            ReadinessStatus::Ready
         } else {
-            AlphaReadinessStatus::Error
+            ReadinessStatus::Error
         },
         if schema_path.is_file() {
             format!("Found {}", schema_path.display())
@@ -6661,7 +6941,7 @@ fn build_alpha_readiness_report_with_paths(
         Some(path) if path.is_file() => {
             rows.push(readiness_row(
                 "Steam helper",
-                AlphaReadinessStatus::Ready,
+                ReadinessStatus::Ready,
                 format!("Found {}", path.display()),
             ));
             rows.push(steam_runtime_readiness_row(path));
@@ -6669,24 +6949,24 @@ fn build_alpha_readiness_report_with_paths(
         Some(path) => {
             rows.push(readiness_row(
                 "Steam helper",
-                AlphaReadinessStatus::Error,
+                ReadinessStatus::Error,
                 format!("Missing {}", path.display()),
             ));
             rows.push(readiness_row(
                 "Steam DLL",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "Helper path must be valid before checking steam_api64.dll.".to_string(),
             ));
         }
         None => {
             rows.push(readiness_row(
                 "Steam helper",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No helper selected or auto-discovered.".to_string(),
             ));
             rows.push(readiness_row(
                 "Steam DLL",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No helper selected; steam_api64.dll should sit beside the packaged helper."
                     .to_string(),
             ));
@@ -6698,41 +6978,39 @@ fn build_alpha_readiness_report_with_paths(
         (Some(_), Some(Ok(validated))) => {
             rows.push(readiness_row(
                 "WH3 folder",
-                AlphaReadinessStatus::Ready,
+                ReadinessStatus::Ready,
                 format!("Found {}", validated.game_dir.display()),
             ));
             rows.push(match discover_wh3_workshop_folder(&validated.game_dir) {
                 Ok(workshop) => readiness_row(
                     "Workshop",
-                    AlphaReadinessStatus::Ready,
+                    ReadinessStatus::Ready,
                     format!("Found {}", workshop.workshop_content_dir.display()),
                 ),
-                Err(error) => {
-                    readiness_row("Workshop", AlphaReadinessStatus::Warning, error.message)
-                }
+                Err(error) => readiness_row("Workshop", ReadinessStatus::Warning, error.message),
             });
         }
         (Some(path), Some(Err(error))) => {
             rows.push(readiness_row(
                 "WH3 folder",
-                AlphaReadinessStatus::Error,
+                ReadinessStatus::Error,
                 format!("{} ({})", path.display(), error.message),
             ));
             rows.push(readiness_row(
                 "Workshop",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "WH3 folder must validate before checking workshop content.".to_string(),
             ));
         }
         _ => {
             rows.push(readiness_row(
                 "WH3 folder",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No WH3 folder selected.".to_string(),
             ));
             rows.push(readiness_row(
                 "Workshop",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No WH3 folder selected; workshop content is unknown.".to_string(),
             ));
         }
@@ -6740,36 +7018,36 @@ fn build_alpha_readiness_report_with_paths(
 
     let ready_count = rows
         .iter()
-        .filter(|row| row.status == AlphaReadinessStatus::Ready)
+        .filter(|row| row.status == ReadinessStatus::Ready)
         .count();
     let warning_count = rows
         .iter()
-        .filter(|row| row.status == AlphaReadinessStatus::Warning)
+        .filter(|row| row.status == ReadinessStatus::Warning)
         .count();
     let error_count = rows
         .iter()
-        .filter(|row| row.status == AlphaReadinessStatus::Error)
+        .filter(|row| row.status == ReadinessStatus::Error)
         .count();
 
-    AlphaReadinessReport {
+    ReadinessReport {
         summary: format!("{ready_count} ready / {warning_count} checks / {error_count} errors"),
         rows,
     }
 }
 
-fn readiness_row(label: &str, status: AlphaReadinessStatus, detail: String) -> AlphaReadinessRow {
-    AlphaReadinessRow {
+fn readiness_row(label: &str, status: ReadinessStatus, detail: String) -> ReadinessRow {
+    ReadinessRow {
         label: label.to_string(),
         status,
         detail,
     }
 }
 
-fn steam_runtime_readiness_row(helper_path: &Path) -> AlphaReadinessRow {
+fn steam_runtime_readiness_row(helper_path: &Path) -> ReadinessRow {
     let Some(helper_dir) = helper_path.parent() else {
         return readiness_row(
             "Steam DLL",
-            AlphaReadinessStatus::Error,
+            ReadinessStatus::Error,
             format!(
                 "Could not resolve helper directory for {}",
                 helper_path.display()
@@ -6780,13 +7058,13 @@ fn steam_runtime_readiness_row(helper_path: &Path) -> AlphaReadinessRow {
     if steam_dll.is_file() {
         readiness_row(
             "Steam DLL",
-            AlphaReadinessStatus::Ready,
+            ReadinessStatus::Ready,
             format!("Found {}", steam_dll.display()),
         )
     } else {
         readiness_row(
             "Steam DLL",
-            AlphaReadinessStatus::Error,
+            ReadinessStatus::Error,
             format!("Missing {}", steam_dll.display()),
         )
     }
@@ -7067,6 +7345,128 @@ where
         let _ = sender.send(work());
     });
     receiver
+}
+
+fn start_release_update_check(
+    mut update_check_state: Signal<UpdateCheckState>,
+    mut mod_status: Signal<Option<String>>,
+    manual: bool,
+) {
+    if *update_check_state.read() == UpdateCheckState::Checking {
+        return;
+    }
+
+    update_check_state.set(UpdateCheckState::Checking);
+    let receiver = run_in_background(check_latest_github_release);
+    spawn(async move {
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(_) => UpdateCheckState::Failed(
+                "The update check ended before returning a result.".to_string(),
+            ),
+        };
+        let status = update_check_status_label(&result);
+        let _ = append_app_diagnostic_log_event(&format!("update check: {status}"));
+        if manual {
+            mod_status.set(Some(status.clone()));
+        }
+        update_check_state.set(result);
+    });
+}
+
+fn check_latest_github_release() -> UpdateCheckState {
+    match fetch_latest_github_release() {
+        Ok(Some(release)) => evaluate_github_release(
+            env!("CARGO_PKG_VERSION"),
+            &release.tag_name,
+            release.draft,
+            release.prerelease,
+        )
+        .unwrap_or_else(UpdateCheckState::Failed),
+        Ok(None) => UpdateCheckState::NoPublishedRelease,
+        Err(error) => UpdateCheckState::Failed(error),
+    }
+}
+
+fn fetch_latest_github_release() -> Result<Option<GitHubLatestRelease>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(UPDATE_CHECK_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("Could not prepare the update check: {error}"))?;
+    let response = client
+        .get(LATEST_RELEASE_API_URL)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(
+            USER_AGENT,
+            format!("WH3-Mod-Manager/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .map_err(|error| format!("Could not reach GitHub for updates: {error}"))?;
+
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+
+    response
+        .error_for_status()
+        .map_err(|error| format!("GitHub rejected the update check: {error}"))?
+        .json::<GitHubLatestRelease>()
+        .map(Some)
+        .map_err(|error| format!("GitHub returned malformed release data: {error}"))
+}
+
+fn evaluate_github_release(
+    current_version: &str,
+    release_tag: &str,
+    draft: bool,
+    prerelease: bool,
+) -> Result<UpdateCheckState, String> {
+    if draft || prerelease {
+        return Ok(UpdateCheckState::NoPublishedRelease);
+    }
+
+    let current = Version::parse(current_version)
+        .map_err(|error| format!("Invalid application version {current_version}: {error}"))?;
+    let tag = release_tag.trim();
+    let version_text = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    let latest = Version::parse(version_text)
+        .map_err(|error| format!("Invalid GitHub release tag {release_tag}: {error}"))?;
+
+    if latest > current {
+        let release_url = format!("{RELEASE_TAG_BASE_URL}/{tag}");
+        Ok(UpdateCheckState::Available {
+            version: latest.to_string(),
+            release_url,
+        })
+    } else {
+        Ok(UpdateCheckState::Current {
+            latest_version: latest.to_string(),
+        })
+    }
+}
+
+fn update_check_status_label(state: &UpdateCheckState) -> String {
+    match state {
+        UpdateCheckState::NotChecked => "Updates have not been checked yet.".to_string(),
+        UpdateCheckState::Checking => {
+            "Checking GitHub for the latest stable release...".to_string()
+        }
+        UpdateCheckState::Current { latest_version } => format!(
+            "WH3 Mod Manager {} is current (latest release: v{latest_version}).",
+            env!("CARGO_PKG_VERSION")
+        ),
+        UpdateCheckState::Available { version, .. } => {
+            format!("WH3 Mod Manager v{version} is available.")
+        }
+        UpdateCheckState::NoPublishedRelease => {
+            "No published stable GitHub release was found.".to_string()
+        }
+        UpdateCheckState::Failed(error) => format!("Could not check for updates: {error}"),
+    }
 }
 
 fn probe_steam_helper(helper_path: &Path, backend: &str) -> Result<String, String> {
@@ -8599,12 +8999,14 @@ mod tests {
     }
 
     use super::{
-        APP_DIAGNOSTIC_LOG_FILE, AlphaReadinessReport, AlphaReadinessRow, AlphaReadinessStatus,
-        DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput, LaunchOptionState, LibraryNavTarget,
-        ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME, STEAM_HELPER_COMMAND_LOG_ENV,
-        STEAM_HELPER_COMMAND_LOG_FILE, SettingsFocus, SteamCommandAction, SteamCommandPanelRow,
-        SteamCommandPanelState, SteamRefreshResult, WorkspacePage, app_brand_subtitle,
-        app_brand_title, append_app_diagnostic_log_event_to_path, append_pack_data_overwrite_packs,
+        APP_DIAGNOSTIC_LOG_FILE, APP_ICON_BYTES, DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput,
+        LaunchOptionState, LibraryNavTarget, ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME,
+        RELEASE_TAG_BASE_URL, ReadinessReport, ReadinessRow, ReadinessStatus,
+        STEAM_HELPER_COMMAND_LOG_ENV, STEAM_HELPER_COMMAND_LOG_FILE, SettingsFocus, StatusCode,
+        SteamCommandAction, SteamCommandPanelRow, SteamCommandPanelState, SteamRefreshResult,
+        UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS, UpdateCheckState,
+        WorkspacePage, app_brand_subtitle, app_brand_title, app_icon_http_response,
+        append_app_diagnostic_log_event_to_path, append_pack_data_overwrite_packs,
         apply_saved_or_existing_game_mod_list, apply_steam_metadata_to_mods,
         archive_empty_actions_style, archive_empty_body, archive_empty_body_style,
         archive_empty_button_style, archive_empty_panel_style, archive_empty_title,
@@ -8612,9 +9014,10 @@ mod tests {
         archive_filter_chip_style, archive_header_icon_button_style,
         archive_source_action_row_style, archive_status_style, archive_table_header_style,
         archive_toolbar_button_style, archive_utility_dock_style, archive_workspace_style,
-        build_alpha_readiness_report_with_paths, build_windows_launch_options,
-        collection_row_button_style, collection_row_style, continue_save_button_style,
-        default_tool_workspace_pages, delete_category_config_for_state, dependency_names_summary,
+        build_readiness_report_with_paths, build_windows_launch_options,
+        collection_row_button_style, collection_row_style, compatibility_analysis_elapsed_label,
+        compatibility_input_fingerprint, continue_save_button_style, default_tool_workspace_pages,
+        delete_category_config_for_state, dependency_names_summary, desktop_app_icon,
         desktop_window_title, detail_action_button_style, detail_action_grid_style,
         detail_category_assignment_style, detail_description_body_style,
         detail_description_panel_style, detail_empty_actions_style, detail_empty_body_style,
@@ -8626,7 +9029,7 @@ mod tests {
         detail_record_path_style, detail_section_label_style, detail_side_column_style,
         detail_side_meta_panel_style, detail_side_meta_row_style, detail_status_style,
         detail_tag_list_style, detail_workspace_grid_style, diagnostic_snapshot_text,
-        enabled_pack_paths_for_start_game, fetch_steam_metadata_safely,
+        enabled_pack_paths_for_start_game, evaluate_github_release, fetch_steam_metadata_safely,
         first_existing_steam_helper_path, generated_pack_details, initial_app_state,
         launch_options_from_legacy_ts, launch_priority_status, launch_quick_button_style,
         launch_state_fingerprint, launch_status_with_close_on_play,
@@ -8640,10 +9043,11 @@ mod tests {
         mod_settings_action_title, mod_source_label, mod_state_label, mod_updated_label,
         mod_workshop_id_from_row, nav_button_style, nav_count_chip_style, nav_icon_dot_style,
         nav_icon_line_style, nav_icon_ring_style, nav_icon_stack_style, nav_icon_tile_style,
-        normalize_steam_helper_backend, play_icon_style, play_primary_button_style,
-        project_readme_path, project_readme_path_from, read_existing_launch_mod_list_pack_names,
-        relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
-        run_in_background, run_steam_command_action, save_on_last_game_launch_preset_to_path,
+        normalize_steam_helper_backend, open_release_update, play_icon_style,
+        play_primary_button_style, project_readme_path, project_readme_path_from,
+        read_existing_launch_mod_list_pack_names, relative_time_label,
+        rename_category_config_for_state, resolve_config_file_read_path, run_in_background,
+        run_steam_command_action, save_on_last_game_launch_preset_to_path,
         save_ui_sort_preference_to, schema_path_from, secondary_page_breadcrumb,
         secondary_page_content_style, secondary_page_header_style, secondary_page_kicker_style,
         secondary_status_style, selected_mod_folder_target, selected_mod_neighbor_key,
@@ -8672,7 +9076,8 @@ mod tests {
         tool_footer_button_style, tool_more_group_style, tool_other_screens_group_label,
         tool_settings_views_group_label, tools_header_style, tools_rail_style, top_actions_style,
         top_brand_title_style, top_icon_button_style, top_search_should_route_to_mods,
-        top_search_style, top_shell_header_style, workshop_id_summary, workshop_ids_from_input,
+        top_search_style, top_shell_header_style, top_update_button_style,
+        update_check_status_label, workshop_id_summary, workshop_ids_from_input,
         workshop_ids_from_mods, workshop_url_for_mod_row,
     };
     use wh3mm_ui::{ModRowViewModel, ModSortColumn, ModSortSpec, SortDirection};
@@ -8681,6 +9086,79 @@ mod tests {
     fn desktop_window_title_is_branded() {
         assert_eq!(desktop_window_title(), "WH3 Mod Manager");
         assert_ne!(desktop_window_title(), "Dioxus App");
+    }
+
+    #[test]
+    fn ts_parity_app_icon_decodes_and_is_served_from_embedded_bytes() {
+        assert!(desktop_app_icon().is_some());
+        assert_eq!(&APP_ICON_BYTES[..4], &[0, 0, 1, 0]);
+
+        let response = app_icon_http_response("/app-icon/modmanager.ico");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/x-icon")
+        );
+        assert_eq!(response.body().as_slice(), APP_ICON_BYTES);
+        assert_eq!(
+            app_icon_http_response("/app-icon/not-allowlisted.ico").status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn github_release_check_uses_semver_and_a_fixed_repository_url() {
+        assert_eq!(
+            evaluate_github_release("1.0.0", "v1.2.3", false, false).unwrap(),
+            UpdateCheckState::Available {
+                version: "1.2.3".to_string(),
+                release_url: format!("{RELEASE_TAG_BASE_URL}/v1.2.3"),
+            }
+        );
+        assert_eq!(
+            evaluate_github_release("1.2.3", "v1.2.3", false, false).unwrap(),
+            UpdateCheckState::Current {
+                latest_version: "1.2.3".to_string(),
+            }
+        );
+        assert_eq!(
+            evaluate_github_release("2.0.0", "v1.9.9", false, false).unwrap(),
+            UpdateCheckState::Current {
+                latest_version: "1.9.9".to_string(),
+            }
+        );
+        assert!(evaluate_github_release("1.0.0", "latest", false, false).is_err());
+    }
+
+    #[test]
+    fn github_release_check_ignores_non_stable_releases_and_has_bounded_timeouts() {
+        assert_eq!(
+            evaluate_github_release("1.0.0", "v2.0.0", true, false).unwrap(),
+            UpdateCheckState::NoPublishedRelease
+        );
+        assert_eq!(
+            evaluate_github_release("1.0.0", "v2.0.0-beta.1", false, true).unwrap(),
+            UpdateCheckState::NoPublishedRelease
+        );
+        assert!(UPDATE_CHECK_CONNECT_TIMEOUT_SECS <= UPDATE_CHECK_TIMEOUT_SECS);
+        assert!(UPDATE_CHECK_TIMEOUT_SECS <= 10);
+    }
+
+    #[test]
+    fn update_ui_reports_state_and_refuses_untrusted_destinations() {
+        let available = UpdateCheckState::Available {
+            version: "1.1.0".to_string(),
+            release_url: format!("{RELEASE_TAG_BASE_URL}/v1.1.0"),
+        };
+        assert!(update_check_status_label(&available).contains("v1.1.0"));
+        assert!(top_update_button_style().contains("inline-flex"));
+        assert_eq!(
+            open_release_update("https://example.com/releases/tag/v9.9.9").unwrap_err(),
+            "Refused to open an untrusted update address."
+        );
     }
 
     #[test]
@@ -8702,11 +9180,43 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_fingerprint_tracks_the_enabled_ordered_snapshot() {
+        let mut first = mod_record("first.pack", None, "First");
+        first.enabled = true;
+        let mut second = mod_record("second.pack", None, "Second");
+        second.always_enabled = true;
+        let disabled = mod_record("disabled.pack", None, "Disabled");
+
+        let fingerprint =
+            compatibility_input_fingerprint(&[first.clone(), disabled.clone(), second.clone()]);
+        assert_eq!(
+            fingerprint,
+            compatibility_input_fingerprint(&[first.clone(), second.clone()])
+        );
+        assert_ne!(
+            fingerprint,
+            compatibility_input_fingerprint(&[second, first])
+        );
+    }
+
+    #[test]
+    fn compatibility_elapsed_label_is_compact() {
+        assert_eq!(
+            compatibility_analysis_elapsed_label(Duration::from_millis(450)),
+            "450 ms"
+        );
+        assert_eq!(
+            compatibility_analysis_elapsed_label(Duration::from_millis(1_250)),
+            "1.2 s"
+        );
+    }
+
+    #[test]
     fn project_readme_path_targets_windows_verification_guide() {
         let readme_path = project_readme_path();
         assert_eq!(
             readme_path.file_name().and_then(|name| name.to_str()),
-            Some("WINDOWS-ALPHA-README.md")
+            Some("WINDOWS-VERIFICATION.md")
         );
     }
 
@@ -9181,7 +9691,7 @@ mod tests {
         assert_eq!(app_brand_title(), "Mod Archive");
         assert_eq!(
             app_brand_subtitle("WH3 Mod Manager"),
-            "WH3 Mod Manager / Windows alpha"
+            "WH3 Mod Manager / Windows"
         );
         assert!(nav_icon_tile_style(true).contains("grid-template-columns"));
         assert!(nav_icon_tile_style(false).contains("#3d4a3e"));
@@ -9637,7 +10147,7 @@ mod tests {
     }
 
     #[test]
-    fn alpha_readiness_report_accepts_packaged_windows_shape() {
+    fn readiness_report_accepts_packaged_windows_shape() {
         let root = std::env::temp_dir().join(format!("wh3mm-dioxus-ready-{}", std::process::id()));
         let payload = root.join("payload");
         let helper_dir = payload.join("helpers");
@@ -9666,7 +10176,7 @@ mod tests {
         fs::write(&schema, b"schema").unwrap();
         fs::write(game_dir.join("Warhammer3.exe"), b"exe").unwrap();
 
-        let report = build_alpha_readiness_report_with_paths(
+        let report = build_readiness_report_with_paths(
             Some(&game_dir),
             helper.to_str().unwrap(),
             &schema,
@@ -9678,21 +10188,21 @@ mod tests {
             report
                 .rows
                 .iter()
-                .all(|row| row.status == super::AlphaReadinessStatus::Ready)
+                .all(|row| row.status == super::ReadinessStatus::Ready)
         );
 
         fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn alpha_readiness_report_surfaces_missing_alpha_files() {
+    fn readiness_report_surfaces_missing_required_files() {
         let root =
             std::env::temp_dir().join(format!("wh3mm-dioxus-not-ready-{}", std::process::id()));
         let missing_helper = root.join("helpers/wh3mm-steam-helper.exe");
         let missing_schema = root.join("schema/schema_wh3.json.zst");
         let config_dir = root.join("config");
 
-        let report = build_alpha_readiness_report_with_paths(
+        let report = build_readiness_report_with_paths(
             None,
             missing_helper.to_str().unwrap(),
             &missing_schema,
@@ -9701,11 +10211,11 @@ mod tests {
 
         assert_eq!(report.summary, "0 ready / 4 checks / 2 errors");
         assert_eq!(report.rows[1].label, "Schema");
-        assert_eq!(report.rows[1].status, super::AlphaReadinessStatus::Error);
+        assert_eq!(report.rows[1].status, super::ReadinessStatus::Error);
         assert_eq!(report.rows[2].label, "Steam helper");
-        assert_eq!(report.rows[2].status, super::AlphaReadinessStatus::Error);
+        assert_eq!(report.rows[2].status, super::ReadinessStatus::Error);
         assert_eq!(report.rows[4].label, "WH3 folder");
-        assert_eq!(report.rows[4].status, super::AlphaReadinessStatus::Warning);
+        assert_eq!(report.rows[4].status, super::ReadinessStatus::Warning);
     }
 
     #[test]
@@ -9728,7 +10238,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_snapshot_text_captures_alpha_context() {
+    fn diagnostic_snapshot_text_captures_release_context() {
         let state = AppState::with_mods(
             GameId::Warhammer3,
             vec![
@@ -9762,11 +10272,11 @@ mod tests {
                 },
             ],
         );
-        let readiness = AlphaReadinessReport {
+        let readiness = ReadinessReport {
             summary: "1 ready / 0 checks / 0 errors".to_string(),
-            rows: vec![AlphaReadinessRow {
+            rows: vec![ReadinessRow {
                 label: "Config".to_string(),
-                status: AlphaReadinessStatus::Ready,
+                status: ReadinessStatus::Ready,
                 detail: "Using test config".to_string(),
             }],
         };

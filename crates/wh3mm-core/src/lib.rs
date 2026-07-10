@@ -1,4 +1,4 @@
-//! UI-agnostic domain core for the Rust WH3 Mod Manager migration.
+//! UI-agnostic domain core for WH3 Mod Manager.
 //!
 //! Keep this crate free of desktop toolkit, `WebView`, and platform-shell
 //! dependencies. Dioxus, Slint, or any other UI should talk to this crate

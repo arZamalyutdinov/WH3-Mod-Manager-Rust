@@ -4,6 +4,7 @@ target/
 # Long-form local notes/docs
 *.md
 !/README.md
+!/WINDOWS-VERIFICATION.md
 
 # Local/editor noise
 .DS_Store

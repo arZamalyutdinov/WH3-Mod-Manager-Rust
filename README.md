@@ -1,6 +1,6 @@
-# WH3 Mod Manager Rust
+# WH3 Mod Manager
 
-Rust-first rewrite/migration workspace for WH3 Mod Manager.
+Native Rust mod manager for Total War: Warhammer III.
 
 The current TypeScript/Electron app remains the parity reference. In local
 development this repo is usually checked out beside the TS project as
@@ -10,10 +10,10 @@ development this repo is usually checked out beside the TS project as
 
 - `crates/wh3mm-core`: UI-agnostic domain core, parser/schema logic, app state, ports.
 - `crates/wh3mm-ui`: toolkit-neutral intents and view models. Keep this usable by Dioxus and Slint.
-- `apps/wh3mm-dioxus`: first desktop shell. It is intentionally excluded from the default workspace so core checks stay dependency-light.
+- `apps/wh3mm-dioxus`: desktop application. It is intentionally excluded from the default workspace so core checks stay dependency-light.
 - `schema/`: Creative Assembly schema assets copied from the TS project for parser/schema work.
 - `steamworks/dist/win64/`: Windows Steamworks DLL/import library layout mirrored from the TS app for native helper builds.
-- `installer/windows/`: NSIS installer script for Windows alpha builds.
+- `installer/windows/`: NSIS installer script for Windows releases.
 - local agent notes may exist under `skills/`, but Markdown planning docs are
   intentionally not part of the normal commit set.
 
@@ -30,11 +30,15 @@ Implemented so far:
 - WH3 schema JSON / `.json.zst` loading.
 - DB metadata to schema-version resolution.
 - Toolkit-neutral pack summary and DB table preview view models.
-- Dioxus shell for Windows-first alpha workflows: game/mod discovery, persisted mod order/enablement, TS config import/export, launch preview/prepare/spawn, start-game pack generation, compatibility summaries, and Steam helper controls.
+- Dioxus desktop app with game/mod discovery, persisted mod order/enablement,
+  TS config import/export, launch preview/prepare/spawn, start-game pack
+  generation, compatibility summaries, Steam helper controls, and a bounded
+  GitHub release update check.
 
-Live Windows validation is still required before calling this alpha-stable.
+The remaining release checks require a Windows machine with Steam, WH3, and a
+representative mod library.
 
-## Windows Alpha Packaging
+## Windows Packaging
 
 The Windows workflow is `.github/workflows/release-windows.yml`.
 
@@ -49,8 +53,9 @@ to a GitHub Release. Publishing runs without an explicit tag auto-resolve the
 next release tag in the same style as the TypeScript app workflow. Tag pushes
 publish using the pushed tag.
 
-Pushes to `codex/windows-alpha-validation` also build artifact-only validation
-files and never publish a release.
+Pushes to the configured Windows validation branches (currently
+`codex/windows-validation` and `codex/windows-feedback-ui-parity`) also
+build artifact-only files and never publish a release.
 
 The staged payload contains:
 
@@ -58,20 +63,20 @@ The staged payload contains:
 - `helpers/wh3mm-steam-helper.exe`
 - `helpers/steam_api64.dll`
 - `schema/schema_wh3.json.zst`
-- `WINDOWS-ALPHA-README.md`
+- `WINDOWS-VERIFICATION.md`
 
 The Rust repo intentionally copies only `steam_api64.dll` and `steam_api64.lib` from the TS Steamworks folder. The TS `steamworksjs.win32-x64-msvc.node` module is Electron-specific and is not used by the Rust helper.
 
 The workflow runs a packaged-payload smoke check before creating artifacts:
 
 ```powershell
-.\scripts\windows-alpha-smoke.ps1 -PayloadDir .\out\windows-payload
+.\scripts\windows-release-smoke.ps1 -PayloadDir .\out\windows-payload
 ```
 
 On Windows, the same script can be pointed at an extracted zip or installed app
 directory to verify the app exe, helper exe, schema, verification guide, Steam
 runtime DLL placement, and fixture-mode helper protocol. The full manual
-checklist is [WINDOWS-ALPHA-README.md](WINDOWS-ALPHA-README.md).
+checklist is [WINDOWS-VERIFICATION.md](WINDOWS-VERIFICATION.md).
 
 ## Validation
 

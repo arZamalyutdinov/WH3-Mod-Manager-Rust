@@ -5,6 +5,8 @@ param(
 
   [string] $AppId = "1142710",
 
+  [string] $ExpectedAppIcon,
+
   [switch] $AllowMissingSteamRuntime
 )
 
@@ -42,16 +44,60 @@ function Resolve-RequiredDirectory {
   return (Resolve-Path -LiteralPath $Path).Path
 }
 
+function Assert-EmbeddedAppIconMatches {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string] $ExecutablePath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $ExpectedIconPath
+  )
+
+  Add-Type -AssemblyName System.Drawing
+  $resolvedExpectedIcon = Resolve-RequiredFile -Path $ExpectedIconPath -Label "Expected app icon"
+  $expectedIcon = [System.Drawing.Icon]::new($resolvedExpectedIcon, 32, 32)
+  $embeddedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($ExecutablePath)
+  if ($null -eq $embeddedIcon) {
+    $expectedIcon.Dispose()
+    throw "Dioxus app executable does not expose an associated icon."
+  }
+
+  $expectedBitmap = $expectedIcon.ToBitmap()
+  $embeddedBitmap = $embeddedIcon.ToBitmap()
+  try {
+    if ($expectedBitmap.Width -ne $embeddedBitmap.Width -or $expectedBitmap.Height -ne $embeddedBitmap.Height) {
+      throw "Embedded app icon dimensions differ from the expected icon: expected $($expectedBitmap.Width)x$($expectedBitmap.Height), got $($embeddedBitmap.Width)x$($embeddedBitmap.Height)."
+    }
+
+    for ($y = 0; $y -lt $expectedBitmap.Height; $y++) {
+      for ($x = 0; $x -lt $expectedBitmap.Width; $x++) {
+        if ($expectedBitmap.GetPixel($x, $y).ToArgb() -ne $embeddedBitmap.GetPixel($x, $y).ToArgb()) {
+          throw "Embedded app icon pixels differ from the expected TS parity icon."
+        }
+      }
+    }
+  } finally {
+    $expectedBitmap.Dispose()
+    $embeddedBitmap.Dispose()
+    $expectedIcon.Dispose()
+    $embeddedIcon.Dispose()
+  }
+}
+
 $payload = Resolve-RequiredDirectory -Path $PayloadDir -Label "Windows payload directory"
 $appExe = Resolve-RequiredFile -Path (Join-Path $payload "wh3mm-dioxus.exe") -Label "Dioxus app executable"
 $helperDir = Resolve-RequiredDirectory -Path (Join-Path $payload "helpers") -Label "Steam helper directory"
 $helperExe = Resolve-RequiredFile -Path (Join-Path $helperDir "wh3mm-steam-helper.exe") -Label "Steam helper executable"
 $schemaFile = Resolve-RequiredFile -Path (Join-Path $payload "schema\schema_wh3.json.zst") -Label "WH3 compressed schema"
-$helpFile = Resolve-RequiredFile -Path (Join-Path $payload "WINDOWS-ALPHA-README.md") -Label "Windows alpha verification guide"
+$helpFile = Resolve-RequiredFile -Path (Join-Path $payload "WINDOWS-VERIFICATION.md") -Label "Windows release verification guide"
 $steamDll = Join-Path $helperDir "steam_api64.dll"
 
 if (-not $AllowMissingSteamRuntime) {
   Resolve-RequiredFile -Path $steamDll -Label "Steam runtime DLL" | Out-Null
+}
+
+if ($ExpectedAppIcon) {
+  Assert-EmbeddedAppIconMatches -ExecutablePath $appExe -ExpectedIconPath $ExpectedAppIcon
 }
 
 $fixturePath = Join-Path ([IO.Path]::GetTempPath()) ("wh3mm-steam-helper-smoke-{0}.json" -f [Guid]::NewGuid())
@@ -197,7 +243,7 @@ try {
     throw "Steam helper command log has too few entries: $commandLogCount"
   }
 
-  Write-Host "Windows alpha payload smoke passed."
+  Write-Host "Windows release payload smoke passed."
   Write-Host "App: $appExe"
   Write-Host "Helper: $helperExe"
   Write-Host "Schema: $schemaFile"

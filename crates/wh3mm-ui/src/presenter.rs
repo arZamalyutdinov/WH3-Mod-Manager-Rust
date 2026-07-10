@@ -489,8 +489,8 @@ mod tests {
     #[test]
     fn archive_sorting_covers_all_columns_and_directions() {
         let original = vec![
-            archive_row(2, "beta.pack", "Beta", false, Some("Zed"), Some(200)),
-            archive_row(1, "alpha.pack", "Alpha", true, Some("Amy"), Some(100)),
+            archive_row(2, "bravo.pack", "Bravo", false, Some("Zed"), Some(200)),
+            archive_row(1, "amber.pack", "Amber", true, Some("Amy"), Some(100)),
             archive_row(3, "gamma.pack", "Gamma", false, None, None),
         ];
 
@@ -570,8 +570,8 @@ mod tests {
                 tags: vec!["local".to_string()],
             },
             ModRecord {
-                identity: ModIdentity::new("content/11/alpha.pack", Some("11"), "alpha"),
-                display_name: "alpha".to_string(),
+                identity: ModIdentity::new("content/11/amber.pack", Some("11"), "amber"),
+                display_name: "amber".to_string(),
                 source: ModSource::Workshop,
                 thumbnail_path: None,
                 local_modified_ms: Some(20),
@@ -608,7 +608,7 @@ mod tests {
             },
         );
 
-        assert_eq!(rows[0].pack_name, "alpha.pack");
+        assert_eq!(rows[0].pack_name, "amber.pack");
         assert_eq!(rows[1].display_name, "Steam Zeta");
         assert_eq!(rows[1].author.as_deref(), Some("Author"));
         assert_eq!(rows[1].updated_ms, Some(30));

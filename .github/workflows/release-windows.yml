@@ -4,14 +4,14 @@ on:
   push:
     branches:
       - master
-      - codex/windows-alpha-validation
+      - codex/windows-validation
       - codex/windows-feedback-ui-parity
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (used only when publishing; for example: v0.1.0-alpha.1)"
+        description: "Release tag (used only when publishing; for example: v1.0.0)"
         required: false
         type: string
       publish_release:
@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -73,7 +73,7 @@ jobs:
           else
             LATEST_TAG="$(git tag --list 'v*' --sort=-version:refname | head -n1)"
             if [ -z "$LATEST_TAG" ]; then
-              TAG="v0.0.1"
+              TAG="v1.0.0"
             else
               if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]]; then
                 echo "Latest tag '$LATEST_TAG' does not start with a semantic vMAJOR.MINOR.PATCH version."
@@ -182,7 +182,7 @@ jobs:
           Copy-Item "apps\wh3mm-dioxus\target\release\wh3mm-dioxus.exe" (Join-Path $payload "wh3mm-dioxus.exe") -Force
           Copy-Item "target\release\wh3mm-steam-helper.exe" (Join-Path $helpers "wh3mm-steam-helper.exe") -Force
           Copy-Item "schema\schema_wh3.json.zst" $schemaOut -Force
-          Copy-Item "WINDOWS-ALPHA-README.md" (Join-Path $payload "WINDOWS-ALPHA-README.md") -Force
+          Copy-Item "WINDOWS-VERIFICATION.md" (Join-Path $payload "WINDOWS-VERIFICATION.md") -Force
 
           $steamDllCandidates = @(
             "steamworks\dist\win64\steam_api64.dll",
@@ -209,7 +209,7 @@ jobs:
 
       - name: Smoke staged Windows payload
         shell: pwsh
-        run: .\scripts\windows-alpha-smoke.ps1 -PayloadDir out\windows-payload
+        run: .\scripts\windows-release-smoke.ps1 -PayloadDir out\windows-payload -ExpectedAppIcon apps\wh3mm-dioxus\assets\modmanager.ico
 
       - name: Create portable zip
         id: zipmeta
@@ -271,6 +271,7 @@ jobs:
           $installerOutFile = Join-Path $installerOutDir "WH3-Mod-Manager-Rust-Installer-$env:RELEASE_TAG.exe"
           $nsisScript = Join-Path $repoRoot "installer\windows\wh3mm-rust-installer.nsi"
           $payloadDir = Join-Path $repoRoot "out\windows-payload"
+          $appIcon = Join-Path $repoRoot "apps\wh3mm-dioxus\assets\modmanager.ico"
 
           New-Item -ItemType Directory -Path $installerOutDir -Force | Out-Null
 
@@ -278,10 +279,11 @@ jobs:
             "/DAPP_VERSION=$env:APP_VERSION" `
             "/DPAYLOAD_DIR=$payloadDir" `
             "/DOUT_FILE=$installerOutFile" `
+            "/DAPP_ICON=$appIcon" `
             $nsisScript
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wh3mm-rust-windows-${{ steps.meta.outputs.tag }}
           path: |
@@ -291,7 +293,7 @@ jobs:
 
       - name: Publish GitHub release assets
         if: ${{ steps.meta.outputs.publish_release == 'true' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           target_commitish: ${{ github.sha }}

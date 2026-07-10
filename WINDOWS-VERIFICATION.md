@@ -1,4 +1,4 @@
-# WH3 Mod Manager Rust: Windows Alpha Verification
+# WH3 Mod Manager: Windows Release Verification
 
 This build is ready for a focused Windows verification pass. Use a disposable
 preset or a mod selection you can reconstruct. Keep Steam running and allow
@@ -12,6 +12,12 @@ Test one distribution first, then the other if the first succeeds:
 2. Start `wh3mm-dioxus.exe`.
 3. Confirm the window title is **WH3 Mod Manager** and no extra native menu bar
    appears above the app UI.
+4. Confirm the TS gear/`III` icon appears in the app header, window/taskbar,
+   executable, installer, and installed shortcuts.
+5. Open **Settings → General** and click **Check now**. Confirm the app reports
+   the latest stable GitHub release without freezing. If a newer version
+   exists, confirm the top-bar **Update** button opens this repository's release
+   page in the default browser.
 
 If Windows SmartScreen appears, record the exact warning. Do not disable
 system-wide security controls.

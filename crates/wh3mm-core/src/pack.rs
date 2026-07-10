@@ -306,7 +306,7 @@ pub fn read_pack_contents_lossy(
 /// Builds a minimal uncompressed WH3 PFH5 pack from supplied packed files.
 ///
 /// The generated shape matches the lightweight generated packs used by this
-/// Rust alpha: byte mask `3`, no dependency index, no reference files, and an
+/// Current app: byte mask `3`, no dependency index, no reference files, and an
 /// uncompressed packed-file index.
 ///
 /// # Errors
