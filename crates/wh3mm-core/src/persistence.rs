@@ -1,7 +1,7 @@
 //! Active mod-list persistence.
 //!
 //! The legacy TypeScript app stores this inside a much larger `config.json`
-//! preset structure. The Rust prototype starts with a narrow equivalent for
+//! preset structure. The Rust application uses a focused equivalent for
 //! restoring discovered mods' enablement and order.
 
 use std::collections::BTreeMap;
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{ModIdentity, ModRecord, merged_source_path_tag};
 use crate::ports::{CoreError, CoreResult};
+use crate::steam::WorkshopMetadataCache;
 
 const CONFIG_VERSION: u32 = 1;
 
@@ -778,6 +779,22 @@ pub fn read_steam_helper_config(path: impl AsRef<Path>) -> CoreResult<SteamHelpe
     })
 }
 
+/// Reads persisted Workshop metadata cache state from JSON.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] when the file cannot be read or decoded.
+pub fn read_workshop_metadata_cache(path: impl AsRef<Path>) -> CoreResult<WorkshopMetadataCache> {
+    let path = path.as_ref();
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        CoreError::parse(format!(
+            "failed to parse Workshop metadata cache {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 /// Writes persisted game-folder state through a temp-file rename.
 ///
 /// # Errors
@@ -825,6 +842,29 @@ pub fn write_steam_helper_config_atomic(
 
     let bytes = serde_json::to_vec_pretty(config).map_err(|error| {
         CoreError::parse(format!("failed to encode Steam helper config: {error}"))
+    })?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, bytes)?;
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+/// Writes persisted Workshop metadata through a temp-file rename.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] when the cache cannot be serialized or written.
+pub fn write_workshop_metadata_cache_atomic(
+    path: impl AsRef<Path>,
+    cache: &WorkshopMetadataCache,
+) -> CoreResult<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(cache).map_err(|error| {
+        CoreError::parse(format!("failed to encode Workshop metadata cache: {error}"))
     })?;
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, bytes)?;
@@ -924,6 +964,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::domain::{ModIdentity, ModRecord, merged_source_path_tag};
+    use crate::steam::{WorkshopMetadataCache, WorkshopModData};
 
     use super::{
         ModListConfig, ModUserConfig, PersistedModState, PersistedModUserState, PresetConfig,
@@ -933,10 +974,11 @@ mod tests {
         capture_steam_helper_config, capture_steam_helper_config_with_backend,
         delete_category_config, delete_preset_config, parse_mod_list_pack_names, preset_names,
         read_game_folder_config, read_mod_list_config, read_mod_user_config, read_preset_config,
-        read_steam_helper_config, remove_mod_category, rename_category_config,
-        set_category_color_config, upsert_preset_config, write_game_folder_config_atomic,
-        write_mod_list_config_atomic, write_mod_user_config_atomic, write_preset_config_atomic,
-        write_steam_helper_config_atomic,
+        read_steam_helper_config, read_workshop_metadata_cache, remove_mod_category,
+        rename_category_config, set_category_color_config, upsert_preset_config,
+        write_game_folder_config_atomic, write_mod_list_config_atomic,
+        write_mod_user_config_atomic, write_preset_config_atomic, write_steam_helper_config_atomic,
+        write_workshop_metadata_cache_atomic,
     };
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1314,10 +1356,37 @@ mod tests {
         fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn workshop_metadata_cache_round_trips_atomically() {
+        let path = temp_config_path("workshop-metadata");
+        let mut cache = WorkshopMetadataCache::default();
+        cache.merge(
+            &[WorkshopModData {
+                workshop_id: "123".to_string(),
+                title: "Cached title".to_string(),
+                author: "Cached author".to_string(),
+                description: "Cached description".to_string(),
+                tags: vec!["Units".to_string()],
+                dependency_ids: vec!["456".to_string()],
+                dependency_id_to_name: vec![("456".to_string(), "Dependency".to_string())],
+                last_changed_ms: 50,
+            }],
+            100,
+        );
+
+        write_workshop_metadata_cache_atomic(&path, &cache).unwrap();
+
+        assert_eq!(read_workshop_metadata_cache(&path).unwrap(), cache);
+        fs::remove_file(path).ok();
+    }
+
     fn mod_record(path: &str, workshop_id: Option<&str>, name: &str, enabled: bool) -> ModRecord {
         ModRecord {
             identity: ModIdentity::new(path, workshop_id, name),
             display_name: name.to_string(),
+            source: crate::domain::ModSource::Local,
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled,
             always_enabled: false,
             hidden: false,

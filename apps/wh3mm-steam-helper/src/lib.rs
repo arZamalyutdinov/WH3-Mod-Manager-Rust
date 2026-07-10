@@ -324,6 +324,10 @@ struct WorkshopItem {
     published_file_id: String,
     #[serde(default)]
     title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
     #[serde(default)]
     owner: WorkshopOwner,
     #[serde(default, deserialize_with = "deserialize_u64_value")]
@@ -951,6 +955,8 @@ fn workshop_item_from_query_result(item: steamworks::QueryResult) -> WorkshopIte
     WorkshopItem {
         published_file_id: item.published_file_id.0.to_string(),
         title: item.title,
+        description: item.description,
+        tags: item.tags,
         owner: WorkshopOwner {
             steam_id64: item.owner.raw().to_string(),
         },

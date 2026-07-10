@@ -3,6 +3,20 @@
 /// Tag prefix used for source pack paths contained inside a generated merged pack.
 pub const MERGED_SOURCE_PATH_TAG_PREFIX: &str = "merged-source-path:";
 
+/// Filesystem source that supplied a discovered mod record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModSource {
+    /// Pack found directly in the game's `data` directory.
+    GameData,
+    /// Pack found in the game's `data/modding` directory.
+    GameDataModding,
+    /// Pack found below Steam Workshop content for WH3.
+    Workshop,
+    /// Pack found in an explicitly selected additional directory.
+    #[default]
+    Local,
+}
+
 /// Supported game identifiers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GameId {
@@ -76,6 +90,12 @@ pub struct ModRecord {
     pub identity: ModIdentity,
     /// User-facing mod name.
     pub display_name: String,
+    /// Filesystem source that supplied this record.
+    pub source: ModSource,
+    /// Readable local PNG/JPEG thumbnail associated with this pack, when found.
+    pub thumbnail_path: Option<String>,
+    /// Local pack modification timestamp in Unix milliseconds, when available.
+    pub local_modified_ms: Option<u64>,
     /// Whether the user explicitly enabled this mod.
     pub enabled: bool,
     /// Whether the mod is forced on by app/game rules.
@@ -167,6 +187,9 @@ mod tests {
         let mod_record = ModRecord {
             identity: ModIdentity::new(r"C:\mods\merged.pack", Option::<String>::None, "merged"),
             display_name: "merged".to_string(),
+            source: super::ModSource::Local,
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled: true,
             always_enabled: false,
             hidden: false,

@@ -1433,38 +1433,41 @@ pub fn discover_wh3_steam_install_from_libraryfolders_vdf(
     discover_wh3_steam_install_from_libraries(&libraries)
 }
 
-/// Discovers the WH3 Steam install from Steam's Windows registry `InstallPath`.
+/// Discovers the WH3 Steam install from Steam's machine- or user-level Windows
+/// registry values.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError`] when the registry cannot be queried, Steam's
-/// `InstallPath` cannot be parsed, or no validated WH3 Steam install is found.
+/// install path cannot be parsed, or no validated WH3 Steam install is found.
 pub fn discover_wh3_steam_install_from_windows_registry() -> CoreResult<Wh3SteamInstall> {
     let steam_root = discover_steam_root_from_windows_registry()?;
     discover_wh3_steam_install_from_steam_root(steam_root)
 }
 
-/// Reads Steam's Windows registry `InstallPath`.
+/// Reads Steam's Windows registry install path.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError`] when called outside Windows, when `reg.exe` fails, or
-/// when the output does not contain an `InstallPath` value.
+/// when the output does not contain an `InstallPath` or `SteamPath` value.
 pub fn discover_steam_root_from_windows_registry() -> CoreResult<PathBuf> {
     discover_steam_root_from_windows_registry_impl()
 }
 
-/// Parses the output of `reg query ... /v InstallPath`.
+/// Parses the output of `reg query` for Steam's `InstallPath` or `SteamPath`.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] when no non-empty `InstallPath` value is present.
+/// Returns [`CoreError`] when no supported non-empty install path is present.
 pub fn parse_steam_install_path_from_reg_query_output(output: &str) -> CoreResult<PathBuf> {
     for line in output.lines() {
         let trimmed = line.trim_start();
-        if !trimmed
-            .get(.."InstallPath".len())
-            .is_some_and(|name| name.eq_ignore_ascii_case("InstallPath"))
+        let Some(value_name) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        if !value_name.eq_ignore_ascii_case("InstallPath")
+            && !value_name.eq_ignore_ascii_case("SteamPath")
         {
             continue;
         }
@@ -1485,7 +1488,7 @@ pub fn parse_steam_install_path_from_reg_query_output(output: &str) -> CoreResul
     }
 
     Err(CoreError::parse(
-        "Windows registry query output did not contain Steam InstallPath",
+        "Windows registry query output did not contain Steam InstallPath or SteamPath",
     ))
 }
 
@@ -1525,25 +1528,43 @@ pub fn parse_steam_libraries_from_libraryfolders_vdf(
 
 #[cfg(windows)]
 fn discover_steam_root_from_windows_registry_impl() -> CoreResult<PathBuf> {
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SOFTWARE\Wow6432Node\Valve\Steam",
-            "/v",
-            "InstallPath",
-        ])
-        .output()
-        .map_err(|error| CoreError::io(format!("failed to query Steam registry key: {error}")))?;
+    let candidates = [
+        (r"HKCU\SOFTWARE\Valve\Steam", "SteamPath"),
+        (r"HKLM\SOFTWARE\Wow6432Node\Valve\Steam", "InstallPath"),
+        (r"HKLM\SOFTWARE\Valve\Steam", "InstallPath"),
+    ];
+    let mut failures = Vec::new();
 
-    if !output.status.success() {
-        return Err(CoreError::io(format!(
-            "Steam registry query failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    for (key, value_name) in candidates {
+        let output = match Command::new("reg")
+            .args(["query", key, "/v", value_name])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                failures.push(format!("{key} {value_name}: {error}"));
+                continue;
+            }
+        };
+        if !output.status.success() {
+            failures.push(format!(
+                "{key} {value_name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            continue;
+        }
+        match parse_steam_install_path_from_reg_query_output(&String::from_utf8_lossy(
+            &output.stdout,
+        )) {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("{key} {value_name}: {}", error.message)),
+        }
     }
 
-    parse_steam_install_path_from_reg_query_output(&String::from_utf8_lossy(&output.stdout))
+    Err(CoreError::io(format!(
+        "Steam registry discovery failed: {}",
+        failures.join("; ")
+    )))
 }
 
 #[cfg(not(windows))]
@@ -2274,6 +2295,8 @@ mod tests {
                 workshop_id: "111".to_string(),
                 title: "Main Mod".to_string(),
                 author: "Mod Author".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
                 dependency_ids: vec!["222".to_string()],
                 dependency_id_to_name: vec![("222".to_string(), "Dependency Mod".to_string())],
                 last_changed_ms: 1_234_000,
@@ -2516,6 +2539,8 @@ esac
                 workshop_id: "111".to_string(),
                 title: "Main Mod".to_string(),
                 author: "Mod Author".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
                 dependency_ids: Vec::new(),
                 dependency_id_to_name: Vec::new(),
                 last_changed_ms: 1_234_000,
@@ -3248,6 +3273,18 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Valve\Steam
     }
 
     #[test]
+    fn parses_steam_user_path_from_windows_reg_query_output() {
+        let output = r#"
+HKEY_CURRENT_USER\SOFTWARE\Valve\Steam
+    SteamPath    REG_SZ    D:\Games\Steam
+"#;
+
+        let steam_root = parse_steam_install_path_from_reg_query_output(output).unwrap();
+
+        assert_eq!(steam_root, std::path::PathBuf::from(r"D:\Games\Steam"));
+    }
+
+    #[test]
     fn rejects_windows_reg_query_output_without_install_path() {
         let output = r#"
 HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Valve\Steam
@@ -3256,7 +3293,7 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Valve\Steam
 
         let error = parse_steam_install_path_from_reg_query_output(output).unwrap_err();
 
-        assert!(error.message.contains("Steam InstallPath"));
+        assert!(error.message.contains("Steam InstallPath or SteamPath"));
     }
 
     #[cfg(not(windows))]
@@ -3754,6 +3791,9 @@ cat "$modfile" > launch-mod-list.txt
                     .unwrap_or("test pack"),
             ),
             display_name: "Test Pack".to_string(),
+            source: wh3mm_core::ModSource::Local,
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled: false,
             always_enabled: false,
             hidden: false,

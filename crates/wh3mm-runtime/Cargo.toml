@@ -1,7 +1,7 @@
 [package]
 name = "wh3mm-runtime"
 version = "0.1.0"
-description = "Filesystem and process adapters for the Rust WH3 Mod Manager migration"
+description = "Filesystem and process adapters for WH3 Mod Manager"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

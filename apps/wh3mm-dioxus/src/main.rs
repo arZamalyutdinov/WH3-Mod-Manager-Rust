@@ -1,38 +1,55 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! First Dioxus desktop shell.
 //!
 //! This app intentionally depends on `wh3mm-core` and `wh3mm-ui` only through
 //! toolkit-neutral models. A future Slint app should be able to render the same
 //! `AppViewModel` without reimplementing domain behavior.
 
+mod components;
+
 use dioxus::prelude::*;
-use serde::Deserialize;
+use dioxus_desktop::{
+    Config as DesktopConfig, WindowBuilder, icon_from_memory,
+    tao::dpi::LogicalSize,
+    use_asset_handler,
+    wry::http::{Response as HttpResponse, StatusCode},
+};
+use futures_channel::oneshot;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wh3mm_core::{
     AppState, CoreCommand, GameId, LegacyTsConfigSnapshot, LegacyTsLaunchOptions,
-    ModDiscoveryOptions, ModIdentity, ModRecord, ModUserConfig, PackConflictReport, PackContents,
-    PackDataOverwrite, PackFileMetadata, PackReadOptions, PreLaunchPackWrite, PresetConfig,
-    SteamWorkshopMetadataAdapter, SteamWorkshopRequestState, SteamWorkshopSafetyConfig,
-    WH3_START_GAME_PACK_NAME, WH3_START_GAME_SOURCE_PACK_NAMES, Wh3StartGamePackOptions,
-    WindowsLaunchOptions, WindowsLaunchPackGroup, WorkshopMetadataFetchStep, WorkshopModData,
-    add_mod_category, analyze_enabled_mod_conflicts, analyze_enabled_mod_conflicts_with_schema,
-    apply_mod_list_config, apply_mod_list_pack_names, apply_mod_user_config, apply_preset_config,
-    build_pack_data_overwrite_pack, build_wh3_start_game_pack_with_battle_permissions,
-    capture_game_folder_config, capture_mod_list_config, capture_mod_user_config,
-    capture_steam_helper_config_with_backend, delete_category_config, delete_preset_config,
-    discover_mods, normalize_workshop_id, parse_mod_list_pack_names, plan_windows_launch,
-    preset_names, read_db_rows_from_pack, read_game_folder_config, read_legacy_ts_config,
-    read_mod_list_config, read_mod_user_config, read_pack_contents_lossy, read_preset_config,
-    read_steam_helper_config, read_wh3_battle_permission_tables_from_packs,
-    read_whmm_flow_pack_summary, remove_mod_category, rename_category_config, resolve_table_schema,
-    set_category_color_config, upsert_preset_config, write_game_folder_config_atomic,
-    write_legacy_ts_config_atomic, write_mod_list_config_atomic, write_mod_user_config_atomic,
-    write_preset_config_atomic, write_steam_helper_config_atomic,
+    ModDiscoveryOptions, ModIdentity, ModRecord, ModSource, ModUserConfig, PackConflictReport,
+    PackContents, PackDataOverwrite, PackFileMetadata, PackReadOptions, PreLaunchPackWrite,
+    PresetConfig, SteamWorkshopMetadataAdapter, SteamWorkshopRequestState,
+    SteamWorkshopSafetyConfig, WH3_START_GAME_PACK_NAME, WH3_START_GAME_SOURCE_PACK_NAMES,
+    Wh3StartGamePackOptions, WindowsLaunchOptions, WindowsLaunchPackGroup, WorkshopMetadataCache,
+    WorkshopMetadataFetchStep, WorkshopModData, add_mod_category, analyze_enabled_mod_conflicts,
+    analyze_enabled_mod_conflicts_with_schema, apply_mod_list_config, apply_mod_list_pack_names,
+    apply_mod_user_config, apply_preset_config, build_pack_data_overwrite_pack,
+    build_wh3_start_game_pack_with_battle_permissions, capture_game_folder_config,
+    capture_mod_list_config, capture_mod_user_config, capture_steam_helper_config_with_backend,
+    delete_category_config, delete_preset_config, discover_mods, normalize_workshop_id,
+    parse_mod_list_pack_names, plan_windows_launch, preset_names, read_db_rows_from_pack,
+    read_game_folder_config, read_legacy_ts_config, read_mod_list_config, read_mod_user_config,
+    read_pack_contents_lossy, read_preset_config, read_steam_helper_config,
+    read_wh3_battle_permission_tables_from_packs, read_whmm_flow_pack_summary,
+    read_workshop_metadata_cache, remove_mod_category, rename_category_config,
+    resolve_table_schema, set_category_color_config, upsert_preset_config,
+    write_game_folder_config_atomic, write_legacy_ts_config_atomic, write_mod_list_config_atomic,
+    write_mod_user_config_atomic, write_preset_config_atomic, write_steam_helper_config_atomic,
+    write_workshop_metadata_cache_atomic,
 };
 use wh3mm_runtime::{
     LaunchPreparationOptions, SteamResubscribeResult, SteamResubscribeSafetyConfig,
@@ -45,11 +62,17 @@ use wh3mm_runtime::{
     spawn_prepared_windows_launch_with_options, validate_wh3_game_folder,
 };
 use wh3mm_ui::{
-    ModRowViewModel, PackViewModel, build_app_view_model, build_db_table_preview_view_model,
+    ModRowViewModel, ModSortColumn, ModSortSpec, PackFlowSummaryViewModel, PackViewModel,
+    build_app_view_model, build_db_table_preview_view_model, build_mod_archive_rows,
     build_pack_contents_view_model, build_pack_flow_summary_view_model,
 };
 
+use components::{
+    ArchiveSortButton, ArchiveThumbnail, COMPONENT_CSS, DetailThumbnail, DrawerBackdrop,
+};
+
 const MAX_TABLE_PREVIEW_ROWS: usize = 25;
+const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/modmanager.ico");
 const APP_CONFIG_DIR_NAME: &str = "WH3 Mod Manager Rust";
 const APP_CONFIG_DIR_ENV: &str = "WH3MM_CONFIG_DIR";
 const GAME_FOLDER_CONFIG_FILE: &str = "wh3mm_game_folder.json";
@@ -57,8 +80,11 @@ const MOD_STATE_CONFIG_FILE: &str = "wh3mm_mod_state.json";
 const MOD_USER_CONFIG_FILE: &str = "wh3mm_mod_user_config.json";
 const PRESET_CONFIG_FILE: &str = "wh3mm_presets.json";
 const STEAM_HELPER_CONFIG_FILE: &str = "wh3mm_steam_helper.json";
+const WORKSHOP_METADATA_CACHE_FILE: &str = "wh3mm_workshop_metadata.json";
+const UI_PREFERENCES_FILE: &str = "wh3mm_ui_preferences.json";
 const DIAGNOSTICS_DIR_NAME: &str = "diagnostics";
 const APP_DIAGNOSTIC_LOG_FILE: &str = "wh3mm-dioxus.log";
+const PANIC_DIAGNOSTIC_LOG_FILE: &str = "wh3mm-crash.log";
 const STEAM_HELPER_COMMAND_LOG_FILE: &str = "wh3mm-steam-helper-commands.jsonl";
 const LEGACY_TS_GAME_KEY: &str = "wh3";
 const ON_LAST_GAME_LAUNCH_PRESET_NAME: &str = "On Last Game Launch";
@@ -66,7 +92,84 @@ const STEAM_HELPER_BACKEND_ENV: &str = "WH3MM_STEAM_HELPER_BACKEND";
 const STEAM_HELPER_COMMAND_LOG_ENV: &str = "WH3MM_STEAM_HELPER_COMMAND_LOG";
 const STEAM_HELPER_BACKEND_NATIVE: &str = "native";
 const STEAM_HELPER_BACKEND_FIXTURE: &str = "fixture";
+const PACKAGED_HELP_FILE: &str = "WINDOWS-VERIFICATION.md";
 const CLOSE_ON_PLAY_DELAY_SECS: u64 = 5;
+const WORKSHOP_METADATA_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/arZamalyutdinov/WH3-Mod-Manager-Rust/releases/latest";
+const RELEASE_TAG_BASE_URL: &str =
+    "https://github.com/arZamalyutdinov/WH3-Mod-Manager-Rust/releases/tag";
+const UPDATE_CHECK_CONNECT_TIMEOUT_SECS: u64 = 4;
+const UPDATE_CHECK_TIMEOUT_SECS: u64 = 8;
+const RESPONSIVE_SHELL_CSS: &str = r#"
+.app-shell-grid { min-width: 0; overflow-x: hidden; }
+.workspace-content { min-width: 0; overflow-x: hidden; }
+.responsive-nav-toggle { display: none !important; }
+.drawer-backdrop { display: none; }
+@media (max-width: 1279px) {
+  .app-shell-grid {
+    grid-template-columns: minmax(220px, 252px) minmax(0, 1fr) !important;
+    grid-template-areas: "library content" !important;
+  }
+  .responsive-tools-toggle { display: inline-grid !important; }
+  .tools-rail {
+    position: fixed !important;
+    top: 66px;
+    right: 0;
+    bottom: 0;
+    z-index: 45;
+    width: min(340px, 90vw);
+    box-sizing: border-box;
+    transform: translateX(102%);
+    transition: transform 150ms ease-out;
+    box-shadow: -18px 0 36px rgba(0, 0, 0, 0.34);
+  }
+  .tools-rail.drawer-open { transform: translateX(0); }
+  .drawer-backdrop.drawer-visible {
+    display: block;
+    position: fixed;
+    inset: 66px 0 0;
+    z-index: 40;
+    border: 0;
+    background: rgba(3, 6, 10, 0.54);
+  }
+}
+@media (max-width: 959px) {
+  .app-shell-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-areas: "content" !important;
+  }
+  .responsive-library-toggle { display: inline-grid !important; }
+  .library-rail {
+    position: fixed !important;
+    top: 66px;
+    left: 0;
+    bottom: 0;
+    z-index: 45;
+    width: min(280px, 88vw);
+    box-sizing: border-box;
+    transform: translateX(-102%);
+    transition: transform 150ms ease-out;
+    box-shadow: 18px 0 36px rgba(0, 0, 0, 0.34);
+  }
+  .library-rail.drawer-open { transform: translateX(0); }
+}
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct UiPreferences {
+    version: u32,
+    mod_sort: ModSortSpec,
+}
+
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            mod_sort: ModSortSpec::default(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LaunchPreview {
@@ -115,6 +218,28 @@ struct SteamRefreshResult {
     missing_metadata_count: usize,
     filtered_unsubscribed_count: usize,
     renamed_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateCheckState {
+    NotChecked,
+    Checking,
+    Current {
+        latest_version: String,
+    },
+    Available {
+        version: String,
+        release_url: String,
+    },
+    NoPublishedRelease,
+    Failed(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubLatestRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,20 +309,20 @@ struct SteamRuntimeRedistributableStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AlphaReadinessReport {
+struct ReadinessReport {
     summary: String,
-    rows: Vec<AlphaReadinessRow>,
+    rows: Vec<ReadinessRow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AlphaReadinessRow {
+struct ReadinessRow {
     label: String,
-    status: AlphaReadinessStatus,
+    status: ReadinessStatus,
     detail: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum AlphaReadinessStatus {
+enum ReadinessStatus {
     Ready,
     Warning,
     Error,
@@ -211,7 +336,7 @@ struct DiagnosticSnapshotInput<'a> {
     launch_options: &'a LaunchOptionState,
     launch_save_name: &'a str,
     status_message: Option<&'a str>,
-    readiness: &'a AlphaReadinessReport,
+    readiness: &'a ReadinessReport,
     launch_preview: Option<&'a LaunchPreview>,
     last_steam_command: Option<&'a SteamCommandPanelState>,
 }
@@ -226,27 +351,26 @@ enum ModListFilter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolPanelTab {
-    Overview,
-    Launch,
-    Steam,
-    Workshop,
-    Checks,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LibraryToolTab {
-    None,
-    Presets,
-    Categories,
-    Config,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspacePage {
     Mods,
     ModDetail,
+    Categories,
+    Collections,
+    Compatibility,
+    DbViewer,
+    Skills,
+    Checks,
+    Steam,
+    Workshop,
     Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsFocus {
+    General,
+    GamePaths,
+    Launch,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,11 +379,66 @@ enum LibraryNavTarget {
     Enabled,
     Categories,
     Collections,
-    Settings,
 }
 
 fn main() {
-    dioxus::launch(App);
+    install_panic_diagnostic_hook();
+    let _ = append_app_diagnostic_log_event("application started");
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(desktop_config())
+        .launch(App);
+}
+
+fn desktop_config() -> DesktopConfig {
+    let config = DesktopConfig::new()
+        .with_window(
+            WindowBuilder::new()
+                .with_title(desktop_window_title())
+                .with_inner_size(LogicalSize::new(1600.0, 1000.0))
+                .with_min_inner_size(LogicalSize::new(1180.0, 760.0)),
+        )
+        .with_menu(None);
+
+    match desktop_app_icon() {
+        Some(icon) => config.with_icon(icon),
+        None => config,
+    }
+}
+
+fn desktop_app_icon() -> Option<dioxus_desktop::tao::window::Icon> {
+    #[cfg(target_os = "windows")]
+    {
+        use dioxus_desktop::tao::platform::windows::IconExtWindows;
+
+        if let Ok(icon) = dioxus_desktop::tao::window::Icon::from_resource(1, None) {
+            return Some(icon);
+        }
+    }
+
+    icon_from_memory(APP_ICON_BYTES).ok()
+}
+
+fn desktop_window_title() -> &'static str {
+    "WH3 Mod Manager"
+}
+
+fn initial_workspace_page() -> WorkspacePage {
+    if env::args().nth(1).is_some() {
+        WorkspacePage::DbViewer
+    } else {
+        WorkspacePage::Mods
+    }
+}
+
+#[cfg(test)]
+fn default_tool_workspace_pages() -> [WorkspacePage; 5] {
+    [
+        WorkspacePage::Compatibility,
+        WorkspacePage::Settings,
+        WorkspacePage::ModDetail,
+        WorkspacePage::DbViewer,
+        WorkspacePage::Skills,
+    ]
 }
 
 #[component]
@@ -268,7 +447,7 @@ fn App() -> Element {
     let mut pack_selection = use_signal(selected_pack_from_args);
     let mut mod_status = use_signal(|| None::<String>);
     let mut game_folder = use_signal(load_saved_game_folder);
-    let mut preset_name = use_signal(|| "Prototype preset".to_string());
+    let mut preset_name = use_signal(|| "Default".to_string());
     let mut saved_presets = use_signal(load_preset_names);
     let mut category_name = use_signal(|| "Core".to_string());
     let mut selected_category_name = use_signal(|| "Core".to_string());
@@ -277,21 +456,40 @@ fn App() -> Element {
     let mut show_hidden = use_signal(|| false);
     let mut mod_search = use_signal(String::new);
     let mut mod_list_filter = use_signal(|| ModListFilter::All);
-    let mut tool_panel_tab = use_signal(|| ToolPanelTab::Overview);
-    let mut library_tool_tab = use_signal(|| LibraryToolTab::None);
-    let mut workspace_page = use_signal(|| WorkspacePage::Mods);
+    let mut mod_sort = use_signal(load_ui_sort_preference);
+    let mut archive_filters_expanded = use_signal(|| false);
+    let mut archive_actions_expanded = use_signal(|| false);
+    let mut workspace_page = use_signal(initial_workspace_page);
+    let mut settings_focus = use_signal(|| SettingsFocus::General);
+    let mut tools_more_expanded = use_signal(|| false);
+    let mut tools_drawer_open = use_signal(|| false);
+    let mut library_drawer_open = use_signal(|| false);
     let mut selected_mod_key = use_signal(|| None::<String>);
-    let mut conflict_report = use_signal(|| None::<PackConflictReport>);
+    let conflict_report = use_signal(|| None::<PackConflictReport>);
+    let compatibility_operation = use_signal(|| None::<String>);
     let mut launch_preview = use_signal(|| None::<LaunchPreview>);
     let mut launch_options = use_signal(LaunchOptionState::default);
     let mut launch_save_name = use_signal(String::new);
     let mut steam_helper_path = use_signal(load_saved_steam_helper_path);
     let mut steam_helper_backend = use_signal(load_saved_steam_helper_backend);
     let mut steam_command_ids = use_signal(String::new);
-    let mut steam_metadata = use_signal(Vec::<WorkshopModData>::new);
+    let mut workshop_metadata_cache = use_signal(load_workshop_metadata_cache_or_default);
+    let mut steam_metadata = use_signal(load_cached_workshop_metadata);
     let mut subscribed_workshop_ids = use_signal(Vec::<String>::new);
     let mut last_steam_command = use_signal(|| None::<SteamCommandPanelState>);
+    let mut steam_operation = use_signal(|| None::<String>);
+    let mut last_auto_metadata_request = use_signal(|| None::<String>);
     let mut last_logged_mod_status = use_signal(|| None::<String>);
+    let update_check_state = use_signal(|| UpdateCheckState::NotChecked);
+
+    use_asset_handler("app-icon", move |request, responder| {
+        responder.respond(app_icon_http_response(request.uri().path()));
+    });
+
+    use_asset_handler("mod-thumbnail", move |request, responder| {
+        let response = thumbnail_asset_http_response(&app_state.read().mods, request.uri().path());
+        responder.respond(response);
+    });
 
     use_effect(move || {
         let status = mod_status.read().clone();
@@ -307,16 +505,94 @@ fn App() -> Element {
         }
     });
 
+    use_effect(move || {
+        let _ = *workspace_page.read();
+        tools_drawer_open.set(false);
+        library_drawer_open.set(false);
+    });
+
+    use_effect(move || {
+        if *update_check_state.read() == UpdateCheckState::NotChecked {
+            start_release_update_check(update_check_state, mod_status, false);
+        }
+    });
+
+    use_effect(move || {
+        let workshop_ids = workshop_ids_from_mods(&app_state.read().mods);
+        if workshop_ids.is_empty() {
+            return;
+        }
+
+        let now_ms = current_unix_ms();
+        let ids_needing_refresh = workshop_metadata_cache.read().ids_needing_refresh(
+            &workshop_ids,
+            now_ms,
+            WORKSHOP_METADATA_CACHE_TTL_MS,
+        );
+        if ids_needing_refresh.is_empty() || steam_operation.read().is_some() {
+            return;
+        }
+
+        let helper_path = steam_helper_path.read().trim().to_string();
+        if validate_steam_helper_path(Path::new(&helper_path)).is_err() {
+            return;
+        }
+        let backend = steam_helper_backend.read().clone();
+        let request_key = format!("{helper_path}|{backend}|{}", ids_needing_refresh.join(","));
+        if last_auto_metadata_request.read().as_deref() == Some(request_key.as_str()) {
+            return;
+        }
+        last_auto_metadata_request.set(Some(request_key));
+        steam_operation.set(Some("Refreshing stale Workshop metadata".to_string()));
+
+        let receiver = run_in_background(move || {
+            fetch_metadata_from_helper(&ids_needing_refresh, Path::new(&helper_path), &backend)
+        });
+        spawn(async move {
+            match receiver.await {
+                Ok(Ok(result)) => {
+                    let mut cache = workshop_metadata_cache.read().clone();
+                    cache.merge(&result.metadata, current_unix_ms());
+                    cache.retain_ids(&workshop_ids);
+                    match write_workshop_metadata_cache_atomic(
+                        workshop_metadata_cache_path(),
+                        &cache,
+                    ) {
+                        Ok(()) => {
+                            steam_metadata.set(cache.metadata_for_ids(&workshop_ids));
+                            workshop_metadata_cache.set(cache);
+                            mod_status.set(Some(format!(
+                                "Updated {} Workshop metadata record{} in the background.",
+                                result.metadata.len(),
+                                plural_suffix(result.metadata.len())
+                            )));
+                        }
+                        Err(error) => mod_status.set(Some(format!(
+                            "Workshop metadata refreshed but could not be cached: {}",
+                            error.message
+                        ))),
+                    }
+                }
+                Ok(Err(error)) => mod_status.set(Some(format!(
+                    "Automatic Workshop metadata refresh was skipped: {error}"
+                ))),
+                Err(_) => mod_status.set(Some(
+                    "Automatic Workshop metadata refresh ended unexpectedly.".to_string(),
+                )),
+            }
+            steam_operation.set(None);
+        });
+    });
+
     let mut view_model = build_app_view_model(&app_state.read());
+    view_model.mods =
+        build_mod_archive_rows(&app_state.read(), &steam_metadata.read(), *mod_sort.read());
     let (selected_pack, status_message) = pack_selection.read().clone();
     view_model.selected_pack = selected_pack;
     view_model.status_message =
         combined_status(mod_status.read().as_deref(), status_message.as_deref());
     let all_mod_rows = view_model.mods.clone();
     let current_mod_filter = *mod_list_filter.read();
-    let current_mod_filter_label = mod_list_filter_label(current_mod_filter);
-    let current_tool_panel = *tool_panel_tab.read();
-    let current_library_tool = *library_tool_tab.read();
     let current_workspace_page = *workspace_page.read();
     let visible_rows = all_mod_rows
         .iter()
@@ -327,6 +603,13 @@ fn App() -> Element {
         .cloned()
         .collect::<Vec<_>>();
     let mod_search_query = mod_search.read().trim().to_ascii_lowercase();
+    let archive_filter_count = usize::from(current_mod_filter != ModListFilter::All)
+        + usize::from(!mod_search_query.is_empty());
+    let current_settings_focus = *settings_focus.read();
+    let current_update_check_state = update_check_state.read().clone();
+    let steam_operation_in_progress = steam_operation.read().is_some();
+    let current_compatibility_operation = compatibility_operation.read().clone();
+    let compatibility_operation_in_progress = current_compatibility_operation.is_some();
     let filtered_mods = if mod_search_query.is_empty() {
         visible_rows
     } else {
@@ -336,10 +619,29 @@ fn App() -> Element {
             .cloned()
             .collect::<Vec<_>>()
     };
-    let filtered_mod_count = filtered_mods.len();
+    let explicitly_selected_mod_key = selected_mod_key.read().clone().filter(|key| {
+        filtered_mods
+            .iter()
+            .any(|mod_row| mod_row.key.as_str() == key.as_str())
+    });
     let selected_mod =
-        selected_or_first_mod_row(&filtered_mods, selected_mod_key.read().as_deref());
+        selected_or_first_mod_row(&filtered_mods, explicitly_selected_mod_key.as_deref());
     let active_mod_key = selected_mod.as_ref().map(|mod_row| mod_row.key.clone());
+    let selected_mod_position = selected_mod_position_label(
+        &filtered_mods,
+        active_mod_key.as_deref(),
+        explicitly_selected_mod_key.is_some(),
+    );
+    let previous_mod_key = selected_mod_neighbor_key(&filtered_mods, active_mod_key.as_deref(), -1);
+    let next_mod_key = selected_mod_neighbor_key(&filtered_mods, active_mod_key.as_deref(), 1);
+    let has_selected_mod = selected_mod.is_some();
+    let has_explicitly_selected_mod = explicitly_selected_mod_key.is_some();
+    let mod_settings_action_disabled = mod_settings_action_disabled(has_selected_mod);
+    let mod_settings_action_title = mod_settings_action_title(
+        all_mod_rows.len(),
+        has_selected_mod,
+        has_explicitly_selected_mod,
+    );
     let current_launch_options = launch_options.read().clone();
     let current_launch_save_name = launch_save_name.read().clone();
     let current_launch_fingerprint = launch_state_fingerprint(
@@ -347,10 +649,6 @@ fn App() -> Element {
         &current_launch_options,
         &current_launch_save_name,
     );
-    let visible_mod_count = all_mod_rows
-        .iter()
-        .filter(|mod_row| !mod_row.hidden)
-        .count();
     let enabled_mod_count = all_mod_rows
         .iter()
         .filter(|mod_row| mod_row.enabled)
@@ -368,98 +666,200 @@ fn App() -> Element {
         .iter()
         .filter(|mod_record| mod_record.effectively_enabled())
         .count();
-    let current_game_folder_label = game_folder
-        .read()
+    let selected_game_folder = game_folder.read().clone();
+    let current_game_folder_label = selected_game_folder
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No WH3 folder selected".to_string());
-    let readiness_game_folder = game_folder.read().clone();
+    let current_game_executable_label =
+        settings_game_executable_label(selected_game_folder.as_deref());
+    let current_game_data_label = settings_game_data_label(selected_game_folder.as_deref());
+    let readiness_game_folder = selected_game_folder.clone();
     let readiness_helper_path = steam_helper_path.read().clone();
-    let alpha_readiness = build_alpha_readiness_report(
+    let readiness = build_readiness_report(
         readiness_game_folder.as_deref(),
         readiness_helper_path.trim(),
     );
-    let alpha_readiness_summary = alpha_readiness.summary.clone();
+    let readiness_summary = readiness.summary.clone();
     let saved_category_count = saved_categories.read().len();
     let saved_preset_count = saved_presets.read().len();
+    let category_summaries = saved_categories
+        .read()
+        .iter()
+        .map(|category| {
+            let assigned_count = all_mod_rows
+                .iter()
+                .filter(|mod_row| mod_row.categories.iter().any(|name| name == category))
+                .count();
+            (category.clone(), assigned_count)
+        })
+        .collect::<Vec<_>>();
+    let preset_summaries = saved_presets.read().clone();
     let current_steam_metadata = steam_metadata.read().clone();
     let current_time_ms = current_unix_ms();
     let diagnostics_log_path_label = app_diagnostic_log_path().display().to_string();
+    let panic_log_path_label = panic_diagnostic_log_path().display().to_string();
     let steam_command_log_path_label = steam_helper_command_log_path().display().to_string();
 
     rsx! {
+        style { dangerous_inner_html: RESPONSIVE_SHELL_CSS }
+        style { dangerous_inner_html: COMPONENT_CSS }
         main {
-            style: "height: 100vh; min-height: 0; background: #101018; color: #f2f5f2; font-family: Inter, ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden;",
+            class: "app-root",
+            style: "height: 100vh; min-height: 0; background: #0f1218; color: #f2f5f2; font-family: Inter, ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden;",
             header {
-                style: "height: 64px; border-bottom: 1px solid #262838; background: #11111a; display: grid; grid-template-columns: minmax(220px, auto) minmax(300px, 520px) minmax(180px, 1fr); align-items: center; gap: 16px; padding: 8px 18px; flex-shrink: 0;",
+                style: top_shell_header_style(),
                 div {
-                    style: "min-width: 0; display: grid; gap: 2px;",
-                    h1 {
-                        style: "font-size: 22px; line-height: 27px; margin: 0; color: #65f58b; letter-spacing: 0; white-space: nowrap; text-transform: uppercase;",
-                        "{app_brand_title()}"
+                    style: "min-width: 0; display: flex; align-items: center; gap: 10px;",
+                    img {
+                        src: "/app-icon/modmanager.ico",
+                        alt: "",
+                        aria_hidden: "true",
+                        width: "32",
+                        height: "32",
+                        style: "width: 32px; height: 32px; flex: 0 0 32px; object-fit: contain;"
                     }
                     div {
-                        style: "font-size: 11px; line-height: 14px; color: #94a89b; text-transform: uppercase;",
-                        "{app_brand_subtitle(&view_model.title)}"
+                        style: "min-width: 0; display: grid; gap: 2px;",
+                        h1 {
+                            style: top_brand_title_style(),
+                            "{app_brand_title()}"
+                        }
+                        div {
+                            style: "font-size: 11px; line-height: 14px; color: #94a89b; text-transform: uppercase;",
+                            "{app_brand_subtitle(&view_model.title)}"
+                        }
                     }
                 }
                 div {
-                    style: "min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid #35374a; background: #242531; border-radius: 5px; padding: 0 10px;",
-                    span {
-                        style: "font-size: 13px; color: #7d8ea3;",
-                        "Search"
+                    style: top_search_style(),
+                    svg {
+                        view_box: "0 0 24 24",
+                        width: "18",
+                        height: "18",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        circle { cx: "11", cy: "11", r: "7" }
+                        path { d: "m20 20-3.4-3.4" }
                     }
                     input {
                         style: "width: 100%; min-width: 0; height: 38px; border: 0; outline: 0; background: transparent; color: #edf2f7; font-size: 14px;",
                         value: "{mod_search}",
-                        placeholder: "Name, pack path, tag, category",
+                        placeholder: "Search mods...",
+                        onfocus: move |_| {
+                            if top_search_should_route_to_mods(current_workspace_page) {
+                                workspace_page.set(WorkspacePage::Mods);
+                            }
+                        },
                         oninput: move |event| {
                             mod_search.set(event.value());
                         },
                     }
                 }
                 div {
-                    style: "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 10px; color: #9fb0c0; font-size: 12px; white-space: nowrap;",
-                    span { "{filtered_mod_count} shown" }
-                    span { "{launch_enabled_mod_count} enabled" }
-                    span { "{hidden_mod_count} hidden" }
+                    style: top_actions_style(),
+                    if let UpdateCheckState::Available { version, release_url } = current_update_check_state.clone() {
+                        button {
+                            title: "Open WH3 Mod Manager v{version} on GitHub",
+                            aria_label: "Update WH3 Mod Manager to version {version}",
+                            style: top_update_button_style(),
+                            onclick: move |_| {
+                                match open_release_update(&release_url) {
+                                    Ok(status) => mod_status.set(Some(status)),
+                                    Err(error) => mod_status.set(Some(error)),
+                                }
+                            },
+                            svg {
+                                view_box: "0 0 24 24", width: "17", height: "17",
+                                fill: "none", stroke: "currentColor", stroke_width: "2",
+                                path { d: "M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" }
+                            }
+                            span { "Update v{version}" }
+                        }
+                    }
                     button {
-                        title: "Alpha readiness: {alpha_readiness_summary}",
-                        style: top_icon_button_style(current_tool_panel == ToolPanelTab::Checks),
+                        class: "responsive-nav-toggle responsive-library-toggle",
+                        title: "Open library navigation",
+                        aria_label: "Open library navigation",
+                        style: top_icon_button_style(*library_drawer_open.read()),
                         onclick: move |_| {
-                            tool_panel_tab.set(toggle_tool_panel(
-                                current_tool_panel,
-                                ToolPanelTab::Checks,
-                            ));
+                            let open = *library_drawer_open.read();
+                            library_drawer_open.set(!open);
+                            tools_drawer_open.set(false);
                         },
-                        "!"
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "M4 6h16M4 12h16M4 18h16" }
+                        }
+                    }
+                    button {
+                        title: "System readiness: {readiness_summary}",
+                        aria_label: "Open readiness checks",
+                        style: top_icon_button_style(current_workspace_page == WorkspacePage::Checks),
+                        onclick: move |_| {
+                            workspace_page.set(WorkspacePage::Checks);
+                        },
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" }
+                            path { d: "M10 21h4" }
+                        }
                     }
                     button {
                         title: "Workshop commands",
-                        style: top_icon_button_style(current_tool_panel == ToolPanelTab::Workshop),
+                        aria_label: "Open Workshop commands",
+                        style: top_icon_button_style(current_workspace_page == WorkspacePage::Workshop),
                         onclick: move |_| {
-                            tool_panel_tab.set(toggle_tool_panel(
-                                current_tool_panel,
-                                ToolPanelTab::Workshop,
-                            ));
+                            workspace_page.set(WorkspacePage::Workshop);
                         },
-                        "DL"
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" }
+                        }
                     }
                     button {
                         title: "Settings",
-                        style: top_icon_button_style(current_workspace_page == WorkspacePage::Settings),
+                        aria_label: "Open settings",
+                        style: top_icon_button_style(settings_workspace_active(current_workspace_page)),
                         onclick: move |_| {
+                            settings_focus.set(SettingsFocus::General);
                             workspace_page.set(WorkspacePage::Settings);
-                            library_tool_tab.set(LibraryToolTab::Config);
                         },
-                        "SET"
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            circle { cx: "12", cy: "12", r: "3" }
+                            path { d: "M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.1 2.1-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V20h-3v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L6.6 17l.1-.1A1.7 1.7 0 0 0 7 15a1.7 1.7 0 0 0-1.6-1H5v-3h.4A1.7 1.7 0 0 0 7 10a1.7 1.7 0 0 0-.3-1.9L6.6 8l2.1-2.1.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V4h3v.7a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.4v3H21a1.7 1.7 0 0 0-1.6 1Z" }
+                        }
+                    }
+                    button {
+                        class: "responsive-nav-toggle responsive-tools-toggle",
+                        title: "Open Play and Tools",
+                        aria_label: "Open Play and Tools",
+                        style: top_icon_button_style(*tools_drawer_open.read()),
+                        onclick: move |_| {
+                            let open = *tools_drawer_open.read();
+                            tools_drawer_open.set(!open);
+                            library_drawer_open.set(false);
+                        },
+                        svg {
+                            view_box: "0 0 24 24", width: "19", height: "19",
+                            fill: "none", stroke: "currentColor", stroke_width: "2",
+                            path { d: "m9 18 6-6-6-6" }
+                        }
                     }
                 }
             }
             div {
-                style: "flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 360px); grid-template-areas: \"library content tools\"; overflow: hidden;",
+                class: "app-shell-grid",
+                style: "flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(220px, 252px) minmax(0, 1fr) minmax(288px, 340px); grid-template-areas: \"library content tools\"; overflow: hidden;",
                 aside {
-                    style: "grid-area: library; min-width: 0; border-right: 1px solid #2b2d3a; background: #1a1b25; padding: 20px 14px; overflow-y: auto; display: flex; flex-direction: column;",
+                    class: if *library_drawer_open.read() { "library-rail drawer-open" } else { "library-rail" },
+                    style: "grid-area: library; min-width: 0; border-right: 1px solid #263041; background: #171b24; padding: 20px 14px; overflow-y: auto; display: flex; flex-direction: column;",
                     div {
                         style: "display: grid; gap: 4px; margin-bottom: 18px;",
                         h2 {
@@ -468,7 +868,7 @@ fn App() -> Element {
                         }
                         div {
                             style: "font-size: 11px; line-height: 15px; color: #9fb0a3; text-transform: uppercase;",
-                            "Windows alpha"
+                            "Windows"
                         }
                     }
                     nav {
@@ -478,696 +878,179 @@ fn App() -> Element {
                                 LibraryNavTarget::AllMods,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Mods);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "ALL" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::AllMods,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_dot_style(), "" }
+                            }
                             span { "All mods" }
-                            strong { "{total_mod_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::AllMods,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{total_mod_count}"
+                            }
                         }
                         button {
                             style: nav_button_style(library_nav_active(
                                 LibraryNavTarget::Enabled,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
                                 workspace_page.set(WorkspacePage::Mods);
                                 mod_list_filter.set(ModListFilter::Enabled);
-                                library_tool_tab.set(LibraryToolTab::None);
                             },
-                            span { style: nav_badge_style(), "ON" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::Enabled,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_line_style(), "" }
+                            }
                             span { "Enabled" }
-                            strong { "{enabled_mod_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::Enabled,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{enabled_mod_count}"
+                            }
                         }
                         button {
                             style: nav_button_style(library_nav_active(
                                 LibraryNavTarget::Categories,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Mods);
+                                workspace_page.set(WorkspacePage::Categories);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::Categories);
                             },
-                            span { style: nav_badge_style(), "CAT" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::Categories,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_dot_style(), "" }
+                                span { style: nav_icon_line_style(), "" }
+                            }
                             span { "Categories" }
-                            strong { "{saved_category_count}" }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::Categories,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{saved_category_count}"
+                            }
                         }
                         button {
                             style: nav_button_style(library_nav_active(
                                 LibraryNavTarget::Collections,
                                 current_workspace_page,
                                 current_mod_filter,
-                                current_library_tool,
                             )),
                             onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Mods);
+                                workspace_page.set(WorkspacePage::Collections);
                                 mod_list_filter.set(ModListFilter::All);
-                                library_tool_tab.set(LibraryToolTab::Presets);
                             },
-                            span { style: nav_badge_style(), "COL" }
+                            span {
+                                style: nav_icon_tile_style(library_nav_active(
+                                    LibraryNavTarget::Collections,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                span { style: nav_icon_stack_style(), "" }
+                            }
                             span { "Collections" }
-                            strong { "{saved_preset_count}" }
-                        }
-                        button {
-                            style: nav_button_style(library_nav_active(
-                                LibraryNavTarget::Settings,
-                                current_workspace_page,
-                                current_mod_filter,
-                                current_library_tool,
-                            )),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
-                            },
-                            span { style: nav_badge_style(), "SET" }
-                            span { "Settings" }
-                            strong { "" }
-                        }
-                    }
-                    if current_workspace_page == WorkspacePage::Mods {
-                    div {
-                        style: "display: grid; gap: 6px; margin-bottom: 18px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Game folder"
-                        }
-                        div {
-                            style: "font-size: 12px; line-height: 17px; color: #cbd8cc; overflow-wrap: anywhere;",
-                            "{current_game_folder_label}"
-                        }
-                    }
-                    button {
-                        style: "width: 100%; border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px; margin: -8px 0 18px;",
-                        onclick: move |_| {
-                            if let Some(selected_game_folder) = pick_game_folder() {
-                                match save_game_folder(&selected_game_folder) {
-                                    Ok(status) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
-                                }
-                            }
-                        },
-                        "Set game folder"
-                    }
-                    if current_library_tool == LibraryToolTab::Presets {
-                    section {
-                        style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Preset"
-                        }
-                        input {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{preset_name}",
-                            placeholder: "Preset name",
-                            oninput: move |event| {
-                                preset_name.set(event.value());
-                            },
-                        }
-                        select {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{preset_name}",
-                            onchange: move |event| {
-                                let value = event.value();
-                                if !value.trim().is_empty() {
-                                    preset_name.set(value);
-                                }
-                            },
-                            option {
-                                value: "",
-                                "Presets"
-                            }
-                            for saved_preset in saved_presets.read().iter() {
-                                option {
-                                    value: "{saved_preset}",
-                                    "{saved_preset}"
-                                }
+                            span {
+                                style: nav_count_chip_style(library_nav_active(
+                                    LibraryNavTarget::Collections,
+                                    current_workspace_page,
+                                    current_mod_filter,
+                                )),
+                                "{saved_preset_count}"
                             }
                         }
-                        div {
-                            style: "display: grid; grid-template-columns: 1fr 1fr; gap: 6px;",
+                        if library_settings_nav_visible(current_workspace_page) {
                             button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
+                                style: nav_button_style(true),
                                 onclick: move |_| {
-                                    let name = preset_name.read().trim().to_string();
-                                    let state = app_state.read().clone();
-                                    match save_named_preset(&name, &state) {
-                                        Ok(status) => {
-                                            saved_presets.set(load_preset_names());
-                                            mod_status.set(Some(status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not save preset: {}", error.message))),
-                                    }
+                                    settings_focus.set(SettingsFocus::General);
+                                    workspace_page.set(WorkspacePage::Settings);
                                 },
-                                "Save"
-                            }
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let name = preset_name.read().trim().to_string();
-                                    let state = app_state.read().clone();
-                                    match load_named_preset(&name, &state) {
-                                        Ok((mods, status)) => {
-                                            let mut next_state = state.clone();
-                                            let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                            match save_mod_state(&next_state) {
-                                                Ok(save_status) => mod_status.set(Some(format!("{status} {save_status}"))),
-                                                Err(error) => mod_status.set(Some(format!("{status} Could not save mod state: {}", error.message))),
-                                            }
-                                            app_state.set(next_state);
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not load preset: {}", error.message))),
-                                    }
-                                },
-                                "Load"
-                            }
-                        }
-                        button {
-                            style: "border: 1px solid #7f1d1d; background: #451a1a; color: #fecaca; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                let name = preset_name.read().trim().to_string();
-                                match delete_named_preset(&name) {
-                                    Ok(status) => {
-                                        let names = load_preset_names();
-                                        let next_name = if names.iter().any(|saved_name| saved_name == &name) {
-                                            name
-                                        } else {
-                                            names.first().cloned().unwrap_or_else(|| "Prototype preset".to_string())
-                                        };
-                                        preset_name.set(next_name);
-                                        saved_presets.set(names);
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not delete preset: {}", error.message))),
+                                span {
+                                    style: nav_icon_tile_style(true),
+                                    span { style: nav_icon_ring_style(), "" }
                                 }
-                            },
-                            "Delete preset"
-                        }
-                    }
-                    }
-                    if current_library_tool == LibraryToolTab::Categories {
-                    section {
-                        style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Category"
-                        }
-                        input {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{category_name}",
-                            placeholder: "Category",
-                            oninput: move |event| {
-                                category_name.set(event.value());
-                            },
-                        }
-                        select {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{selected_category_name}",
-                            onchange: move |event| {
-                                let value = event.value();
-                                if !value.trim().is_empty() {
-                                    selected_category_name.set(value.clone());
-                                    category_name.set(value);
-                                }
-                            },
-                            option {
-                                value: "",
-                                "Categories"
-                            }
-                            for saved_category in saved_categories.read().iter() {
-                                option {
-                                    value: "{saved_category}",
-                                    "{saved_category}"
-                                }
-                            }
-                        }
-                        select {
-                            style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            value: "{category_color}",
-                            onchange: move |event| {
-                                category_color.set(event.value());
-                            },
-                            option { value: "blue", "Blue" }
-                            option { value: "green", "Green" }
-                            option { value: "yellow", "Yellow" }
-                            option { value: "red", "Red" }
-                            option { value: "purple", "Purple" }
-                            option { value: "gray", "Gray" }
-                        }
-                        div {
-                            style: "display: grid; grid-template-columns: 1fr 1fr; gap: 6px;",
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let category = category_name.read().trim().to_string();
-                                    let color = category_color.read().trim().to_string();
-                                    match save_category_definition(&category, &color) {
-                                        Ok(status) => {
-                                            saved_categories.set(load_category_names());
-                                            mod_status.set(Some(status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not save category: {}", error.message))),
-                                    }
-                                },
-                                "Save"
-                            }
-                            button {
-                                style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                                onclick: move |_| {
-                                    let old_category = selected_category_name.read().trim().to_string();
-                                    let new_category = category_name.read().trim().to_string();
-                                    let state = app_state.read().clone();
-                                    match rename_category_definition(&old_category, &new_category, &state) {
-                                        Ok((mods, status)) => {
-                                            let mut next_state = app_state.read().clone();
-                                            let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                            app_state.set(next_state);
-                                            selected_category_name.set(new_category);
-                                            saved_categories.set(load_category_names());
-                                            mod_status.set(Some(status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not rename category: {}", error.message))),
-                                    }
-                                },
-                                "Rename"
-                            }
-                        }
-                        button {
-                            style: "border: 1px solid #7f1d1d; background: #451a1a; color: #fecaca; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                let category = selected_category_name.read().trim().to_string();
-                                let state = app_state.read().clone();
-                                match delete_category_definition(&category, &state) {
-                                    Ok((mods, status)) => {
-                                        let mut next_state = app_state.read().clone();
-                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                        app_state.set(next_state);
-                                        let names = load_category_names();
-                                        let next_category = names.first().cloned().unwrap_or_else(|| "Core".to_string());
-                                        category_name.set(next_category.clone());
-                                        selected_category_name.set(next_category);
-                                        saved_categories.set(names);
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not delete category: {}", error.message))),
-                                }
-                            },
-                            "Delete category"
-                        }
-                    }
-                    }
-                    if current_library_tool == LibraryToolTab::Config {
-                    section {
-                        style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
-                        h3 {
-                            style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                            "Config"
-                        }
-                        label {
-                            style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                            input {
-                                r#type: "checkbox",
-                                checked: *show_hidden.read(),
-                                onchange: move |event| {
-                                    show_hidden.set(event.checked());
-                                },
-                            }
-                            "Show hidden mods"
-                        }
-                        button {
-                            style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                if let Some(config_path) = pick_legacy_ts_config_file() {
-                                    let state = app_state.read().clone();
-                                    match import_legacy_ts_config_into_app(&state, &config_path) {
-                                        Ok(imported) => {
-                                            let mut next_state = state.clone();
-                                            let _ = next_state.apply(CoreCommand::ReplaceMods { mods: imported.mods });
-                                            app_state.set(next_state);
-                                            if let Some(imported_game_folder) = imported.game_folder {
-                                                game_folder.set(Some(imported_game_folder));
-                                            }
-                                            launch_options.set(imported.launch_options);
-                                            saved_presets.set(load_preset_names());
-                                            let categories = load_category_names();
-                                            let next_category = categories.first().cloned().unwrap_or_else(|| "Core".to_string());
-                                            category_name.set(next_category.clone());
-                                            selected_category_name.set(next_category);
-                                            saved_categories.set(categories);
-                                            mod_status.set(Some(imported.status));
-                                        }
-                                        Err(error) => mod_status.set(Some(format!("Could not import TS config: {}", error.message))),
-                                    }
-                                }
-                            },
-                            "Import TS config"
-                        }
-                        button {
-                            style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                            onclick: move |_| {
-                                if let Some(config_path) = pick_legacy_ts_config_save_file() {
-                                    let state = app_state.read().clone();
-                                    let options = launch_options.read().clone();
-                                    match export_legacy_ts_config_from_app(&state, &options, &config_path) {
-                                        Ok(status) => mod_status.set(Some(status)),
-                                        Err(error) => mod_status.set(Some(format!("Could not export TS config: {}", error.message))),
-                                    }
-                                }
-                            },
-                            "Export TS config"
-                        }
-                    }
-                    }
-                    } else if current_workspace_page == WorkspacePage::ModDetail {
-                        header {
-                            style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 16px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
-                            div {
-                                style: "min-width: 0;",
-                                h2 {
-                                    style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
-                                    "Mod Detail"
-                                }
-                                div {
-                                    style: "font-size: 14px; line-height: 20px; color: #cbd5c9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                    if let Some(selected_mod) = selected_mod.as_ref() {
-                                        "{selected_mod.display_name}"
-                                    } else {
-                                        "Select a mod from the library to inspect it here."
-                                    }
-                                }
-                            }
-                            button {
-                                style: "border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 14px; font-size: 13px;",
-                                onclick: move |_| {
-                                    workspace_page.set(WorkspacePage::Mods);
-                                },
-                                "Back to library"
-                            }
-                        }
-                        if let Some(status_message) = view_model.status_message.clone() {
-                            div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
-                                "{status_message}"
-                            }
-                        }
-                        div {
-                            style: "display: grid; gap: 22px; max-width: 980px; padding: 8px 40px 40px;",
-                            section {
-                                style: "border: 1px solid #303241; border-radius: 8px; background: #1f202b; overflow: hidden;",
-                                header {
-                                    style: "display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; background: #2a2b37; border-bottom: 1px solid #303241;",
-                                    div {
-                                        style: "display: grid; gap: 4px; min-width: 0;",
-                                        h3 {
-                                            style: "font-size: 19px; line-height: 24px; margin: 0; color: #f2f5f2;",
-                                            "Selected Archive"
-                                        }
-                                        div {
-                                            style: "font-size: 12px; color: #aeb8c8;",
-                                            "Source, metadata, categories, and row operations"
-                                        }
-                                    }
-                                }
-                                if let Some(selected_mod) = selected_mod.clone() {
-                                    div {
-                                        style: "display: grid; grid-template-columns: minmax(160px, 220px) minmax(0, 1fr); gap: 20px; padding: 20px;",
-                                        div {
-                                            style: "display: grid; gap: 12px; align-content: start; min-width: 0;",
-                                            div {
-                                                style: detail_source_tile_style(&selected_mod),
-                                                div {
-                                                    style: "font-size: 28px; line-height: 32px; font-weight: 800; letter-spacing: 0;",
-                                                    "{mod_source_label(&selected_mod)}"
-                                                }
-                                                div {
-                                                    style: "font-size: 12px; line-height: 16px; color: #d7ded9;",
-                                                    "{mod_state_label(&selected_mod)}"
-                                                }
-                                            }
-                                            div {
-                                                style: "display: grid; gap: 8px; font-size: 13px;",
-                                                div {
-                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
-                                                    span { "Author" }
-                                                    strong {
-                                                        style: "color: #f2f5f2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                                        "{mod_author_label(&selected_mod, &current_steam_metadata)}"
-                                                    }
-                                                }
-                                                div {
-                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
-                                                    span { "Updated" }
-                                                    strong {
-                                                        style: "color: #f2f5f2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                                        "{mod_updated_label(&selected_mod, &current_steam_metadata, current_time_ms)}"
-                                                    }
-                                                }
-                                                div {
-                                                    style: "display: flex; justify-content: space-between; gap: 12px; color: #aeb8c8;",
-                                                    span { "Source" }
-                                                    strong {
-                                                        style: "color: #f2f5f2;",
-                                                        "{mod_source_label(&selected_mod)}"
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        div {
-                                            style: "display: grid; gap: 16px; min-width: 0;",
-                                            div {
-                                                style: "display: grid; gap: 6px; min-width: 0;",
-                                                h3 {
-                                                    style: "font-size: 26px; line-height: 32px; margin: 0; color: #f2f5f2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                                    "{selected_mod.display_name}"
-                                                }
-                                                div {
-                                                    style: "font-size: 13px; color: #aeb8c8; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                                    "{selected_mod.subtitle}"
-                                                }
-                                            }
-                                            div {
-                                                style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
-                                                div {
-                                                    style: detail_metric_style(),
-                                                    span { "State" }
-                                                    strong { "{mod_state_label(&selected_mod)}" }
-                                                }
-                                                div {
-                                                    style: detail_metric_style(),
-                                                    span { "Categories" }
-                                                    strong { "{mod_categories_label(&selected_mod)}" }
-                                                }
-                                                div {
-                                                    style: detail_metric_style(),
-                                                    span { "Tags" }
-                                                    strong { "{selected_mod.tags.len()}" }
-                                                }
-                                            }
-                                            div {
-                                                style: "display: grid; gap: 8px;",
-                                                div {
-                                                    style: "font-size: 11px; line-height: 14px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 1px;",
-                                                    "Tags"
-                                                }
-                                                if selected_mod.tags.is_empty() {
-                                                    div {
-                                                        style: "font-size: 13px; color: #778194;",
-                                                        "No tags recorded"
-                                                    }
-                                                } else {
-                                                    div {
-                                                        style: "display: flex; flex-wrap: wrap; gap: 6px;",
-                                                        for tag in selected_mod.tags.iter() {
-                                                            span {
-                                                                key: "{tag}",
-                                                                style: "border: 1px solid #3b3d4d; border-radius: 4px; padding: 4px 7px; font-size: 12px; color: #d8ded8; background: #292a35;",
-                                                                "{tag}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            div {
-                                                style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;",
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    disabled: selected_mod.locked,
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| {
-                                                            let mut next_state = app_state.read().clone();
-                                                            if let Some(identity) = identity_for_mod_key(&next_state, &mod_key) {
-                                                                match next_state.apply(CoreCommand::ToggleMod { identity }) {
-                                                                    Ok(_) => {
-                                                                        match save_mod_state(&next_state) {
-                                                                            Ok(status) => mod_status.set(Some(status)),
-                                                                            Err(error) => mod_status.set(Some(format!("Could not save mod state: {}", error.message))),
-                                                                        }
-                                                                        app_state.set(next_state);
-                                                                    }
-                                                                    Err(error) => mod_status.set(Some(format!("Could not toggle mod: {}", error.message))),
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    if selected_mod.enabled {
-                                                        "Disable"
-                                                    } else {
-                                                        "Enable"
-                                                    }
-                                                }
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| toggle_mod_hidden_by_key(&mut app_state, &mut mod_status, &mod_key)
-                                                    },
-                                                    if selected_mod.hidden {
-                                                        "Show"
-                                                    } else {
-                                                        "Hide"
-                                                    }
-                                                }
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    disabled: selected_mod.locked,
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| move_mod_by_delta(&mut app_state, &mut mod_status, &mod_key, -1)
-                                                    },
-                                                    "Move up"
-                                                }
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    disabled: selected_mod.locked,
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| move_mod_by_delta(&mut app_state, &mut mod_status, &mod_key, 1)
-                                                    },
-                                                    "Move down"
-                                                }
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| toggle_mod_lock_by_key(&mut app_state, &mut mod_status, &mod_key)
-                                                    },
-                                                    if selected_mod.locked {
-                                                        "Unlock"
-                                                    } else {
-                                                        "Lock"
-                                                    }
-                                                }
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| {
-                                                            let category = category_name.read().trim().to_string();
-                                                            let color = category_color.read().trim().to_string();
-                                                            add_mod_category_by_key(
-                                                                &mut app_state,
-                                                                &mut mod_status,
-                                                                &mut saved_categories,
-                                                                &mod_key,
-                                                                &category,
-                                                                &color,
-                                                            )
-                                                        }
-                                                    },
-                                                    "Add category"
-                                                }
-                                                button {
-                                                    style: detail_action_button_style(false),
-                                                    onclick: {
-                                                        let mod_key = selected_mod.key.clone();
-                                                        move |_| {
-                                                            let category = category_name.read().trim().to_string();
-                                                            remove_mod_category_by_key(
-                                                                &mut app_state,
-                                                                &mut mod_status,
-                                                                &mut saved_categories,
-                                                                &mod_key,
-                                                                &category,
-                                                            )
-                                                        }
-                                                    },
-                                                    "Remove category"
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    div {
-                                        style: "display: grid; gap: 12px; padding: 22px 20px; color: #aeb8c8;",
-                                        h3 {
-                                            style: "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;",
-                                            "No mod selected"
-                                        }
-                                        div {
-                                            style: "font-size: 13px; line-height: 18px;",
-                                            "Load game mods or open a mod folder, then select a row from the library."
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        div {
-                            style: "display: grid; gap: 8px; margin-top: 28px; padding-top: 18px; border-top: 1px solid #2b2d3a;",
-                            div {
-                                style: "font-size: 12px; line-height: 17px; color: #aeb8c8; overflow-wrap: anywhere;",
-                                "{current_game_folder_label}"
-                            }
-                            button {
-                                style: "width: 100%; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 13px;",
-                                onclick: move |_| {
-                                    workspace_page.set(WorkspacePage::Mods);
-                                    mod_list_filter.set(ModListFilter::All);
-                                },
-                                "Back to mods"
+                                span { "Settings" }
                             }
                         }
                     }
                     div {
                         style: "margin-top: auto; padding-top: 18px; border-top: 1px solid #2b2d3a; display: grid; gap: 8px;",
                         button {
-                            style: library_utility_button_style(current_tool_panel == ToolPanelTab::Checks),
+                            title: "Diagnostics and log paths",
+                            style: library_utility_button_style(settings_focus_active(
+                                current_workspace_page,
+                                current_settings_focus,
+                                SettingsFocus::Diagnostics,
+                            )),
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Checks,
-                                ));
+                                settings_focus.set(SettingsFocus::Diagnostics);
+                                workspace_page.set(WorkspacePage::Settings);
                             },
-                            span { style: nav_badge_style(), "CHK" }
-                            span { "Alpha checks" }
+                            span {
+                                style: nav_icon_tile_style(settings_focus_active(
+                                    current_workspace_page,
+                                    current_settings_focus,
+                                    SettingsFocus::Diagnostics,
+                                )),
+                                span { style: nav_icon_line_style(), "" }
+                                span { style: nav_icon_line_style(), "" }
+                            }
+                            span { "Logs" }
                         }
                         button {
-                            style: library_utility_button_style(current_workspace_page == WorkspacePage::Settings),
+                            title: "Open project README",
+                            style: library_utility_button_style(false),
                             onclick: move |_| {
-                                workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
+                                match open_project_readme() {
+                                    Ok(status) => mod_status.set(Some(status)),
+                                    Err(error) => mod_status.set(Some(error)),
+                                }
                             },
-                            span { style: nav_badge_style(), "CFG" }
-                            span { "Settings" }
+                            span {
+                                style: nav_icon_tile_style(false),
+                                span { style: nav_icon_stack_style(), "" }
+                                span { style: nav_icon_line_style(), "" }
+                            }
+                            span { "Wiki" }
                         }
                     }
                 }
                 aside {
-                    style: "grid-area: tools; min-width: 0; border-left: 1px solid #2b2d3a; background: #292a35; padding: 20px 18px; overflow-y: auto;",
+                    class: if *tools_drawer_open.read() { "tools-rail drawer-open" } else { "tools-rail" },
+                    style: tools_rail_style(),
                     div {
-                        style: "display: grid; gap: 4px; margin-bottom: 12px;",
+                        style: tools_header_style(),
                         h2 {
                             style: "font-size: 18px; line-height: 24px; margin: 0; color: #edf2f7;",
                             "Play & Tools"
@@ -1178,7 +1061,7 @@ fn App() -> Element {
                         }
                     }
                     button {
-                        style: "width: 100%; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 8px; padding: 18px 14px; font-weight: 800; font-size: 20px; line-height: 24px; margin-bottom: 16px; letter-spacing: 0;",
+                        style: play_primary_button_style(),
                         onclick: move |_| {
                             let selected_game_folder = select_game_folder(game_folder.read().clone());
                             if let Some(selected_game_folder) = selected_game_folder {
@@ -1202,7 +1085,8 @@ fn App() -> Element {
                                 }
                             }
                         },
-                        "PLAY GAME"
+                        span { style: play_icon_style(), "" }
+                        span { "PLAY GAME" }
                     }
                     button {
                         style: continue_save_button_style(current_launch_save_name.trim().is_empty()),
@@ -1210,8 +1094,8 @@ fn App() -> Element {
                             let save_name = launch_save_name.read().trim().to_string();
                             if save_name.is_empty() {
                                 mod_status.set(Some("Set a campaign save name in Settings before continuing a save.".to_string()));
+                                settings_focus.set(SettingsFocus::Launch);
                                 workspace_page.set(WorkspacePage::Settings);
-                                library_tool_tab.set(LibraryToolTab::Config);
                                 return;
                             }
                             let selected_game_folder = select_game_folder(game_folder.read().clone());
@@ -1238,445 +1122,1897 @@ fn App() -> Element {
                         span { "Continue Last Save" }
                         span { ">" }
                     }
+                    if current_workspace_page == WorkspacePage::ModDetail
+                        && let Some(context_mod) = selected_mod.clone()
+                    {
+                        div {
+                            style: tool_context_panel_style(),
+                            div {
+                                style: tool_context_summary_style(),
+                                div {
+                                    style: tool_context_label_style(),
+                                    "{mod_context_label(has_explicitly_selected_mod)}"
+                                }
+                                div {
+                                    style: tool_context_name_style(),
+                                    "{context_mod.display_name}"
+                                }
+                                div {
+                                    style: tool_context_path_style(),
+                                    "{context_mod.subtitle}"
+                                }
+                                div {
+                                    style: tool_context_meta_style(),
+                                    span {
+                                        style: tool_context_meta_chip_style(),
+                                        "{mod_state_label(&context_mod)}"
+                                    }
+                                    span {
+                                        style: tool_context_meta_chip_style(),
+                                        "{mod_source_label(&context_mod)}"
+                                    }
+                                }
+                            }
+                            div {
+                                style: tool_context_actions_style(),
+                                button {
+                                    title: "Open this mod folder",
+                                    style: tool_context_action_style(false),
+                                    onclick: {
+                                        let context_mod = context_mod.clone();
+                                        move |_| {
+                                            match open_selected_mod_folder(&context_mod) {
+                                                Ok(status) => mod_status.set(Some(status)),
+                                                Err(error) => mod_status.set(Some(error)),
+                                            }
+                                        }
+                                    },
+                                    "Open Folder"
+                                }
+                                button {
+                                    title: "Open this mod in Steam Workshop",
+                                    style: tool_context_action_style(mod_workshop_id_from_row(&context_mod).is_none()),
+                                    disabled: mod_workshop_id_from_row(&context_mod).is_none(),
+                                    onclick: {
+                                        let context_mod = context_mod.clone();
+                                        move |_| {
+                                            match open_selected_mod_workshop_page(&context_mod) {
+                                                Ok(status) => mod_status.set(Some(status)),
+                                                Err(error) => mod_status.set(Some(error)),
+                                            }
+                                        }
+                                    },
+                                    "View Workshop"
+                                }
+                            }
+                            button {
+                                title: "Toggle this mod",
+                                style: tool_context_toggle_style(context_mod.locked),
+                                disabled: context_mod.locked,
+                                onclick: {
+                                    let mod_key = context_mod.key.clone();
+                                    move |_| {
+                                        let mut next_state = app_state.read().clone();
+                                        if let Some(identity) = identity_for_mod_key(&next_state, &mod_key) {
+                                            match next_state.apply(CoreCommand::ToggleMod { identity }) {
+                                                Ok(_) => {
+                                                    match save_mod_state(&next_state) {
+                                                        Ok(status) => mod_status.set(Some(status)),
+                                                        Err(error) => mod_status.set(Some(format!("Could not save mod state: {}", error.message))),
+                                                    }
+                                                    app_state.set(next_state);
+                                                }
+                                                Err(error) => mod_status.set(Some(format!("Could not toggle mod: {}", error.message))),
+                                            }
+                                        }
+                                    }
+                                },
+                                span { "Toggle Mod" }
+                                span {
+                                    style: toggle_label_style(context_mod.enabled),
+                                    span {
+                                        style: settings_toggle_knob_style(context_mod.enabled),
+                                        ""
+                                    }
+                                }
+                            }
+                        }
+                        div {
+                            style: tool_context_screen_group_style(),
+                            div {
+                                style: tool_context_label_style(),
+                                "{tool_other_screens_group_label()}"
+                            }
+                            button {
+                                title: "Current screen",
+                                style: tool_context_screen_button_style(true),
+                                disabled: true,
+                                span { "Mod Settings" }
+                                span { "Current" }
+                            }
+                            button {
+                                title: "Return to the full mod archive",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Mods);
+                                },
+                                span { "Mod Archive" }
+                                span { ">" }
+                            }
+                            button {
+                                title: if compatibility_operation_in_progress { "Compatibility analysis is already running" } else { "Analyze enabled mods and open compatibility" },
+                                style: if compatibility_operation_in_progress {
+                                    tool_context_disabled_screen_button_style()
+                                } else {
+                                    tool_context_screen_button_style(false)
+                                },
+                                disabled: compatibility_operation_in_progress,
+                                onclick: move |_| {
+                                    start_compatibility_analysis(
+                                        app_state,
+                                        compatibility_operation,
+                                        mod_status,
+                                        conflict_report,
+                                        workspace_page,
+                                    );
+                                },
+                                span { if compatibility_operation_in_progress { "Analyzing..." } else { "Compatibility" } }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Launch);
+                                    workspace_page.set(WorkspacePage::Settings);
+                                },
+                                span { "Launch Options" }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::DbViewer);
+                                },
+                                span { "DB Viewer" }
+                                span { ">" }
+                            }
+                            button {
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Skills);
+                                },
+                                span { "Skills" }
+                                span { ">" }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Settings {
+                        div {
+                            style: tool_context_screen_group_style(),
+                            div {
+                                style: tool_context_label_style(),
+                                "{tool_settings_views_group_label()}"
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::General { "Current screen" } else { "Open Settings overview" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::General),
+                                disabled: current_settings_focus == SettingsFocus::General,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::General);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::General)}" }
+                                span { if current_settings_focus == SettingsFocus::General { "Current" } else { ">" } }
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::GamePaths { "Current screen" } else { "Open game and helper paths" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::GamePaths),
+                                disabled: current_settings_focus == SettingsFocus::GamePaths,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::GamePaths);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::GamePaths)}" }
+                                span { if current_settings_focus == SettingsFocus::GamePaths { "Current" } else { ">" } }
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::Launch { "Current screen" } else { "Open launch options" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::Launch),
+                                disabled: current_settings_focus == SettingsFocus::Launch,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Launch);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::Launch)}" }
+                                span { if current_settings_focus == SettingsFocus::Launch { "Current" } else { ">" } }
+                            }
+                            button {
+                                title: if current_settings_focus == SettingsFocus::Diagnostics { "Current screen" } else { "Open diagnostics and logs" },
+                                style: tool_context_screen_button_style(current_settings_focus == SettingsFocus::Diagnostics),
+                                disabled: current_settings_focus == SettingsFocus::Diagnostics,
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Diagnostics);
+                                },
+                                span { "{settings_focus_tab_label(SettingsFocus::Diagnostics)}" }
+                                span { if current_settings_focus == SettingsFocus::Diagnostics { "Current" } else { ">" } }
+                            }
+                        }
+                        div {
+                            style: tool_context_screen_group_style(),
+                            div {
+                                style: tool_context_label_style(),
+                                "{tool_other_screens_group_label()}"
+                            }
+                            button {
+                                title: "Return to the mod archive",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Mods);
+                                },
+                                span { "Mod Archive" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "Analyze enabled mods and open compatibility",
+                                style: if compatibility_operation_in_progress {
+                                    tool_context_disabled_screen_button_style()
+                                } else {
+                                    tool_context_screen_button_style(false)
+                                },
+                                disabled: compatibility_operation_in_progress,
+                                onclick: move |_| {
+                                    start_compatibility_analysis(
+                                        app_state,
+                                        compatibility_operation,
+                                        mod_status,
+                                        conflict_report,
+                                        workspace_page,
+                                    );
+                                },
+                                span { if compatibility_operation_in_progress { "Analyzing..." } else { "Compatibility" } }
+                                span { ">" }
+                            }
+                            button {
+                                title: "{mod_settings_action_title}",
+                                style: if mod_settings_action_disabled {
+                                    tool_context_disabled_screen_button_style()
+                                } else {
+                                    tool_context_screen_button_style(false)
+                                },
+                                disabled: mod_settings_action_disabled,
+                                onclick: {
+                                    let target_mod_key = active_mod_key.clone();
+                                    move |_| {
+                                        if let Some(mod_key) = target_mod_key.clone() {
+                                            selected_mod_key.set(Some(mod_key));
+                                        }
+                                        workspace_page.set(WorkspacePage::ModDetail);
+                                    }
+                                },
+                                span { "Mod Settings" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "Open pack and DB viewer",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::DbViewer);
+                                },
+                                span { "DB Viewer" }
+                                span { ">" }
+                            }
+                            button {
+                                title: "Open WH3MM skills and user-flow data",
+                                style: tool_context_screen_button_style(false),
+                                onclick: move |_| {
+                                    workspace_page.set(WorkspacePage::Skills);
+                                },
+                                span { "Skills" }
+                                span { ">" }
+                            }
+                        }
+                    } else {
                     div {
-                        style: "display: grid; gap: 10px; margin-bottom: 18px;",
+                        style: tool_action_group_style(),
                         button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Launch),
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Compatibility),
+                            disabled: compatibility_operation_in_progress,
                             onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Launch,
-                                ));
+                                start_compatibility_analysis(
+                                    app_state,
+                                    compatibility_operation,
+                                    mod_status,
+                                    conflict_report,
+                                    workspace_page,
+                                );
+                            },
+                            span { if compatibility_operation_in_progress { "Analyzing..." } else { "Check Compatibility" } }
+                            span { ">" }
+                        }
+                        button {
+                            style: tool_action_button_style(settings_focus_active(
+                                current_workspace_page,
+                                current_settings_focus,
+                                SettingsFocus::Launch,
+                            )),
+                            onclick: move |_| {
+                                settings_focus.set(SettingsFocus::Launch);
+                                workspace_page.set(WorkspacePage::Settings);
                             },
                             span { "Launch Options" }
                             span { ">" }
                         }
                         button {
-                            style: tool_action_button_style(current_workspace_page == WorkspacePage::ModDetail),
-                            onclick: move |_| {
-                                workspace_page.set(WorkspacePage::ModDetail);
+                            title: "{mod_settings_action_title}",
+                            style: if mod_settings_action_disabled {
+                                tool_action_disabled_button_style()
+                            } else {
+                                tool_action_button_style(current_workspace_page == WorkspacePage::ModDetail)
                             },
-                            span { "Mod Detail" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Checks),
-                            onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Checks,
-                                ));
-                            },
-                            span { "Alpha Checks" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Steam),
-                            onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Steam,
-                                ));
-                            },
-                            span { "Steam Helper" }
-                            span { ">" }
-                        }
-                        button {
-                            style: tool_action_button_style(current_tool_panel == ToolPanelTab::Workshop),
-                            onclick: move |_| {
-                                tool_panel_tab.set(toggle_tool_panel(
-                                    current_tool_panel,
-                                    ToolPanelTab::Workshop,
-                                ));
-                            },
-                            span { "Workshop Commands" }
-                            span { ">" }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Launch {
-                        section {
-                            style: "display: grid; gap: 11px; margin-bottom: 12px; border-top: 1px solid #373947; padding-top: 14px;",
-                h3 {
-                    style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Launch options"
-                }
-                div {
-                    style: "display: grid; grid-template-columns: 1fr 1fr; gap: 8px;",
-                    button {
-                        style: launch_quick_button_style(),
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                let state = app_state.read().clone();
-                                let launch_options = launch_options.read().clone();
-                                let save_name = launch_save_name.read().clone();
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| build_launch_preview(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                {
-                                    Ok(preview) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(format!(
-                                            "Previewed {} enabled mods and {} generated packs for {}.",
-                                            preview.enabled_count,
-                                            preview.generated_packs.len(),
-                                            preview.mod_list_file_name
-                                        )));
-                                        launch_preview.set(Some(preview));
+                            disabled: mod_settings_action_disabled,
+                            onclick: {
+                                let target_mod_key = active_mod_key.clone();
+                                move |_| {
+                                    if let Some(mod_key) = target_mod_key.clone() {
+                                        selected_mod_key.set(Some(mod_key));
                                     }
-                                    Err(error) => mod_status.set(Some(format!("Could not preview launch: {}", error.message))),
+                                    workspace_page.set(WorkspacePage::ModDetail);
+                                }
+                            },
+                            span { "Mod Settings" }
+                            span { ">" }
+                        }
+                        button {
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::DbViewer),
+                            onclick: move |_| {
+                                workspace_page.set(WorkspacePage::DbViewer);
+                            },
+                            span { "DB Viewer" }
+                            span { ">" }
+                        }
+                        button {
+                            title: "WH3MM user-flow and skill data from opened packs",
+                            style: tool_action_button_style(current_workspace_page == WorkspacePage::Skills),
+                            onclick: move |_| {
+                                workspace_page.set(WorkspacePage::Skills);
+                            },
+                            span { "Skills" }
+                            span { ">" }
+                        }
+                    }
+                    div {
+                        style: tool_aux_group_style(),
+                        button {
+                            title: "Show Steam, Workshop, and readiness tools",
+                            style: tool_aux_button_style(
+                                *tools_more_expanded.read()
+                                    || matches!(
+                                        current_workspace_page,
+                                        WorkspacePage::Steam | WorkspacePage::Workshop | WorkspacePage::Checks
+                                    ),
+                            ),
+                            onclick: move |_| {
+                                let expanded = *tools_more_expanded.read();
+                                tools_more_expanded.set(!expanded);
+                            },
+                            span { "More Tools" }
+                            span { if *tools_more_expanded.read() { "^" } else { ">" } }
+                        }
+                        if *tools_more_expanded.read()
+                            || matches!(
+                                current_workspace_page,
+                                WorkspacePage::Steam | WorkspacePage::Workshop | WorkspacePage::Checks
+                            )
+                        {
+                            div {
+                                style: tool_more_group_style(),
+                                button {
+                                    title: "Steam helper and workshop metadata",
+                                    style: tool_action_button_style(current_workspace_page == WorkspacePage::Steam),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Steam);
+                                    },
+                                    span { "Steam" }
+                                    span { ">" }
+                                }
+                                button {
+                                    title: "Workshop command queue",
+                                    style: tool_action_button_style(current_workspace_page == WorkspacePage::Workshop),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Workshop);
+                                    },
+                                    span { "Workshop" }
+                                    span { ">" }
+                                }
+                                button {
+                                    title: "Readiness checks",
+                                    style: tool_action_button_style(current_workspace_page == WorkspacePage::Checks),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Checks);
+                                    },
+                                    span { "Checks" }
+                                    span { ">" }
                                 }
                             }
-                        },
-                        "Preview"
+                        }
                     }
-                    button {
-                        style: launch_quick_button_style(),
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                let state = app_state.read().clone();
-                                let launch_options = launch_options.read().clone();
-                                let save_name = launch_save_name.read().clone();
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| prepare_launch_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
-                                {
-                                    Ok(status) => {
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not prepare launch files: {}", error.message))),
+                    }
+                    div {
+                        style: "margin-top: auto; padding-top: 18px;",
+                        button {
+                            title: "Open project README",
+                            style: tool_footer_button_style(false),
+                            onclick: move |_| {
+                                match open_project_readme() {
+                                    Ok(status) => mod_status.set(Some(status)),
+                                    Err(error) => mod_status.set(Some(error)),
                                 }
-                            }
-                        },
-                        "Prepare"
-                    }
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.skip_intro_movies,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.skip_intro_movies = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Skip intros"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.script_logging,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.script_logging = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Script logging"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.auto_start_custom_battle,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.auto_start_custom_battle = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Auto battle"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.make_units_generals,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.make_units_generals = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Make generals"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.high_process_priority,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.high_process_priority = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "High priority"
-                }
-                label {
-                    style: "display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 13px;",
-                    input {
-                        r#type: "checkbox",
-                        checked: current_launch_options.close_on_play,
-                        onchange: move |event| {
-                            let mut next = launch_options.read().clone();
-                            next.close_on_play = event.checked();
-                            launch_options.set(next);
-                        },
-                    }
-                    "Close on play"
-                }
-                input {
-                    style: "width: 220px; min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{current_launch_save_name}",
-                    placeholder: "Campaign save name",
-                    oninput: move |event| {
-                        launch_save_name.set(event.value());
-                    },
-                }
+                            },
+                            span { "Help / FAQ" }
+                            span { "?" }
                         }
                     }
-                    if current_tool_panel == ToolPanelTab::Steam {
-                        section {
-                            style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; align-items: stretch; margin-bottom: 12px; border: 1px solid #28323d; background: #141a20; border-radius: 6px; padding: 10px;",
-                h3 {
-                    style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Steam helper"
                 }
-                input {
-                    style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{steam_helper_path}",
-                    placeholder: "Steam helper executable path",
-                    oninput: move |event| {
-                        steam_helper_path.set(event.value());
+                DrawerBackdrop {
+                    visible: *tools_drawer_open.read() || *library_drawer_open.read(),
+                    on_close: move |_| {
+                        tools_drawer_open.set(false);
+                        library_drawer_open.set(false);
                     },
-                }
-                select {
-                    style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{steam_helper_backend}",
-                    onchange: move |event| {
-                        steam_helper_backend.set(event.value());
-                    },
-                    option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
-                    option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    onclick: move |_| {
-                        if let Some(helper_path) = pick_steam_helper_file() {
-                            let helper_path = helper_path.display().to_string();
-                            let backend = steam_helper_backend.read().clone();
-                            match save_steam_helper_settings(&helper_path, &backend) {
-                                Ok(status) => {
-                                    steam_helper_path.set(helper_path);
-                                    mod_status.set(Some(status));
-                                }
-                                Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
-                            }
-                        }
-                    },
-                    "Choose helper"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    onclick: move |_| {
-                        let helper_path = steam_helper_path.read().trim().to_string();
-                        let backend = steam_helper_backend.read().clone();
-                        match save_steam_helper_settings(&helper_path, &backend) {
-                            Ok(status) => mod_status.set(Some(status)),
-                            Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
-                        }
-                    },
-                    "Save helper"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        match probe_steam_helper(&helper_path, &backend) {
-                            Ok(status) => mod_status.set(Some(status)),
-                            Err(error) => mod_status.set(Some(format!("Could not probe Steam helper: {error}"))),
-                        }
-                    },
-                    "Probe helper"
-                }
-                button {
-                    style: "border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let mut next_state = app_state.read().clone();
-                        match refresh_steam_from_helper(&mut next_state, &helper_path, &backend) {
-                            Ok(result) => {
-                                let command_panel = steam_refresh_panel_state(&result);
-                                let status = format!(
-                                    "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.",
-                                    result.subscribed_ids.len(),
-                                    result.metadata.len(),
-                                    result.requested_metadata_count,
-                                    result.missing_metadata_count,
-                                    result.filtered_unsubscribed_count,
-                                    result.renamed_count
-                                );
-                                subscribed_workshop_ids.set(result.subscribed_ids);
-                                steam_metadata.set(result.metadata);
-                                last_steam_command.set(Some(command_panel));
-                                app_state.set(next_state);
-                                mod_status.set(Some(status));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not refresh Steam: {error}"))),
-                        }
-                    },
-                    "Refresh Steam"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        match check_steam_updates_with_helper(&app_state.read(), &helper_path, &backend) {
-                            Ok(result) => {
-                                mod_status.set(Some(steam_check_update_status(&result)));
-                                last_steam_command.set(Some(steam_check_update_panel_state(&result)));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not check Steam updates: {error}"))),
-                        }
-                    },
-                    "Check updates"
-                }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Workshop {
-                        section {
-                            style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; align-items: stretch; margin-bottom: 12px; border: 1px solid #28323d; background: #141a20; border-radius: 6px; padding: 10px;",
-                h3 {
-                    style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Workshop commands"
-                }
-                input {
-                    style: "min-width: 0; border: 1px solid #3a4756; background: #111820; color: #edf2f7; border-radius: 6px; padding: 8px 10px;",
-                    value: "{steam_command_ids}",
-                    placeholder: "Workshop IDs",
-                    oninput: move |event| {
-                        steam_command_ids.set(event.value());
-                    },
-                }
-                button {
-                    style: "border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Subscribe, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not subscribe: {error}"))),
-                        }
-                    },
-                    "Subscribe"
-                }
-                button {
-                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Download, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not download: {error}"))),
-                        }
-                    },
-                    "Download"
-                }
-                button {
-                    style: "border: 1px solid #7f3a3a; background: #402020; color: #f8d7da; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Unsubscribe, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not unsubscribe: {error}"))),
-                        }
-                    },
-                    "Unsubscribe"
-                }
-                button {
-                    style: "border: 1px solid #7b5f22; background: #3a2d13; color: #f8e7b2; border-radius: 6px; padding: 8px 12px;",
-                    disabled: steam_helper_path.read().trim().is_empty(),
-                    onclick: move |_| {
-                        let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
-                        let backend = steam_helper_backend.read().clone();
-                        let ids = steam_command_ids.read().clone();
-                        let mods = app_state.read().mods.clone();
-                        match run_steam_command_with_helper(SteamCommandAction::Resubscribe, &helper_path, &backend, &ids, &mods) {
-                            Ok(result) => {
-                                mod_status.set(Some(result.status));
-                                last_steam_command.set(Some(result.panel));
-                            }
-                            Err(error) => mod_status.set(Some(format!("Could not resubscribe: {error}"))),
-                        }
-                    },
-                    "Resubscribe"
-                }
-                        }
-                    }
-                    if current_tool_panel == ToolPanelTab::Checks {
-                        AlphaReadinessPanel {
-                            report: alpha_readiness
-                        }
-                    }
                 }
                 section {
                     style: "grid-area: content; min-width: 0; min-height: 0; overflow: auto; padding: 0; background: #11111a;",
-                    if current_workspace_page == WorkspacePage::Settings {
+                    if current_workspace_page == WorkspacePage::ModDetail {
                         header {
-                            style: "display: grid; gap: 8px; padding: 32px 40px 20px; border-bottom: 1px solid #262838;",
-                            h2 {
-                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
-                                "Settings and Launch Options"
+                            style: detail_page_header_style(),
+                            div {
+                                style: "min-width: 0; display: grid; gap: 7px;",
+                                div {
+                                    style: detail_page_kicker_style(),
+                                    "{mod_detail_breadcrumb()}"
+                                }
+                                h2 {
+                                    style: "font-size: 25px; line-height: 32px; margin: 0; color: #f8fafc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                    if let Some(selected_mod) = selected_mod.as_ref() {
+                                        "{selected_mod.display_name}"
+                                    } else {
+                                        "Mod Settings"
+                                    }
+                                }
+                                div {
+                                    style: "font-size: 14px; line-height: 20px; color: #bccabb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                    if let Some(selected_mod) = selected_mod.as_ref() {
+                                        "Author: {mod_author_label(selected_mod)} / {selected_mod.subtitle}"
+                                    } else {
+                                        "Select a mod from the archive to inspect it here."
+                                    }
+                                }
                             }
                             div {
-                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
-                                "Configure application behavior and game integration parameters."
+                                style: detail_header_actions_style(),
+                                span {
+                                    style: detail_position_label_style(),
+                                    "{selected_mod_position}"
+                                }
+                                button {
+                                    title: "Previous mod in current archive view",
+                                    style: detail_header_nav_button_style(previous_mod_key.is_none()),
+                                    disabled: previous_mod_key.is_none(),
+                                    onclick: {
+                                        let previous_mod_key = previous_mod_key.clone();
+                                        move |_| {
+                                            if let Some(mod_key) = previous_mod_key.clone() {
+                                                selected_mod_key.set(Some(mod_key));
+                                            }
+                                        }
+                                    },
+                                    "Prev"
+                                }
+                                button {
+                                    title: "Next mod in current archive view",
+                                    style: detail_header_nav_button_style(next_mod_key.is_none()),
+                                    disabled: next_mod_key.is_none(),
+                                    onclick: {
+                                        let next_mod_key = next_mod_key.clone();
+                                        move |_| {
+                                            if let Some(mod_key) = next_mod_key.clone() {
+                                                selected_mod_key.set(Some(mod_key));
+                                            }
+                                        }
+                                    },
+                                    "Next"
+                                }
+                                button {
+                                    style: settings_secondary_button_style(),
+                                    onclick: move |_| {
+                                        workspace_page.set(WorkspacePage::Mods);
+                                    },
+                                    "Back to archive"
+                                }
                             }
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
                             div {
-                                style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 16px 40px; color: #aeb8c8; font-size: 13px;",
+                                style: detail_status_style(),
                                 "{status_message}"
                             }
                         }
                         div {
-                            style: "display: grid; gap: 26px; max-width: 860px; padding: 8px 40px 40px;",
+                            style: detail_page_content_style(),
+                            if let Some(selected_mod) = selected_mod.clone() {
+                                section {
+                                    style: detail_workspace_grid_style(),
+                                    div {
+                                        style: detail_side_column_style(),
+                                        DetailThumbnail {
+                                            url: selected_mod.thumbnail_path.as_ref().map(|_| mod_thumbnail_url(&selected_mod)),
+                                            display_name: selected_mod.display_name.clone(),
+                                            source: selected_mod.source,
+                                            source_label: mod_source_label(&selected_mod),
+                                        }
+                                        div {
+                                            style: detail_side_meta_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Mod metadata"
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "State" }
+                                                strong { "{mod_state_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Source" }
+                                                strong { "{mod_source_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Author" }
+                                                strong { "{mod_author_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Updated" }
+                                                strong { "{mod_updated_label(&selected_mod, current_time_ms)}" }
+                                            }
+                                            div {
+                                                style: detail_side_meta_row_style(),
+                                                span { "Categories" }
+                                                strong { "{mod_categories_label(&selected_mod)}" }
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: detail_main_panel_style(),
+                                        div {
+                                            style: detail_primary_description_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Mod Description"
+                                            }
+                                            div {
+                                                style: detail_primary_description_body_style(),
+                                                "{mod_detail_description_text(&selected_mod)}"
+                                            }
+                                        }
+                                        div {
+                                            style: detail_record_path_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Pack path"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #9aa4b7; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
+                                                "{selected_mod.subtitle}"
+                                            }
+                                        }
+                                        div {
+                                            style: detail_metrics_grid_style(),
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Order" }
+                                                strong { "{mod_order_label(&all_mod_rows, &selected_mod.key)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "State" }
+                                                strong { "{mod_state_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Categories" }
+                                                strong { "{mod_categories_label(&selected_mod)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Updated" }
+                                                strong { "{mod_updated_label(&selected_mod, current_time_ms)}" }
+                                            }
+                                            div {
+                                                style: detail_metric_style(),
+                                                span { "Source" }
+                                                strong { "{mod_source_label(&selected_mod)}" }
+                                            }
+                                        }
+                                        if !selected_mod.tags.is_empty() {
+                                            div {
+                                                style: detail_tag_list_style(),
+                                                for tag in selected_mod.tags.iter() {
+                                                    span {
+                                                        style: "border: 1px solid #303746; border-radius: 4px; padding: 4px 7px; font-size: 12px; color: #d8ded8; background: #1f2430;",
+                                                        "{tag}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div {
+                                            style: detail_description_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Dependencies"
+                                            }
+                                            div {
+                                                style: detail_description_body_style(),
+                                                "{mod_detail_dependency_text(&selected_mod, &current_steam_metadata)}"
+                                            }
+                                        }
+                                        div {
+                                            style: detail_description_panel_style(),
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Category assignment"
+                                            }
+                                            div {
+                                                style: detail_description_body_style(),
+                                                "{mod_categories_label(&selected_mod)}"
+                                            }
+                                            div {
+                                                style: detail_category_assignment_style(),
+                                                select {
+                                                    style: settings_input_style(),
+                                                    value: "{category_name}",
+                                                    onchange: move |event| {
+                                                        let value = event.value();
+                                                        if !value.trim().is_empty() {
+                                                            category_name.set(value.clone());
+                                                            selected_category_name.set(value);
+                                                        }
+                                                    },
+                                                    option {
+                                                        value: "",
+                                                        "Saved categories"
+                                                    }
+                                                    for saved_category in saved_categories.read().iter() {
+                                                        option {
+                                                            value: "{saved_category}",
+                                                            "{saved_category}"
+                                                        }
+                                                    }
+                                                }
+                                                button {
+                                                    style: detail_action_button_style(false),
+                                                    onclick: {
+                                                        let mod_key = selected_mod.key.clone();
+                                                        move |_| {
+                                                            let category = category_name.read().trim().to_string();
+                                                            let color = category_color.read().trim().to_string();
+                                                            add_mod_category_by_key(
+                                                                &mut app_state,
+                                                                &mut mod_status,
+                                                                &mut saved_categories,
+                                                                &mod_key,
+                                                                &category,
+                                                                &color,
+                                                            )
+                                                        }
+                                                    },
+                                                    "Add"
+                                                }
+                                                button {
+                                                    style: detail_action_button_style(false),
+                                                    onclick: {
+                                                        let mod_key = selected_mod.key.clone();
+                                                        move |_| {
+                                                            let category = category_name.read().trim().to_string();
+                                                            remove_mod_category_by_key(
+                                                                &mut app_state,
+                                                                &mut mod_status,
+                                                                &mut saved_categories,
+                                                                &mod_key,
+                                                                &category,
+                                                            )
+                                                        }
+                                                    },
+                                                    "Remove"
+                                                }
+                                            }
+                                        }
+                                        div {
+                                            style: detail_action_grid_style(),
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                disabled: selected_mod.locked,
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| {
+                                                        let mut next_state = app_state.read().clone();
+                                                        if let Some(identity) = identity_for_mod_key(&next_state, &mod_key) {
+                                                            match next_state.apply(CoreCommand::ToggleMod { identity }) {
+                                                                Ok(_) => {
+                                                                    match save_mod_state(&next_state) {
+                                                                        Ok(status) => mod_status.set(Some(status)),
+                                                                        Err(error) => mod_status.set(Some(format!("Could not save mod state: {}", error.message))),
+                                                                    }
+                                                                    app_state.set(next_state);
+                                                                }
+                                                                Err(error) => mod_status.set(Some(format!("Could not toggle mod: {}", error.message))),
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                if selected_mod.enabled {
+                                                    "Disable"
+                                                } else {
+                                                    "Enable"
+                                                }
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| toggle_mod_hidden_by_key(&mut app_state, &mut mod_status, &mod_key)
+                                                },
+                                                if selected_mod.hidden {
+                                                    "Show"
+                                                } else {
+                                                    "Hide"
+                                                }
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                disabled: selected_mod.locked,
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| move_mod_by_delta(&mut app_state, &mut mod_status, &mod_key, -1)
+                                                },
+                                                "Move up"
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                disabled: selected_mod.locked,
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| move_mod_by_delta(&mut app_state, &mut mod_status, &mod_key, 1)
+                                                },
+                                                "Move down"
+                                            }
+                                            button {
+                                                style: detail_action_button_style(false),
+                                                onclick: {
+                                                    let mod_key = selected_mod.key.clone();
+                                                    move |_| toggle_mod_lock_by_key(&mut app_state, &mut mod_status, &mod_key)
+                                                },
+                                                if selected_mod.locked {
+                                                    "Unlock"
+                                                } else {
+                                                    "Lock"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                section {
+                                    style: detail_empty_panel_style(),
+                                    h3 {
+                                        style: detail_empty_title_style(),
+                                        "{mod_detail_empty_title(all_mod_rows.len())}"
+                                    }
+                                    div {
+                                        style: detail_empty_body_style(),
+                                        "{mod_detail_empty_body(all_mod_rows.len())}"
+                                    }
+                                    div {
+                                        style: detail_empty_actions_style(),
+                                        button {
+                                            style: detail_action_button_style(false),
+                                            onclick: move |_| {
+                                                workspace_page.set(WorkspacePage::Mods);
+                                            },
+                                            "Back to archive"
+                                        }
+                                        if !all_mod_rows.is_empty() {
+                                        button {
+                                            style: detail_action_button_style(false),
+                                            onclick: move |_| {
+                                                mod_search.set(String::new());
+                                                mod_list_filter.set(ModListFilter::All);
+                                                show_hidden.set(true);
+                                            },
+                                            "Clear filters"
+                                        }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Checks {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Checks)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Checks"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Readiness checks for the local app, schema, helper, Steam paths, and WH3 install."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            ReadinessPanel {
+                                report: readiness.clone()
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Compatibility {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Compatibility)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Compatibility"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Analyze enabled packs for file collisions, dependency misses, DB references, unique IDs, script listeners, and read errors."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
                             section {
                                 style: settings_card_style(),
                                 header {
                                     style: settings_card_header_style(),
                                     h3 {
                                         style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Enabled Pack Analysis"
+                                    }
+                                    button {
+                                        style: settings_primary_button_style(),
+                                        disabled: compatibility_operation_in_progress,
+                                        onclick: move |_| {
+                                            start_compatibility_analysis(
+                                                app_state,
+                                                compatibility_operation,
+                                                mod_status,
+                                                conflict_report,
+                                                workspace_page,
+                                            );
+                                        },
+                                        if compatibility_operation_in_progress {
+                                            "Analyzing..."
+                                        } else {
+                                            "Run analysis"
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                        "{launch_enabled_mod_count} enabled mods will be analyzed. Results stay on this screen so the archive can remain focused on mod ordering."
+                                    }
+                                    if let Some(operation) = current_compatibility_operation.as_deref() {
+                                        div {
+                                            role: "status",
+                                            aria_live: "polite",
+                                            style: "margin-top: 12px; border: 1px solid #36513d; background: #17251a; border-radius: 5px; padding: 10px 12px; color: #d8ffe1; font-size: 13px; line-height: 19px;",
+                                            "{operation}. The app remains available while this runs."
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(report) = conflict_report.read().as_ref() {
+                                ConflictPanel { report: report.clone() }
+                            } else {
+                                section {
+                                    style: settings_card_style(),
+                                    header {
+                                        style: settings_card_header_style(),
+                                        h3 {
+                                            style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                            "No analysis yet"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_card_body_style(),
+                                        div {
+                                            style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                            "Use Run analysis or the Analyze button in the archive toolbar."
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::DbViewer {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::DbViewer)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "DB Viewer"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Inspect opened pack indexes, schema-backed DB previews, loc metadata, and WHMM flow summaries away from the mod archive."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Pack Source"
+                                    }
+                                    button {
+                                        style: settings_primary_button_style(),
+                                        onclick: move |_| {
+                                            if let Some(pack_path) = pick_pack_file() {
+                                                pack_selection.set(load_pack_from_path(pack_path));
+                                                workspace_page.set(WorkspacePage::DbViewer);
+                                            }
+                                        },
+                                        "Open pack"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                        if view_model.selected_pack.is_some() {
+                                            "The selected pack is loaded below. Open another pack to replace the current inspection target."
+                                        } else {
+                                            "No pack is open yet. Open a .pack file to inspect its index and first schema-resolvable DB table."
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(pack) = view_model.selected_pack.clone() {
+                                PackPanel { pack }
+                            } else {
+                                section {
+                                    style: settings_card_style(),
+                                    header {
+                                        style: settings_card_header_style(),
+                                        h3 {
+                                            style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                            "No pack selected"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_card_body_style(),
+                                        div {
+                                            style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                            "Use Open pack from this screen or from the archive toolbar."
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Skills {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Skills)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Skills"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Inspect WH3MM user-flow and skill data from opened packs on a dedicated screen."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Skill Source"
+                                    }
+                                    button {
+                                        style: settings_primary_button_style(),
+                                        onclick: move |_| {
+                                            if let Some(pack_path) = pick_pack_file() {
+                                                pack_selection.set(load_pack_from_path(pack_path));
+                                                workspace_page.set(WorkspacePage::Skills);
+                                            }
+                                        },
+                                        "Open pack"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    if let Some(pack) = view_model.selected_pack.as_ref() {
+                                        div {
+                                            style: "display: grid; gap: 6px; min-width: 0;",
+                                            div {
+                                                style: detail_section_label_style(),
+                                                "Opened pack"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #aeb8c8; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
+                                                "{pack.path}"
+                                            }
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                                if let Some(flow_summary) = pack.flow_summary.as_ref() {
+                                                    "{flow_summary.file_count_label} / {flow_summary.read_error_count_label}"
+                                                } else {
+                                                    "No WH3MM user-flow files were detected in this pack."
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        div {
+                                            style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                            "No pack is open yet. Open a .pack file to inspect WH3MM flow/skill data."
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(pack) = view_model.selected_pack.clone() {
+                                if let Some(flow_summary) = pack.flow_summary {
+                                    FlowSummaryPanel { flow_summary }
+                                } else {
+                                    section {
+                                        style: settings_card_style(),
+                                        header {
+                                            style: settings_card_header_style(),
+                                            h3 {
+                                                style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                                "No skills found"
+                                            }
+                                        }
+                                        div {
+                                            style: settings_card_body_style(),
+                                            div {
+                                                style: "font-size: 13px; line-height: 19px; color: #aeb8c8;",
+                                                "The opened pack does not contain WH3MM user-flow files."
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Steam {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Steam)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Steam"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Configure the helper executable and refresh workshop metadata from a dedicated screen."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Helper Configuration"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    input {
+                                        style: settings_input_style(),
+                                        value: "{steam_helper_path}",
+                                        placeholder: "Steam helper executable path",
+                                        oninput: move |event| {
+                                            steam_helper_path.set(event.value());
+                                        },
+                                    }
+                                    select {
+                                        style: settings_input_style(),
+                                        value: "{steam_helper_backend}",
+                                        onchange: move |event| {
+                                            steam_helper_backend.set(event.value());
+                                        },
+                                        option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
+                                        option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                if let Some(helper_path) = pick_steam_helper_file() {
+                                                    let helper_path = helper_path.display().to_string();
+                                                    let backend = steam_helper_backend.read().clone();
+                                                    match save_steam_helper_settings(&helper_path, &backend) {
+                                                        Ok(status) => {
+                                                            steam_helper_path.set(helper_path);
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
+                                                    }
+                                                }
+                                            },
+                                            "Choose"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let helper_path = steam_helper_path.read().trim().to_string();
+                                                let backend = steam_helper_backend.read().clone();
+                                                match save_steam_helper_settings(&helper_path, &backend) {
+                                                    Ok(status) => mod_status.set(Some(status)),
+                                                    Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
+                                                }
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                steam_operation.set(Some("Probing Steam helper".to_string()));
+                                                mod_status.set(Some("Probing Steam helper...".to_string()));
+                                                let receiver = run_in_background(move || probe_steam_helper(&helper_path, &backend));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(status)) => mod_status.set(Some(status)),
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not probe Steam helper: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not probe Steam helper: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
+                                            },
+                                            "Probe"
+                                        }
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let mut next_state = app_state.read().clone();
+                                                steam_operation.set(Some("Refreshing Steam metadata".to_string()));
+                                                mod_status.set(Some("Refreshing Steam metadata...".to_string()));
+                                                let receiver = run_in_background(move || {
+                                                    refresh_steam_from_helper(&mut next_state, &helper_path, &backend)
+                                                        .map(|result| (next_state, result))
+                                                });
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok((next_state, result))) => {
+                                                            let command_panel = steam_refresh_panel_state(&result);
+                                                            let current_ids = workshop_ids_from_mods(&next_state.mods);
+                                                            let mut cache = workshop_metadata_cache.read().clone();
+                                                            cache.merge(&result.metadata, current_unix_ms());
+                                                            cache.retain_ids(&current_ids);
+                                                            let cache_status = write_workshop_metadata_cache_atomic(
+                                                                workshop_metadata_cache_path(),
+                                                                &cache,
+                                                            )
+                                                            .err()
+                                                            .map(|error| format!(" Cache write failed: {}", error.message))
+                                                            .unwrap_or_default();
+                                                            let status = format!(
+                                                                "Steam refreshed: {} subscribed IDs, {} metadata rows ({} requested, {} missing), {} filtered, {} renamed.{}",
+                                                                result.subscribed_ids.len(),
+                                                                result.metadata.len(),
+                                                                result.requested_metadata_count,
+                                                                result.missing_metadata_count,
+                                                                result.filtered_unsubscribed_count,
+                                                                result.renamed_count,
+                                                                cache_status,
+                                                            );
+                                                            subscribed_workshop_ids.set(result.subscribed_ids);
+                                                            steam_metadata.set(cache.metadata_for_ids(&current_ids));
+                                                            workshop_metadata_cache.set(cache);
+                                                            last_steam_command.set(Some(command_panel));
+                                                            app_state.set(next_state);
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not refresh Steam: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not refresh Steam: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
+                                            },
+                                            "Refresh"
+                                        }
+                                    }
+                                    button {
+                                        style: settings_secondary_button_style(),
+                                        disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                        onclick: move |_| {
+                                            if steam_operation.read().is_some() {
+                                                return;
+                                            }
+                                            let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                            let backend = steam_helper_backend.read().clone();
+                                            let state = app_state.read().clone();
+                                            steam_operation.set(Some("Checking Steam updates".to_string()));
+                                            mod_status.set(Some("Checking Steam updates...".to_string()));
+                                            let receiver = run_in_background(move || check_steam_updates_with_helper(&state, &helper_path, &backend));
+                                            spawn(async move {
+                                                match receiver.await {
+                                                    Ok(Ok(result)) => {
+                                                        mod_status.set(Some(steam_check_update_status(&result)));
+                                                        last_steam_command.set(Some(steam_check_update_panel_state(&result)));
+                                                    }
+                                                    Ok(Err(error)) => mod_status.set(Some(format!("Could not check Steam updates: {error}"))),
+                                                    Err(_) => mod_status.set(Some("Could not check Steam updates: background task ended unexpectedly.".to_string())),
+                                                }
+                                                steam_operation.set(None);
+                                            });
+                                        },
+                                        "Check updates"
+                                    }
+                                }
+                            }
+                            SteamMetadataPanel {
+                                helper_path: steam_helper_path.read().clone(),
+                                subscribed_ids: subscribed_workshop_ids.read().clone(),
+                                metadata: steam_metadata.read().clone(),
+                            }
+                            if let Some(command_panel) = last_steam_command.read().clone() {
+                                SteamCommandPanel { state: command_panel }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Workshop {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Workshop)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Workshop"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Run bounded subscribe, download, unsubscribe, and resubscribe actions for workshop IDs."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Command Queue"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    input {
+                                        style: settings_input_style(),
+                                        value: "{steam_command_ids}",
+                                        placeholder: "Workshop IDs separated by spaces, commas, or new lines",
+                                        oninput: move |event| {
+                                            steam_command_ids.set(event.value());
+                                        },
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                steam_operation.set(Some("Subscribing to Workshop items".to_string()));
+                                                mod_status.set(Some("Subscribing to Workshop items...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Subscribe, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not subscribe: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not subscribe: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
+                                            },
+                                            "Subscribe"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                steam_operation.set(Some("Requesting Workshop downloads".to_string()));
+                                                mod_status.set(Some("Requesting Workshop downloads...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Download, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not download: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not download: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
+                                            },
+                                            "Download"
+                                        }
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                steam_operation.set(Some("Unsubscribing from Workshop items".to_string()));
+                                                mod_status.set(Some("Unsubscribing from Workshop items...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Unsubscribe, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not unsubscribe: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not unsubscribe: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
+                                            },
+                                            "Unsubscribe"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                if steam_operation.read().is_some() {
+                                                    return;
+                                                }
+                                                let helper_path = PathBuf::from(steam_helper_path.read().trim().to_string());
+                                                let backend = steam_helper_backend.read().clone();
+                                                let ids = steam_command_ids.read().clone();
+                                                let mods = app_state.read().mods.clone();
+                                                steam_operation.set(Some("Resubscribing Workshop items".to_string()));
+                                                mod_status.set(Some("Resubscribing Workshop items...".to_string()));
+                                                let receiver = run_in_background(move || run_steam_command_with_helper(SteamCommandAction::Resubscribe, &helper_path, &backend, &ids, &mods));
+                                                spawn(async move {
+                                                    match receiver.await {
+                                                        Ok(Ok(result)) => {
+                                                            mod_status.set(Some(result.status));
+                                                            last_steam_command.set(Some(result.panel));
+                                                        }
+                                                        Ok(Err(error)) => mod_status.set(Some(format!("Could not resubscribe: {error}"))),
+                                                        Err(_) => mod_status.set(Some("Could not resubscribe: background task ended unexpectedly.".to_string())),
+                                                    }
+                                                    steam_operation.set(None);
+                                                });
+                                            },
+                                            "Resubscribe"
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(command_panel) = last_steam_command.read().clone() {
+                                SteamCommandPanel { state: command_panel }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Categories {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Categories)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Categories"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Manage category labels used by the archive and mod detail screens."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Category Editor"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(160px, 0.8fr); gap: 12px;",
+                                        input {
+                                            style: settings_input_style(),
+                                            value: "{category_name}",
+                                            placeholder: "Category name",
+                                            oninput: move |event| {
+                                                category_name.set(event.value());
+                                            },
+                                        }
+                                        select {
+                                            style: settings_input_style(),
+                                            value: "{category_color}",
+                                            onchange: move |event| {
+                                                category_color.set(event.value());
+                                            },
+                                            option { value: "blue", "Blue" }
+                                            option { value: "green", "Green" }
+                                            option { value: "yellow", "Yellow" }
+                                            option { value: "red", "Red" }
+                                            option { value: "purple", "Purple" }
+                                            option { value: "gray", "Gray" }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px;",
+                                        select {
+                                            style: settings_input_style(),
+                                            value: "{selected_category_name}",
+                                            onchange: move |event| {
+                                                let value = event.value();
+                                                if !value.trim().is_empty() {
+                                                    selected_category_name.set(value.clone());
+                                                    category_name.set(value);
+                                                }
+                                            },
+                                            option {
+                                                value: "",
+                                                "Saved categories"
+                                            }
+                                            for saved_category in saved_categories.read().iter() {
+                                                option {
+                                                    value: "{saved_category}",
+                                                    "{saved_category}"
+                                                }
+                                            }
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                selected_category_name.set("Core".to_string());
+                                                category_name.set("Core".to_string());
+                                                category_color.set("blue".to_string());
+                                            },
+                                            "Reset"
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            onclick: move |_| {
+                                                let category = category_name.read().trim().to_string();
+                                                let color = category_color.read().trim().to_string();
+                                                match save_category_definition(&category, &color) {
+                                                    Ok(status) => {
+                                                        saved_categories.set(load_category_names());
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not save category: {}", error.message))),
+                                                }
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let old_category = selected_category_name.read().trim().to_string();
+                                                let new_category = category_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match rename_category_definition(&old_category, &new_category, &state) {
+                                                    Ok((mods, status)) => {
+                                                        let mut next_state = app_state.read().clone();
+                                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                        app_state.set(next_state);
+                                                        selected_category_name.set(new_category);
+                                                        saved_categories.set(load_category_names());
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not rename category: {}", error.message))),
+                                                }
+                                            },
+                                            "Rename"
+                                        }
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            onclick: move |_| {
+                                                let category = selected_category_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match delete_category_definition(&category, &state) {
+                                                    Ok((mods, status)) => {
+                                                        let mut next_state = app_state.read().clone();
+                                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                        app_state.set(next_state);
+                                                        let names = load_category_names();
+                                                        let next_category = names.first().cloned().unwrap_or_else(|| "Core".to_string());
+                                                        category_name.set(next_category.clone());
+                                                        selected_category_name.set(next_category);
+                                                        saved_categories.set(names);
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not delete category: {}", error.message))),
+                                                }
+                                            },
+                                            "Delete"
+                                        }
+                                    }
+                                }
+                            }
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Saved Categories"
+                                    }
+                                    span {
+                                        style: "font-size: 12px; color: #aeb8c8;",
+                                        "{saved_category_count} total"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    if category_summaries.is_empty() {
+                                        div {
+                                            style: "font-size: 13px; color: #9fb0c0;",
+                                            "No category definitions saved yet."
+                                        }
+                                    } else {
+                                        div {
+                                            style: "display: grid; gap: 8px;",
+                                            for (category, assigned_count) in category_summaries.iter() {
+                                                div {
+                                                    key: "{category}",
+                                                    style: collection_row_style(),
+                                                    strong { "{category}" }
+                                                    span { "{assigned_count} assigned mods" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Collections {
+                        header {
+                            style: secondary_page_header_style(),
+                            div {
+                                style: secondary_page_kicker_style(),
+                                "{secondary_page_breadcrumb(WorkspacePage::Collections)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2;",
+                                "Collections"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "Save, load, and delete named mod presets without leaving the central workspace."
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: secondary_status_style(),
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: secondary_page_content_style(),
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Preset Editor"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    input {
+                                        style: settings_input_style(),
+                                        value: "{preset_name}",
+                                        placeholder: "Collection / preset name",
+                                        oninput: move |event| {
+                                            preset_name.set(event.value());
+                                        },
+                                    }
+                                    select {
+                                        style: settings_input_style(),
+                                        value: "{preset_name}",
+                                        onchange: move |event| {
+                                            let value = event.value();
+                                            if !value.trim().is_empty() {
+                                                preset_name.set(value);
+                                            }
+                                        },
+                                        option {
+                                            value: "",
+                                            "Saved collections"
+                                        }
+                                        for saved_preset in saved_presets.read().iter() {
+                                            option {
+                                                value: "{saved_preset}",
+                                                "{saved_preset}"
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;",
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            onclick: move |_| {
+                                                let name = preset_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match save_named_preset(&name, &state) {
+                                                    Ok(status) => {
+                                                        saved_presets.set(load_preset_names());
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not save preset: {}", error.message))),
+                                                }
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let name = preset_name.read().trim().to_string();
+                                                let state = app_state.read().clone();
+                                                match load_named_preset(&name, &state) {
+                                                    Ok((mods, status)) => {
+                                                        let mut next_state = state.clone();
+                                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                        match save_mod_state(&next_state) {
+                                                            Ok(save_status) => mod_status.set(Some(format!("{status} {save_status}"))),
+                                                            Err(error) => mod_status.set(Some(format!("{status} Could not save mod state: {}", error.message))),
+                                                        }
+                                                        app_state.set(next_state);
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not load preset: {}", error.message))),
+                                                }
+                                            },
+                                            "Load"
+                                        }
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            onclick: move |_| {
+                                                let name = preset_name.read().trim().to_string();
+                                                match delete_named_preset(&name) {
+                                                    Ok(status) => {
+                                                        let names = load_preset_names();
+                                                        let next_name = if names.iter().any(|saved_name| saved_name == &name) {
+                                                            name
+                                                        } else {
+                                                            names.first().cloned().unwrap_or_else(|| "Default".to_string())
+                                                        };
+                                                        preset_name.set(next_name);
+                                                        saved_presets.set(names);
+                                                        mod_status.set(Some(status));
+                                                    }
+                                                    Err(error) => mod_status.set(Some(format!("Could not delete preset: {}", error.message))),
+                                                }
+                                            },
+                                            "Delete"
+                                        }
+                                    }
+                                }
+                            }
+                            section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Saved Collections"
+                                    }
+                                    span {
+                                        style: "font-size: 12px; color: #aeb8c8;",
+                                        "{saved_preset_count} total"
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    if preset_summaries.is_empty() {
+                                        div {
+                                            style: "font-size: 13px; color: #9fb0c0;",
+                                            "No collections saved yet."
+                                        }
+                                    } else {
+                                        div {
+                                            style: "display: grid; gap: 8px;",
+                                            for preset in preset_summaries.iter() {
+                                                button {
+                                                    key: "{preset}",
+                                                    style: collection_row_button_style(preset_name.read().as_str() == preset.as_str()),
+                                                    onclick: {
+                                                        let preset = preset.clone();
+                                                        move |_| {
+                                                            preset_name.set(preset.clone());
+                                                        }
+                                                    },
+                                                    strong { "{preset}" }
+                                                    span { "Saved load order" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_workspace_page == WorkspacePage::Settings {
+                        header {
+                            style: settings_page_header_style(),
+                            div {
+                                style: settings_page_kicker_style(),
+                                "{settings_focus_breadcrumb(current_settings_focus)}"
+                            }
+                            h2 {
+                                style: "font-size: 25px; line-height: 32px; margin: 0; color: #f2f5f2; letter-spacing: 0;",
+                                "{settings_focus_title(current_settings_focus)}"
+                            }
+                            div {
+                                style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
+                                "{settings_focus_description(current_settings_focus)}"
+                            }
+                        }
+                        if let Some(status_message) = view_model.status_message.clone() {
+                            div {
+                                style: "max-width: 860px; border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 0 auto 16px; color: #aeb8c8; font-size: 13px;",
+                                "{status_message}"
+                            }
+                        }
+                        div {
+                            style: settings_focus_tabs_style(),
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::General),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::General);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::General)}"
+                            }
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::GamePaths),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::GamePaths);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::GamePaths)}"
+                            }
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::Launch),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Launch);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::Launch)}"
+                            }
+                            button {
+                                style: settings_focus_tab_style(current_settings_focus == SettingsFocus::Diagnostics),
+                                onclick: move |_| {
+                                    settings_focus.set(SettingsFocus::Diagnostics);
+                                },
+                                "{settings_focus_tab_label(SettingsFocus::Diagnostics)}"
+                            }
+                        }
+                        div {
+                            style: settings_page_content_style(),
+                            section {
+                                style: settings_focus_card_style(SettingsFocus::General, current_settings_focus),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
                                         "General"
+                                    }
+                                    if current_settings_focus == SettingsFocus::General {
+                                        span {
+                                            style: settings_focus_route_chip_style(),
+                                            "Current screen"
+                                        }
                                     }
                                 }
                                 div {
@@ -1701,11 +3037,53 @@ fn App() -> Element {
                                                     show_hidden.set(event.checked());
                                                 },
                                             }
-                                            span { if *show_hidden.read() { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(*show_hidden.read()),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; grid-template-columns: 1fr 1fr; gap: 10px;",
+                                        style: settings_row_style(),
+                                        div {
+                                            style: "display: grid; gap: 4px; min-width: 0;",
+                                            strong { "Application updates" }
+                                            span {
+                                                style: "font-size: 13px; color: #aeb8c8; overflow-wrap: anywhere;",
+                                                "{update_check_status_label(&current_update_check_state)}"
+                                            }
+                                        }
+                                        div {
+                                            style: "display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end;",
+                                            if let UpdateCheckState::Available { version, release_url } = current_update_check_state.clone() {
+                                                button {
+                                                    style: settings_primary_button_style(),
+                                                    title: "Open the v{version} release on GitHub",
+                                                    onclick: move |_| {
+                                                        match open_release_update(&release_url) {
+                                                            Ok(status) => mod_status.set(Some(status)),
+                                                            Err(error) => mod_status.set(Some(error)),
+                                                        }
+                                                    },
+                                                    "Open v{version}"
+                                                }
+                                            }
+                                            button {
+                                                style: settings_secondary_button_style(),
+                                                disabled: current_update_check_state == UpdateCheckState::Checking,
+                                                onclick: move |_| {
+                                                    start_release_update_check(update_check_state, mod_status, true);
+                                                },
+                                                if current_update_check_state == UpdateCheckState::Checking {
+                                                    "Checking..."
+                                                } else {
+                                                    "Check now"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: settings_button_pair_style(),
                                         button {
                                             style: settings_secondary_button_style(),
                                             onclick: move |_| {
@@ -1752,122 +3130,57 @@ fn App() -> Element {
                                 }
                             }
                             section {
-                                style: settings_card_style(),
-                                header {
-                                    style: settings_card_header_style(),
-                                    h3 {
-                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
-                                        "Diagnostics"
-                                    }
-                                    button {
-                                        style: settings_secondary_button_style(),
-                                        onclick: move |_| {
-                                            let state = app_state.read().clone();
-                                            let game_folder_snapshot = game_folder.read().clone();
-                                            let helper_path_snapshot = steam_helper_path.read().clone();
-                                            let helper_backend_snapshot = steam_helper_backend.read().clone();
-                                            let launch_options_snapshot = launch_options.read().clone();
-                                            let launch_save_name_snapshot = launch_save_name.read().clone();
-                                            let launch_preview_snapshot = launch_preview.read().clone();
-                                            let last_steam_command_snapshot = last_steam_command.read().clone();
-                                            let mod_status_snapshot = mod_status.read().clone();
-                                            let (_, pack_status_snapshot) = pack_selection.read().clone();
-                                            let status_snapshot = combined_status(
-                                                mod_status_snapshot.as_deref(),
-                                                pack_status_snapshot.as_deref(),
-                                            );
-                                            let readiness_snapshot = build_alpha_readiness_report(
-                                                game_folder_snapshot.as_deref(),
-                                                helper_path_snapshot.trim(),
-                                            );
-
-                                            match write_diagnostic_snapshot(DiagnosticSnapshotInput {
-                                                app_state: &state,
-                                                game_folder: game_folder_snapshot.as_deref(),
-                                                helper_path: &helper_path_snapshot,
-                                                helper_backend: &helper_backend_snapshot,
-                                                launch_options: &launch_options_snapshot,
-                                                launch_save_name: &launch_save_name_snapshot,
-                                                status_message: status_snapshot.as_deref(),
-                                                readiness: &readiness_snapshot,
-                                                launch_preview: launch_preview_snapshot.as_ref(),
-                                                last_steam_command: last_steam_command_snapshot.as_ref(),
-                                            }) {
-                                                Ok(path) => mod_status.set(Some(format!("Wrote diagnostic snapshot {}.", path.display()))),
-                                                Err(error) => mod_status.set(Some(format!("Could not write diagnostic snapshot: {}", error.message))),
-                                            }
-                                        },
-                                        "Write snapshot"
-                                    }
-                                }
-                                div {
-                                    style: settings_card_body_style(),
-                                    div {
-                                        style: "display: grid; gap: 8px;",
-                                        label {
-                                            style: "font-size: 14px; color: #e5e7eb;",
-                                            "App log"
-                                        }
-                                        div {
-                                            style: settings_path_box_style(),
-                                            "{diagnostics_log_path_label}"
-                                        }
-                                    }
-                                    div {
-                                        style: "display: grid; gap: 8px;",
-                                        label {
-                                            style: "font-size: 14px; color: #e5e7eb;",
-                                            "Steam helper command log"
-                                        }
-                                        div {
-                                            style: settings_path_box_style(),
-                                            "{steam_command_log_path_label}"
-                                        }
-                                    }
-                                }
-                            }
-                            section {
-                                style: settings_card_style(),
+                                style: settings_focus_card_style(SettingsFocus::GamePaths, current_settings_focus),
                                 header {
                                     style: settings_card_header_style(),
                                     h3 {
                                         style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
                                         "Game Paths"
                                     }
-                                    button {
-                                        style: "border: 0; background: transparent; color: #bfdbfe; padding: 0; font-size: 13px;",
-                                        onclick: move |_| {
-                                            if let Some(discovered_game_folder) = auto_discover_game_folder() {
-                                                match save_game_folder(&discovered_game_folder) {
-                                                    Ok(status) => {
-                                                        game_folder.set(Some(discovered_game_folder));
-                                                        mod_status.set(Some(status));
-                                                    }
-                                                    Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
-                                                }
-                                            } else {
-                                                mod_status.set(Some("Could not auto-detect a WH3 Steam install on this machine.".to_string()));
+                                    div {
+                                        style: settings_card_header_actions_style(),
+                                        if current_settings_focus == SettingsFocus::GamePaths {
+                                            span {
+                                                style: settings_focus_route_chip_style(),
+                                                "Current screen"
                                             }
-                                        },
-                                        "Auto-detect"
+                                        }
+                                        button {
+                                            style: "border: 0; background: transparent; color: #bfdbfe; padding: 0; font-size: 13px;",
+                                            onclick: move |_| {
+                                                if let Some(discovered_game_folder) = auto_discover_game_folder() {
+                                                    match save_game_folder(&discovered_game_folder) {
+                                                        Ok(status) => {
+                                                            game_folder.set(Some(discovered_game_folder));
+                                                            mod_status.set(Some(status));
+                                                        }
+                                                        Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
+                                                    }
+                                                } else {
+                                                    mod_status.set(Some("Could not auto-detect a WH3 Steam install on this machine.".to_string()));
+                                                }
+                                            },
+                                            "Auto-detect"
+                                        }
                                     }
                                 }
                                 div {
                                     style: settings_card_body_style(),
                                     div {
-                                        style: "display: grid; gap: 8px;",
+                                        style: settings_field_style(),
                                         label {
                                             style: "font-size: 14px; color: #e5e7eb;",
-                                            "Game folder"
+                                            "Executable location"
                                         }
                                         div {
-                                            style: "display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 10px;",
+                                            style: settings_path_action_row_style(),
                                             div {
                                                 style: settings_path_box_style(),
-                                                "{current_game_folder_label}"
+                                                "{current_game_executable_label}"
                                             }
                                             button {
                                                 style: settings_secondary_button_style(),
+                                                title: "Choose the WH3 install folder that contains Warhammer3.exe",
                                                 onclick: move |_| {
                                                     if let Some(selected_game_folder) = pick_game_folder() {
                                                         match save_game_folder(&selected_game_folder) {
@@ -1884,47 +3197,98 @@ fn App() -> Element {
                                         }
                                     }
                                     div {
-                                        style: "display: grid; gap: 8px;",
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Data folder"
+                                        }
+                                        div {
+                                            style: settings_path_action_row_style(),
+                                            div {
+                                                style: settings_path_box_style(),
+                                                "{current_game_data_label}"
+                                            }
+                                            button {
+                                                style: settings_secondary_button_style(),
+                                                title: "Choose the WH3 install folder; the data folder is derived from it",
+                                                onclick: move |_| {
+                                                    if let Some(selected_game_folder) = pick_game_folder() {
+                                                        match save_game_folder(&selected_game_folder) {
+                                                            Ok(status) => {
+                                                                game_folder.set(Some(selected_game_folder));
+                                                                mod_status.set(Some(status));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not save game folder: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Change root"
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Game root"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{current_game_folder_label}"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
                                         label {
                                             style: "font-size: 14px; color: #e5e7eb;",
                                             "Steam helper executable"
                                         }
-                                        input {
-                                            style: settings_input_style(),
-                                            value: "{steam_helper_path}",
-                                            placeholder: "Steam helper executable path",
-                                            oninput: move |event| {
-                                                steam_helper_path.set(event.value());
-                                            },
+                                        div {
+                                            style: settings_path_action_row_style(),
+                                            input {
+                                                style: settings_input_style(),
+                                                value: "{steam_helper_path}",
+                                                placeholder: "Steam helper executable path",
+                                                oninput: move |event| {
+                                                    steam_helper_path.set(event.value());
+                                                },
+                                            }
+                                            button {
+                                                style: settings_secondary_button_style(),
+                                                onclick: move |_| {
+                                                    if let Some(helper_path) = pick_steam_helper_file() {
+                                                        let helper_path = helper_path.display().to_string();
+                                                        let backend = steam_helper_backend.read().clone();
+                                                        match save_steam_helper_settings(&helper_path, &backend) {
+                                                            Ok(status) => {
+                                                                steam_helper_path.set(helper_path);
+                                                                mod_status.set(Some(status));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Browse"
+                                            }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; grid-template-columns: minmax(0, 1fr) 96px 96px; gap: 10px;",
-                                        select {
-                                            style: settings_input_style(),
-                                            value: "{steam_helper_backend}",
-                                            onchange: move |event| {
-                                                steam_helper_backend.set(event.value());
-                                            },
-                                            option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
-                                            option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
-                                        }
-                                        button {
-                                            style: settings_secondary_button_style(),
-                                            onclick: move |_| {
-                                                if let Some(helper_path) = pick_steam_helper_file() {
-                                                    let helper_path = helper_path.display().to_string();
-                                                    let backend = steam_helper_backend.read().clone();
-                                                    match save_steam_helper_settings(&helper_path, &backend) {
-                                                        Ok(status) => {
-                                                            steam_helper_path.set(helper_path);
-                                                            mod_status.set(Some(status));
-                                                        }
-                                                        Err(error) => mod_status.set(Some(format!("Could not save Steam helper: {}", error.message))),
-                                                    }
-                                                }
-                                            },
-                                            "Choose"
+                                        style: settings_helper_backend_row_style(),
+                                        div {
+                                            style: settings_inline_field_style(),
+                                            label {
+                                                style: "font-size: 14px; color: #e5e7eb;",
+                                                "Steam helper backend"
+                                            }
+                                            select {
+                                                style: settings_input_style(),
+                                                value: "{steam_helper_backend}",
+                                                onchange: move |event| {
+                                                    steam_helper_backend.set(event.value());
+                                                },
+                                                option { value: STEAM_HELPER_BACKEND_NATIVE, "Native backend" }
+                                                option { value: STEAM_HELPER_BACKEND_FIXTURE, "Fixture backend" }
+                                            }
                                         }
                                         button {
                                             style: settings_secondary_button_style(),
@@ -1942,12 +3306,18 @@ fn App() -> Element {
                                 }
                             }
                             section {
-                                style: settings_card_style(),
+                                style: settings_focus_card_style(SettingsFocus::Launch, current_settings_focus),
                                 header {
                                     style: settings_card_header_style(),
                                     h3 {
                                         style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
                                         "Launch Options"
+                                    }
+                                    if current_settings_focus == SettingsFocus::Launch {
+                                        span {
+                                            style: settings_focus_route_chip_style(),
+                                            "Current screen"
+                                        }
                                     }
                                 }
                                 div {
@@ -1971,7 +3341,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.skip_intro_movies { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.skip_intro_movies),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -1993,7 +3366,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.script_logging { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.script_logging),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2015,7 +3391,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.auto_start_custom_battle { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.auto_start_custom_battle),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2037,7 +3416,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.make_units_generals { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.make_units_generals),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2059,7 +3441,10 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.high_process_priority { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.high_process_priority),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
@@ -2081,11 +3466,14 @@ fn App() -> Element {
                                                     launch_options.set(next);
                                                 },
                                             }
-                                            span { if current_launch_options.close_on_play { "ON" } else { "OFF" } }
+                                            span {
+                                                style: settings_toggle_knob_style(current_launch_options.close_on_play),
+                                                ""
+                                            }
                                         }
                                     }
                                     div {
-                                        style: "display: grid; gap: 8px;",
+                                        style: settings_field_style(),
                                         label {
                                             style: "font-size: 14px; color: #e5e7eb;",
                                             "Campaign save name"
@@ -2099,128 +3487,249 @@ fn App() -> Element {
                                             },
                                         }
                                     }
+                                    div {
+                                        style: settings_launch_actions_style(),
+                                        div {
+                                            style: settings_launch_actions_copy_style(),
+                                            strong { "Launch files" }
+                                            span { "Preview the exact mod list or write launch files without starting WH3." }
+                                        }
+                                        div {
+                                            style: settings_launch_button_row_style(),
+                                            button {
+                                                style: launch_quick_button_style(),
+                                                onclick: move |_| {
+                                                    let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                                    if let Some(selected_game_folder) = selected_game_folder {
+                                                        let state = app_state.read().clone();
+                                                        let launch_options = launch_options.read().clone();
+                                                        let save_name = launch_save_name.read().clone();
+                                                        match save_game_folder(&selected_game_folder)
+                                                            .and_then(|_| build_launch_preview(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                                        {
+                                                            Ok(preview) => {
+                                                                game_folder.set(Some(selected_game_folder));
+                                                                mod_status.set(Some(format!(
+                                                                    "Previewed {} enabled mods and {} generated packs for {}.",
+                                                                    preview.enabled_count,
+                                                                    preview.generated_packs.len(),
+                                                                    preview.mod_list_file_name
+                                                                )));
+                                                                launch_preview.set(Some(preview));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not preview launch: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Preview launch"
+                                            }
+                                            button {
+                                                style: launch_quick_button_style(),
+                                                onclick: move |_| {
+                                                    let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                                    if let Some(selected_game_folder) = selected_game_folder {
+                                                        let state = app_state.read().clone();
+                                                        let launch_options = launch_options.read().clone();
+                                                        let save_name = launch_save_name.read().clone();
+                                                        match save_game_folder(&selected_game_folder)
+                                                            .and_then(|_| prepare_launch_for_game_folder(&state, selected_game_folder.clone(), &launch_options, &save_name))
+                                                        {
+                                                            Ok(status) => {
+                                                                game_folder.set(Some(selected_game_folder));
+                                                                mod_status.set(Some(status));
+                                                            }
+                                                            Err(error) => mod_status.set(Some(format!("Could not prepare launch files: {}", error.message))),
+                                                        }
+                                                    }
+                                                },
+                                                "Prepare files"
+                                            }
+                                        }
+                                    }
+                                    if let Some(preview) = launch_preview.read().as_ref() {
+                                        LaunchPreviewPanel {
+                                            preview: preview.clone(),
+                                            is_stale: preview.fingerprint != current_launch_fingerprint,
+                                        }
+                                    }
+                                }
+                            }
+                            section {
+                                style: settings_focus_card_style(SettingsFocus::Diagnostics, current_settings_focus),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 {
+                                        style: "font-size: 18px; line-height: 24px; margin: 0; color: #f2f5f2;",
+                                        "Diagnostics"
+                                    }
+                                    div {
+                                        style: settings_card_header_actions_style(),
+                                        if current_settings_focus == SettingsFocus::Diagnostics {
+                                            span {
+                                                style: settings_focus_route_chip_style(),
+                                                "Current screen"
+                                            }
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                match open_diagnostics_folder() {
+                                                    Ok(status) => mod_status.set(Some(status)),
+                                                    Err(error) => mod_status.set(Some(error)),
+                                                }
+                                            },
+                                            "Open folder"
+                                        }
+                                        button {
+                                            style: settings_secondary_button_style(),
+                                            onclick: move |_| {
+                                                let state = app_state.read().clone();
+                                                let game_folder_snapshot = game_folder.read().clone();
+                                                let helper_path_snapshot = steam_helper_path.read().clone();
+                                                let helper_backend_snapshot = steam_helper_backend.read().clone();
+                                                let launch_options_snapshot = launch_options.read().clone();
+                                                let launch_save_name_snapshot = launch_save_name.read().clone();
+                                                let launch_preview_snapshot = launch_preview.read().clone();
+                                                let last_steam_command_snapshot = last_steam_command.read().clone();
+                                                let mod_status_snapshot = mod_status.read().clone();
+                                                let (_, pack_status_snapshot) = pack_selection.read().clone();
+                                                let status_snapshot = combined_status(
+                                                    mod_status_snapshot.as_deref(),
+                                                    pack_status_snapshot.as_deref(),
+                                                );
+                                                let readiness_snapshot = build_readiness_report(
+                                                    game_folder_snapshot.as_deref(),
+                                                    helper_path_snapshot.trim(),
+                                                );
+
+                                                match write_diagnostic_snapshot(DiagnosticSnapshotInput {
+                                                    app_state: &state,
+                                                    game_folder: game_folder_snapshot.as_deref(),
+                                                    helper_path: &helper_path_snapshot,
+                                                    helper_backend: &helper_backend_snapshot,
+                                                    launch_options: &launch_options_snapshot,
+                                                    launch_save_name: &launch_save_name_snapshot,
+                                                    status_message: status_snapshot.as_deref(),
+                                                    readiness: &readiness_snapshot,
+                                                    launch_preview: launch_preview_snapshot.as_ref(),
+                                                    last_steam_command: last_steam_command_snapshot.as_ref(),
+                                                }) {
+                                                    Ok(path) => mod_status.set(Some(format!("Wrote diagnostic snapshot {}.", path.display()))),
+                                                    Err(error) => mod_status.set(Some(format!("Could not write diagnostic snapshot: {}", error.message))),
+                                                }
+                                            },
+                                            "Write snapshot"
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "App log"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{diagnostics_log_path_label}"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Steam helper command log"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{steam_command_log_path_label}"
+                                        }
+                                    }
+                                    div {
+                                        style: settings_field_style(),
+                                        label {
+                                            style: "font-size: 14px; color: #e5e7eb;",
+                                            "Crash log"
+                                        }
+                                        div {
+                                            style: settings_path_box_style(),
+                                            "{panic_log_path_label}"
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else {
-            header {
-                style: "min-height: 48px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 8px 26px; border-bottom: 1px solid #262838; background: #11111a;",
-                div {
-                    style: "min-width: 0; display: flex; align-items: center; gap: 10px;",
-                    strong {
-                        style: "font-size: 11px; line-height: 15px; color: #d5d9df; text-transform: uppercase; letter-spacing: 1.5px; white-space: nowrap;",
-                        "Archive"
-                    }
-                    div {
-                        style: "font-size: 12px; line-height: 16px; color: #94a89b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                        "{current_mod_filter_label}: {filtered_mod_count} shown / {visible_mod_count} visible / {launch_enabled_mod_count} launch enabled"
-                    }
-                }
-                div {
-                    style: "display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px;",
-                    button {
-                        style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            if let Some(pack_path) = pick_pack_file() {
-                                pack_selection.set(load_pack_from_path(pack_path));
-                            }
-                        },
-                        "Open pack"
-                    }
-                    button {
-                        style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            if let Some(mod_folder) = pick_mod_folder() {
-                                match load_mods_from_folder(mod_folder) {
-                                    Ok((mods, status)) => {
-                                        let mut next_state = app_state.read().clone();
-                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                        app_state.set(next_state);
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => {
-                                        mod_status.set(Some(format!("Could not discover mods: {}", error.message)));
-                                    }
-                                }
-                            }
-                        },
-                        "Open mod folder"
-                    }
-                    button {
-                        style: archive_toolbar_button_style(true),
-                        onclick: move |_| {
-                            let selected_game_folder = select_game_folder(game_folder.read().clone());
-                            if let Some(selected_game_folder) = selected_game_folder {
-                                match save_game_folder(&selected_game_folder)
-                                    .and_then(|_| load_mods_from_game_folder(selected_game_folder.clone()))
-                                {
-                                    Ok((mods, status)) => {
-                                        let mut next_state = app_state.read().clone();
-                                        let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
-                                        app_state.set(next_state);
-                                        game_folder.set(Some(selected_game_folder));
-                                        mod_status.set(Some(status));
-                                    }
-                                    Err(error) => mod_status.set(Some(format!("Could not load game mods: {}", error.message))),
-                                }
-                            }
-                        },
-                        "Load game mods"
-                    }
-                    button {
-                        style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            let report = analyze_enabled_with_optional_schema(&app_state.read().mods);
-                            mod_status.set(Some(conflict_status(&report)));
-                            conflict_report.set(Some(report));
-                        },
-                        "Analyze"
-                    }
-                    if !mod_search_query.is_empty() {
-                        button {
-                            style: archive_toolbar_button_style(false),
-                        onclick: move |_| {
-                            mod_search.set(String::new());
-                        },
-                        "Clear search"
-                    }
-                }
-                }
-            }
             if let Some(status_message) = view_model.status_message {
                 div {
-                    style: "border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 8px 10px; margin: 14px 26px; color: #aeb8c8; font-size: 13px;",
-                    "{status_message}"
+                    style: archive_status_style(),
+                    span { "{status_message}" }
+                    button {
+                        title: "Dismiss status",
+                        style: archive_status_dismiss_style(),
+                        onclick: move |_| mod_status.set(None),
+                        "×"
+                    }
                 }
             }
             div {
-                style: "display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; padding: 0 26px 26px;",
+                style: archive_workspace_style(),
                 section {
                     style: "display: grid; gap: 6px; min-width: 0;",
                     div {
                         style: archive_table_header_style(),
-                        div { "Ord" }
-                        div { "Status" }
-                        div { "Type" }
-                        div { "Pack / Mod Name" }
-                        div { "Author" }
-                        div { "Updated" }
+                        ArchiveSortButton {
+                            label: "Ord", column: ModSortColumn::Order, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        ArchiveSortButton {
+                            label: "Status", column: ModSortColumn::Status, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        div { "Thumb" }
+                        ArchiveSortButton {
+                            label: "Pack / Mod Name", column: ModSortColumn::Name, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        ArchiveSortButton {
+                            label: "Author", column: ModSortColumn::Author, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        ArchiveSortButton {
+                            label: "Updated", column: ModSortColumn::Updated, sort: *mod_sort.read(),
+                            on_sort: move |column| set_mod_sort_column(&mut mod_sort, &mut mod_status, column),
+                        }
+                        button {
+                            title: "Sources and archive actions",
+                            style: archive_header_icon_button_style(*archive_actions_expanded.read()),
+                            onclick: move |_| {
+                                let expanded = *archive_actions_expanded.read();
+                                archive_actions_expanded.set(!expanded);
+                            },
+                            svg {
+                                view_box: "0 0 24 24", width: "18", height: "18",
+                                fill: "none", stroke: "currentColor", stroke_width: "2",
+                                circle { cx: "12", cy: "12", r: "3" }
+                                path { d: "M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.1 2.1-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V20h-3v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L6.6 17l.1-.1A1.7 1.7 0 0 0 7 15a1.7 1.7 0 0 0-1.6-1H5v-3h.4A1.7 1.7 0 0 0 7 10a1.7 1.7 0 0 0-.3-1.9L6.6 8l2.1-2.1.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V4h3v.7a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.4v3H21a1.7 1.7 0 0 0-1.6 1Z" }
+                            }
+                        }
                     }
                     if all_mod_rows.is_empty() {
                         div {
-                            style: "border: 1px solid #28323d; border-radius: 6px; background: #151b18; padding: 22px 18px; color: #cbd8cc; display: grid; gap: 8px;",
+                            style: archive_empty_panel_style(),
                             h3 {
-                                style: "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;",
-                                "No mods loaded"
+                                style: archive_empty_title_style(),
+                                "{archive_empty_title(all_mod_rows.len())}"
                             }
                             div {
-                                style: "font-size: 13px; line-height: 18px; color: #9fb0c0;",
-                                "No source selected."
+                                style: archive_empty_body_style(),
+                                "{archive_empty_body(all_mod_rows.len())}"
                             }
                             div {
-                                style: "display: flex; flex-wrap: wrap; gap: 8px;",
+                                style: archive_empty_actions_style(),
                                 button {
-                                    style: "border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 6px; padding: 8px 12px;",
+                                    style: archive_empty_button_style(true),
                                     onclick: move |_| {
                                         let selected_game_folder = select_game_folder(game_folder.read().clone());
                                         if let Some(selected_game_folder) = selected_game_folder {
@@ -2241,7 +3750,7 @@ fn App() -> Element {
                                     "Load game mods"
                                 }
                                 button {
-                                    style: "border: 1px solid #3a4756; background: #202832; color: #edf2f7; border-radius: 6px; padding: 8px 12px;",
+                                    style: archive_empty_button_style(false),
                                     onclick: move |_| {
                                         if let Some(mod_folder) = pick_mod_folder() {
                                             match load_mods_from_folder(mod_folder) {
@@ -2263,14 +3772,31 @@ fn App() -> Element {
                         }
                     } else if filtered_mods.is_empty() {
                         div {
-                            style: "border: 1px solid #28323d; border-radius: 6px; background: #151b18; padding: 18px 16px; color: #9fb0c0; font-size: 13px;",
-                            "No mods match the current search."
+                            style: archive_empty_panel_style(),
+                            h3 {
+                                style: archive_empty_title_style(),
+                                "{archive_empty_title(all_mod_rows.len())}"
+                            }
+                            div {
+                                style: archive_empty_body_style(),
+                                "{archive_empty_body(all_mod_rows.len())}"
+                            }
+                            button {
+                                style: archive_empty_button_style(false),
+                                onclick: move |_| {
+                                    mod_search.set(String::new());
+                                    mod_list_filter.set(ModListFilter::All);
+                                    show_hidden.set(true);
+                                },
+                                "Clear filters"
+                            }
                         }
                     }
-                    for (mod_order, mod_row) in filtered_mods.iter().enumerate().map(|(index, row)| (index + 1, row)) {
+                    for mod_row in filtered_mods.iter() {
                         article {
                             key: "{mod_row.key}",
-                            style: mod_row_style(active_mod_key.as_deref() == Some(mod_row.key.as_str())),
+                            title: "Open Mod Settings for {mod_row.display_name}\n{mod_row.subtitle}",
+                            style: mod_row_style(explicitly_selected_mod_key.as_deref() == Some(mod_row.key.as_str())),
                             onclick: {
                                 let mod_key = mod_row.key.clone();
                                 move |_| {
@@ -2280,7 +3806,7 @@ fn App() -> Element {
                             },
                             div {
                                 style: "font-size: 13px; color: #d5d9df; text-align: center; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                "{mod_order}"
+                                "{mod_row.load_order}"
                             }
                             button {
                                 title: "Enable or disable mod",
@@ -2305,15 +3831,14 @@ fn App() -> Element {
                                         }
                                     }
                                 },
-                                if mod_row.enabled {
-                                    "ON"
-                                } else {
-                                    "OFF"
-                                }
+                                span { style: mod_enable_knob_style(mod_row.enabled, mod_row.locked), "" }
                             }
-                            div {
-                                style: source_tile_style(mod_row),
-                                "{mod_source_label(mod_row)}"
+                            ArchiveThumbnail {
+                                url: mod_row.thumbnail_path.as_ref().map(|_| mod_thumbnail_url(mod_row)),
+                                display_name: mod_row.display_name.clone(),
+                                source: mod_row.source,
+                                source_label: mod_source_label(mod_row),
+                                source_description: mod_source_description(mod_row),
                             }
                             div {
                                 style: "min-width: 0;",
@@ -2323,7 +3848,7 @@ fn App() -> Element {
                                 }
                                 div {
                                     style: "font-size: 12px; color: #9aa4b7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                    "{mod_row.subtitle}"
+                                    "{mod_row.pack_name}"
                                 }
                                 if !mod_row.categories.is_empty() {
                                     div {
@@ -2334,85 +3859,150 @@ fn App() -> Element {
                             }
                             div {
                                 style: "font-size: 13px; color: #d5d9df; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{mod_author_label(mod_row, &current_steam_metadata)}"
+                                "{mod_author_label(mod_row)}"
                             }
                             div {
                                 style: "font-size: 12px; color: #aeb8c8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;",
-                                "{mod_updated_label(mod_row, &current_steam_metadata, current_time_ms)}"
+                                "{mod_updated_label(mod_row, current_time_ms)}"
                             }
                         }
                     }
                 }
                 div {
-                    style: archive_filter_bar_style(),
-                    span {
-                        style: "font-size: 11px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 1.2px;",
-                        "Filter"
+                    style: archive_utility_dock_style(),
+                    div {
+                        style: archive_filter_bar_style(),
+                        button {
+                            title: "Show archive filters",
+                            style: archive_filter_chip_style(*archive_filters_expanded.read() || archive_filter_count > 0),
+                            onclick: move |_| {
+                                let expanded = *archive_filters_expanded.read();
+                                archive_filters_expanded.set(!expanded);
+                            },
+                            span { "Filter ({archive_filter_count})" }
+                            span { if *archive_filters_expanded.read() { "^" } else { ">" } }
+                        }
+                        if *archive_filters_expanded.read() {
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::All),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::All);
+                                },
+                                "All {total_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Enabled),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Enabled);
+                                },
+                                "Enabled {enabled_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Disabled),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Disabled);
+                                },
+                                "Disabled {disabled_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Locked),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Locked);
+                                },
+                                "Locked {locked_mod_count}"
+                            }
+                            button {
+                                style: archive_filter_button_style(current_mod_filter == ModListFilter::Hidden),
+                                onclick: move |_| {
+                                    mod_list_filter.set(ModListFilter::Hidden);
+                                },
+                                "Hidden {hidden_mod_count}"
+                            }
+                            if !mod_search_query.is_empty() {
+                                button {
+                                    style: archive_filter_button_style(false),
+                                    onclick: move |_| {
+                                        mod_search.set(String::new());
+                                    },
+                                    "Clear search"
+                                }
+                            }
+                        }
                     }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::All),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::All);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "All {total_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Enabled),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Enabled);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Enabled {enabled_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Disabled),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Disabled);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Disabled {disabled_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Locked),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Locked);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Locked {locked_mod_count}"
-                    }
-                    button {
-                        style: archive_filter_button_style(current_mod_filter == ModListFilter::Hidden),
-                        onclick: move |_| {
-                            mod_list_filter.set(ModListFilter::Hidden);
-                            library_tool_tab.set(LibraryToolTab::None);
-                        },
-                        "Hidden {hidden_mod_count}"
+                    div {
+                        style: archive_source_action_row_style(),
+                        if *archive_actions_expanded.read() {
+                            button {
+                                style: archive_toolbar_button_style(false),
+                                onclick: move |_| {
+                                    if let Some(pack_path) = pick_pack_file() {
+                                        pack_selection.set(load_pack_from_path(pack_path));
+                                        workspace_page.set(WorkspacePage::DbViewer);
+                                    }
+                                },
+                                "Open pack"
+                            }
+                            button {
+                                style: archive_toolbar_button_style(false),
+                                onclick: move |_| {
+                                    if let Some(mod_folder) = pick_mod_folder() {
+                                        match load_mods_from_folder(mod_folder) {
+                                            Ok((mods, status)) => {
+                                                let mut next_state = app_state.read().clone();
+                                                let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                app_state.set(next_state);
+                                                mod_status.set(Some(status));
+                                            }
+                                            Err(error) => {
+                                                mod_status.set(Some(format!("Could not discover mods: {}", error.message)));
+                                            }
+                                        }
+                                    }
+                                },
+                                "Open folder"
+                            }
+                            button {
+                                style: archive_toolbar_button_style(true),
+                                onclick: move |_| {
+                                    let selected_game_folder = select_game_folder(game_folder.read().clone());
+                                    if let Some(selected_game_folder) = selected_game_folder {
+                                        match save_game_folder(&selected_game_folder)
+                                            .and_then(|_| load_mods_from_game_folder(selected_game_folder.clone()))
+                                        {
+                                            Ok((mods, status)) => {
+                                                let mut next_state = app_state.read().clone();
+                                                let _ = next_state.apply(CoreCommand::ReplaceMods { mods });
+                                                app_state.set(next_state);
+                                                game_folder.set(Some(selected_game_folder));
+                                                mod_status.set(Some(status));
+                                            }
+                                            Err(error) => mod_status.set(Some(format!("Could not load game mods: {}", error.message))),
+                                        }
+                                    }
+                                },
+                                "Load game"
+                            }
+                            button {
+                                style: archive_toolbar_button_style(false),
+                                disabled: compatibility_operation_in_progress,
+                                onclick: move |_| {
+                                    start_compatibility_analysis(
+                                        app_state,
+                                        compatibility_operation,
+                                        mod_status,
+                                        conflict_report,
+                                        workspace_page,
+                                    );
+                                },
+                                if compatibility_operation_in_progress {
+                                    "Analyzing..."
+                                } else {
+                                    "Analyze"
+                                }
+                            }
+                        }
                     }
                 }
-                if let Some(pack) = view_model.selected_pack {
-                    PackPanel { pack }
-                }
-            }
-            div {
-                style: "display: grid; gap: 12px; margin-top: 16px;",
-                if let Some(preview) = launch_preview.read().as_ref() {
-                    LaunchPreviewPanel {
-                        preview: preview.clone(),
-                        is_stale: preview.fingerprint != current_launch_fingerprint,
-                    }
-                }
-                SteamMetadataPanel {
-                    helper_path: steam_helper_path.read().clone(),
-                    subscribed_ids: subscribed_workshop_ids.read().clone(),
-                    metadata: steam_metadata.read().clone(),
-                }
-                if let Some(command_panel) = last_steam_command.read().as_ref() {
-                    SteamCommandPanel { state: command_panel.clone() }
-                }
-            }
-            if let Some(report) = conflict_report.read().as_ref() {
-                ConflictPanel { report: report.clone() }
             }
                     }
                 }
@@ -2438,12 +4028,42 @@ fn app_diagnostic_log_path() -> PathBuf {
     diagnostics_dir().join(APP_DIAGNOSTIC_LOG_FILE)
 }
 
+fn panic_diagnostic_log_path() -> PathBuf {
+    diagnostics_dir().join(PANIC_DIAGNOSTIC_LOG_FILE)
+}
+
 fn steam_helper_command_log_path() -> PathBuf {
     diagnostics_dir().join(STEAM_HELPER_COMMAND_LOG_FILE)
 }
 
 fn diagnostic_snapshot_path() -> PathBuf {
     diagnostics_dir().join(format!("wh3mm-diagnostic-{}.txt", current_unix_ms()))
+}
+
+fn install_panic_diagnostic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let thread = thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let _ = append_app_diagnostic_log_event_to_path(
+            &panic_diagnostic_log_path(),
+            &format!("panic on thread {thread_name}: {panic_info}"),
+        );
+        default_hook(panic_info);
+    }));
+}
+
+fn open_diagnostics_folder() -> Result<String, String> {
+    let path = diagnostics_dir();
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "Could not create diagnostics folder {}: {error}",
+            path.display()
+        )
+    })?;
+    let target = path.display().to_string();
+    open_system_target(&target)?;
+    Ok(format!("Opened diagnostics folder: {target}"))
 }
 
 fn append_app_diagnostic_log_event(event: &str) -> wh3mm_core::CoreResult<PathBuf> {
@@ -2517,6 +4137,7 @@ fn diagnostic_snapshot_text(input: &DiagnosticSnapshotInput<'_>) -> String {
         format!("timestamp_unix_ms={}", current_unix_ms()),
         format!("config_dir={}", app_config_dir().display()),
         format!("app_log={}", app_diagnostic_log_path().display()),
+        format!("crash_log={}", panic_diagnostic_log_path().display()),
         format!(
             "steam_helper_command_log={}",
             steam_helper_command_log_path().display()
@@ -2567,7 +4188,7 @@ fn diagnostic_snapshot_text(input: &DiagnosticSnapshotInput<'_>) -> String {
         lines.push(format!(
             "readiness.{}={}: {}",
             row.label,
-            alpha_readiness_status_label(&row.status),
+            readiness_status_label(&row.status),
             row.detail
         ));
     }
@@ -2618,11 +4239,11 @@ fn diagnostic_snapshot_text(input: &DiagnosticSnapshotInput<'_>) -> String {
     lines.join("\n")
 }
 
-fn alpha_readiness_status_label(status: &AlphaReadinessStatus) -> &'static str {
+fn readiness_status_label(status: &ReadinessStatus) -> &'static str {
     match status {
-        AlphaReadinessStatus::Ready => "READY",
-        AlphaReadinessStatus::Warning => "CHECK",
-        AlphaReadinessStatus::Error => "ERROR",
+        ReadinessStatus::Ready => "READY",
+        ReadinessStatus::Warning => "CHECK",
+        ReadinessStatus::Error => "ERROR",
     }
 }
 
@@ -2643,7 +4264,39 @@ fn app_brand_title() -> &'static str {
 }
 
 fn app_brand_subtitle(app_title: &str) -> String {
-    format!("{app_title} / Windows alpha")
+    format!("{app_title} / Windows")
+}
+
+fn top_search_should_route_to_mods(workspace_page: WorkspacePage) -> bool {
+    workspace_page != WorkspacePage::Mods
+}
+
+fn settings_workspace_active(workspace_page: WorkspacePage) -> bool {
+    workspace_page == WorkspacePage::Settings
+}
+
+fn library_settings_nav_visible(workspace_page: WorkspacePage) -> bool {
+    settings_workspace_active(workspace_page)
+}
+
+fn top_shell_header_style() -> &'static str {
+    "height: 66px; border-bottom: 1px solid #263041; background: #121620; display: grid; grid-template-columns: minmax(220px, auto) minmax(260px, 420px) auto; align-items: center; gap: 16px; padding: 8px 18px; flex-shrink: 0;"
+}
+
+fn top_brand_title_style() -> &'static str {
+    "font-size: 21px; line-height: 27px; margin: 0; color: #65f58b; letter-spacing: 0; white-space: nowrap; text-transform: uppercase;"
+}
+
+fn top_search_style() -> &'static str {
+    "min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid #35374a; background: #242531; border-radius: 5px; padding: 0 10px;"
+}
+
+fn top_actions_style() -> &'static str {
+    "min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #9fb0c0; font-size: 12px; white-space: nowrap;"
+}
+
+fn top_update_button_style() -> &'static str {
+    "height: 36px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid #4ade80; background: #183b25; color: #86efac; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 750; white-space: nowrap;"
 }
 
 fn mod_row_matches_query(mod_row: &ModRowViewModel, normalized_query: &str) -> bool {
@@ -2659,6 +4312,14 @@ fn mod_row_matches_query(mod_row: &ModRowViewModel, normalized_query: &str) -> b
             .subtitle
             .to_ascii_lowercase()
             .contains(normalized_query)
+        || mod_row
+            .pack_name
+            .to_ascii_lowercase()
+            .contains(normalized_query)
+        || mod_row
+            .author
+            .as_deref()
+            .is_some_and(|author| author.to_ascii_lowercase().contains(normalized_query))
         || mod_row
             .categories
             .iter()
@@ -2676,6 +4337,113 @@ fn selected_or_first_mod_row(
     selected_key
         .and_then(|key| rows.iter().find(|row| row.key == key).cloned())
         .or_else(|| rows.first().cloned())
+}
+
+fn selected_mod_neighbor_key(
+    rows: &[ModRowViewModel],
+    selected_key: Option<&str>,
+    direction: i8,
+) -> Option<String> {
+    let selected_key = selected_key?;
+    let selected_index = rows.iter().position(|row| row.key == selected_key)?;
+    let neighbor_index = if direction < 0 {
+        selected_index.checked_sub(1)?
+    } else if direction > 0 {
+        selected_index.checked_add(1)?
+    } else {
+        selected_index
+    };
+
+    rows.get(neighbor_index).map(|row| row.key.clone())
+}
+
+fn selected_mod_position_label(
+    rows: &[ModRowViewModel],
+    selected_key: Option<&str>,
+    has_explicit_selection: bool,
+) -> String {
+    if rows.is_empty() {
+        return "No mods".to_string();
+    }
+
+    let Some(index) = selected_key.and_then(|key| rows.iter().position(|row| row.key == key))
+    else {
+        return format!("{} mods", rows.len());
+    };
+
+    if has_explicit_selection {
+        format!("Mod {} of {}", index + 1, rows.len())
+    } else {
+        format!("First visible / {}", rows.len())
+    }
+}
+
+fn mod_settings_action_disabled(has_selected_mod: bool) -> bool {
+    !has_selected_mod
+}
+
+fn mod_settings_action_title(
+    total_mod_count: usize,
+    has_selectable_mod: bool,
+    has_explicit_selection: bool,
+) -> &'static str {
+    if has_selectable_mod && has_explicit_selection {
+        "Open selected mod settings"
+    } else if has_selectable_mod {
+        "Open first visible mod settings"
+    } else if total_mod_count == 0 {
+        "Load game mods before opening Mod Settings"
+    } else {
+        "Clear search or filters before opening Mod Settings"
+    }
+}
+
+fn mod_context_label(has_explicit_selection: bool) -> &'static str {
+    if has_explicit_selection {
+        "Selected Mod"
+    } else {
+        "First Visible Mod"
+    }
+}
+
+fn mod_detail_empty_title(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "No mod selected"
+    } else {
+        "No visible mod selected"
+    }
+}
+
+fn mod_detail_empty_body(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "Load game mods or open a mod folder, then select a row from the archive."
+    } else {
+        "Current search or filters hide every mod. Clear them to restore the archive selection."
+    }
+}
+
+fn archive_empty_title(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "No mods loaded"
+    } else {
+        "No visible mods"
+    }
+}
+
+fn archive_empty_body(total_mod_count: usize) -> &'static str {
+    if total_mod_count == 0 {
+        "No source selected."
+    } else {
+        "Current search or filters hide every archive row."
+    }
+}
+
+fn mod_order_label(all_rows: &[ModRowViewModel], mod_key: &str) -> String {
+    all_rows
+        .iter()
+        .find(|row| row.key == mod_key)
+        .map(|row| row.load_order.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn mod_row_matches_filter(mod_row: &ModRowViewModel, filter: ModListFilter) -> bool {
@@ -2708,6 +4476,7 @@ fn mod_categories_label(mod_row: &ModRowViewModel) -> String {
     }
 }
 
+#[cfg(test)]
 fn mod_list_filter_label(filter: ModListFilter) -> &'static str {
     match filter {
         ModListFilter::All => "All mods",
@@ -2720,25 +4489,85 @@ fn mod_list_filter_label(filter: ModListFilter) -> &'static str {
 
 fn mod_row_style(active: bool) -> &'static str {
     if active {
-        "min-height: 58px; display: grid; grid-template-columns: 44px 76px 58px minmax(0, 1.9fr) minmax(110px, 0.55fr) minmax(92px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #4ade80; border-left: 3px solid #65f58b; border-radius: 5px; padding: 8px 14px; background: #20242b; cursor: pointer;"
+        "min-height: 60px; display: grid; grid-template-columns: 42px 64px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #3b82f6; border-left: 3px solid #60a5fa; border-radius: 4px; padding: 6px 14px; background: #1d2631; cursor: pointer;"
     } else {
-        "min-height: 58px; display: grid; grid-template-columns: 44px 76px 58px minmax(0, 1.9fr) minmax(110px, 0.55fr) minmax(92px, 0.45fr); align-items: center; gap: 10px; border: 1px solid #242735; border-left: 3px solid transparent; border-radius: 5px; padding: 8px 14px; background: #1b1c26; cursor: pointer;"
+        "min-height: 60px; display: grid; grid-template-columns: 42px 64px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; border: 1px solid #252b38; border-left: 3px solid transparent; border-radius: 4px; padding: 6px 14px; background: #171922; cursor: pointer;"
     }
 }
 
+fn archive_status_style() -> &'static str {
+    "position: fixed; right: 24px; bottom: 24px; z-index: 50; max-width: min(520px, calc(100vw - 48px)); display: flex; align-items: flex-start; gap: 12px; border: 1px solid #3b4658; background: #1b202a; border-radius: 7px; padding: 10px 12px; color: #d7dee9; font-size: 13px; line-height: 18px; box-shadow: 0 12px 34px rgba(0, 0, 0, 0.38);"
+}
+
+fn archive_status_dismiss_style() -> &'static str {
+    "flex: 0 0 auto; border: 0; background: transparent; color: #aeb8c8; padding: 0 2px; font-size: 18px; line-height: 18px; cursor: pointer;"
+}
+
+fn archive_workspace_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; padding: 0 10px 24px;"
+}
+
 fn archive_table_header_style() -> &'static str {
-    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 44px 76px 58px minmax(0, 1.9fr) minmax(110px, 0.55fr) minmax(92px, 0.45fr); align-items: center; gap: 10px; padding: 11px 14px; border: 1px solid #343545; background: #343541; color: #d5d9df; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 1.5px;"
+    "position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: 42px 64px 52px minmax(0, 1.9fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) 38px; align-items: center; gap: 10px; padding: 9px 14px; border: 1px solid #303746; background: #20242f; color: #cbd5e1; font-size: 11px; line-height: 15px; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn archive_empty_panel_style() -> &'static str {
+    "min-height: 118px; display: grid; align-content: center; gap: 8px; border: 1px solid #252b38; border-left: 3px solid #303746; border-radius: 4px; background: #151722; padding: 18px 20px; color: #cbd8cc;"
+}
+
+fn archive_empty_title_style() -> &'static str {
+    "font-size: 17px; line-height: 22px; margin: 0; color: #edf2f7;"
+}
+
+fn archive_empty_body_style() -> &'static str {
+    "font-size: 13px; line-height: 18px; color: #9aa4b7;"
+}
+
+fn archive_empty_actions_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px;"
+}
+
+fn archive_empty_button_style(primary: bool) -> &'static str {
+    if primary {
+        "min-height: 34px; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 5px; padding: 8px 12px; font-size: 13px; font-weight: 800;"
+    } else {
+        "min-height: 34px; border: 1px solid #3a4354; background: #242936; color: #edf2f7; border-radius: 5px; padding: 8px 12px; font-size: 13px;"
+    }
+}
+
+fn archive_header_icon_button_style(active: bool) -> &'static str {
+    if active {
+        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #65f58b; background: #17251a; color: #b7ffc7; border-radius: 5px; padding: 0;"
+    } else {
+        "justify-self: end; width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid #3a4354; background: #242936; color: #d5dbe6; border-radius: 5px; padding: 0;"
+    }
+}
+
+fn archive_utility_dock_style() -> &'static str {
+    "position: sticky; bottom: 0; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; border: 1px solid #293142; background: rgba(21, 24, 33, 0.98); border-radius: 6px; padding: 8px; box-shadow: 0 -10px 24px rgba(0, 0, 0, 0.22);"
 }
 
 fn archive_filter_bar_style() -> &'static str {
-    "display: flex; align-items: center; flex-wrap: wrap; gap: 7px; max-width: max-content; min-height: 44px; border: 1px solid #303346; background: #1a1b25; border-radius: 5px; padding: 6px 8px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);"
+    "display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; min-height: 34px; box-sizing: border-box;"
+}
+
+fn archive_source_action_row_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; min-width: 0;"
+}
+
+fn archive_filter_chip_style(active: bool) -> &'static str {
+    if active {
+        "min-width: 130px; height: 36px; display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 0 14px; font-size: 13px; font-weight: 650; letter-spacing: 0;"
+    } else {
+        "min-width: 130px; height: 36px; display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #303746; background: #232530; color: #d8ded8; border-radius: 5px; padding: 0 14px; font-size: 13px; font-weight: 650; letter-spacing: 0;"
+    }
 }
 
 fn archive_filter_button_style(active: bool) -> &'static str {
     if active {
-        "min-width: 78px; height: 30px; border: 1px solid #65f58b; background: #202c2a; color: #65f58b; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
+        "min-width: 78px; height: 30px; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
     } else {
-        "min-width: 78px; height: 30px; border: 1px solid #333541; background: #242531; color: #d5d9df; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 700; letter-spacing: 0;"
+        "min-width: 78px; height: 30px; border: 1px solid #303746; background: #1f2430; color: #d5d9df; border-radius: 4px; padding: 0 10px; font-size: 11px; font-weight: 700; letter-spacing: 0;"
     }
 }
 
@@ -2746,27 +4575,26 @@ fn library_nav_active(
     target: LibraryNavTarget,
     workspace_page: WorkspacePage,
     mod_filter: ModListFilter,
-    library_tool: LibraryToolTab,
 ) -> bool {
     match target {
         LibraryNavTarget::AllMods => {
-            workspace_page == WorkspacePage::Mods
-                && mod_filter == ModListFilter::All
-                && library_tool == LibraryToolTab::None
+            (workspace_page == WorkspacePage::Mods && mod_filter == ModListFilter::All)
+                || workspace_page == WorkspacePage::ModDetail
         }
         LibraryNavTarget::Enabled => {
-            workspace_page == WorkspacePage::Mods
-                && mod_filter == ModListFilter::Enabled
-                && library_tool == LibraryToolTab::None
+            workspace_page == WorkspacePage::Mods && mod_filter == ModListFilter::Enabled
         }
-        LibraryNavTarget::Categories => {
-            workspace_page == WorkspacePage::Mods && library_tool == LibraryToolTab::Categories
-        }
-        LibraryNavTarget::Collections => {
-            workspace_page == WorkspacePage::Mods && library_tool == LibraryToolTab::Presets
-        }
-        LibraryNavTarget::Settings => workspace_page == WorkspacePage::Settings,
+        LibraryNavTarget::Categories => workspace_page == WorkspacePage::Categories,
+        LibraryNavTarget::Collections => workspace_page == WorkspacePage::Collections,
     }
+}
+
+fn settings_focus_active(
+    workspace_page: WorkspacePage,
+    current_focus: SettingsFocus,
+    target_focus: SettingsFocus,
+) -> bool {
+    workspace_page == WorkspacePage::Settings && current_focus == target_focus
 }
 
 fn nav_button_style(active: bool) -> &'static str {
@@ -2777,15 +4605,43 @@ fn nav_button_style(active: bool) -> &'static str {
     }
 }
 
-fn nav_badge_style() -> &'static str {
-    "width: 26px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid currentColor; border-radius: 4px; font-size: 9px; font-weight: 800; letter-spacing: 0;"
+fn nav_icon_tile_style(active: bool) -> &'static str {
+    if active {
+        "width: 26px; height: 24px; display: grid; grid-template-columns: repeat(2, 1fr); place-items: center; gap: 2px; border: 1px solid currentColor; border-radius: 4px; padding: 4px; box-sizing: border-box;"
+    } else {
+        "width: 26px; height: 24px; display: grid; grid-template-columns: repeat(2, 1fr); place-items: center; gap: 2px; border: 1px solid #3d4a3e; border-radius: 4px; padding: 4px; box-sizing: border-box;"
+    }
+}
+
+fn nav_icon_dot_style() -> &'static str {
+    "width: 4px; height: 4px; border-radius: 999px; background: currentColor;"
+}
+
+fn nav_icon_line_style() -> &'static str {
+    "grid-column: 1 / -1; width: 12px; height: 2px; border-radius: 999px; background: currentColor;"
+}
+
+fn nav_icon_stack_style() -> &'static str {
+    "grid-column: 1 / -1; width: 13px; height: 10px; border: 1px solid currentColor; border-radius: 2px; box-shadow: 3px 3px 0 -1px #171b24, 3px 3px 0 0 currentColor;"
+}
+
+fn nav_icon_ring_style() -> &'static str {
+    "grid-column: 1 / -1; width: 10px; height: 10px; border: 2px solid currentColor; border-radius: 999px; box-sizing: border-box;"
+}
+
+fn nav_count_chip_style(active: bool) -> &'static str {
+    if active {
+        "justify-self: end; min-width: 28px; height: 22px; display: inline-grid; place-items: center; border: 1px solid #2f6f44; background: #25322b; color: #d8ffe1; border-radius: 4px; padding: 0 7px; font-size: 11px; font-weight: 800; letter-spacing: 0;"
+    } else {
+        "justify-self: end; min-width: 28px; height: 22px; display: inline-grid; place-items: center; border: 1px solid #2d3442; background: #20232d; color: #d5d9df; border-radius: 4px; padding: 0 7px; font-size: 11px; font-weight: 750; letter-spacing: 0;"
+    }
 }
 
 fn top_icon_button_style(active: bool) -> &'static str {
     if active {
-        "width: 34px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 34px; border: 1px solid #65f58b; background: #1b2a1d; color: #65f58b; border-radius: 7px; padding: 0; font-size: 10px; font-weight: 850; letter-spacing: 0;"
+        "width: 38px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 6px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
     } else {
-        "width: 34px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 34px; border: 1px solid #333541; background: #1a1b25; color: #cbd8cc; border-radius: 7px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
+        "width: 38px; height: 34px; display: inline-grid; place-items: center; flex: 0 0 auto; border: 1px solid #303746; background: #1f2430; color: #cbd8cc; border-radius: 6px; padding: 0; font-size: 10px; font-weight: 750; letter-spacing: 0;"
     }
 }
 
@@ -2797,20 +4653,198 @@ fn library_utility_button_style(active: bool) -> &'static str {
     }
 }
 
+fn settings_focus_title(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "General Settings",
+        SettingsFocus::GamePaths => "Game Paths",
+        SettingsFocus::Launch => "Launch Options",
+        SettingsFocus::Diagnostics => "Logs and Diagnostics",
+    }
+}
+
+fn settings_focus_tab_label(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "General",
+        SettingsFocus::GamePaths => "Game Paths",
+        SettingsFocus::Launch => "Launch Options",
+        SettingsFocus::Diagnostics => "Diagnostics",
+    }
+}
+
+fn settings_focus_description(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "Manage app-level behavior plus TS config import and export.",
+        SettingsFocus::GamePaths => {
+            "Set the WH3 install folder and Steam helper integration paths."
+        }
+        SettingsFocus::Launch => {
+            "Tune WH3 startup behavior, generated packs, save continuation, and launch preview."
+        }
+        SettingsFocus::Diagnostics => {
+            "Find live log paths and write a diagnostic snapshot for troubleshooting."
+        }
+    }
+}
+
+fn settings_focus_breadcrumb(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::General => "Settings / General",
+        SettingsFocus::GamePaths => "Settings / Game Paths",
+        SettingsFocus::Launch => "Settings / Launch Options",
+        SettingsFocus::Diagnostics => "Settings / Diagnostics",
+    }
+}
+
+fn settings_game_executable_label(game_folder: Option<&Path>) -> String {
+    settings_game_child_path_label(
+        game_folder,
+        "Warhammer3.exe",
+        "No WH3 executable path selected",
+    )
+}
+
+fn settings_game_data_label(game_folder: Option<&Path>) -> String {
+    settings_game_child_path_label(game_folder, "data", "No WH3 data folder selected")
+}
+
+fn settings_game_child_path_label(
+    game_folder: Option<&Path>,
+    child_name: &str,
+    empty_label: &str,
+) -> String {
+    let Some(game_folder) = game_folder else {
+        return empty_label.to_string();
+    };
+
+    let raw_folder = game_folder.display().to_string();
+    let trimmed = raw_folder.trim_end_matches(['/', '\\']);
+    if trimmed.trim().is_empty() {
+        return empty_label.to_string();
+    }
+
+    let separator = if trimmed.contains('\\') { '\\' } else { '/' };
+    format!("{trimmed}{separator}{child_name}")
+}
+
+fn settings_focus_tabs_style() -> &'static str {
+    "width: min(100%, 860px); box-sizing: border-box; margin: 0 auto 16px; padding: 0 40px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;"
+}
+
+fn settings_focus_tab_style(active: bool) -> &'static str {
+    if active {
+        "min-height: 36px; border: 1px solid #65f58b; background: #17251a; color: #d8ffe1; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 800; letter-spacing: 0;"
+    } else {
+        "min-height: 36px; border: 1px solid #303241; background: #20212b; color: #d5d9df; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700; letter-spacing: 0;"
+    }
+}
+
 fn settings_card_style() -> &'static str {
     "border: 1px solid #303241; background: #1f202b; border-radius: 8px; overflow: hidden;"
 }
 
+fn settings_focus_card_style(section: SettingsFocus, focus: SettingsFocus) -> String {
+    if section == focus {
+        return format!(
+            "{} order: 0; border-color: #65f58b; box-shadow: 0 0 0 1px rgba(101, 245, 139, 0.18);",
+            settings_card_style()
+        );
+    }
+
+    format!("{} display: none;", settings_card_style())
+}
+
+fn secondary_page_header_style() -> &'static str {
+    "display: grid; gap: 8px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 34px 40px 18px;"
+}
+
+fn secondary_page_breadcrumb(page: WorkspacePage) -> &'static str {
+    match page {
+        WorkspacePage::Categories => "Library / Categories",
+        WorkspacePage::Collections => "Library / Collections",
+        WorkspacePage::Compatibility => "Mod Archive / Compatibility",
+        WorkspacePage::DbViewer => "Packs / DB Viewer",
+        WorkspacePage::Skills => "Packs / Skills",
+        WorkspacePage::Checks => "Tools / Checks",
+        WorkspacePage::Steam => "Tools / Steam",
+        WorkspacePage::Workshop => "Tools / Workshop",
+        WorkspacePage::Mods | WorkspacePage::ModDetail | WorkspacePage::Settings => "",
+    }
+}
+
+fn secondary_page_kicker_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #65f58b; font-weight: 800; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn secondary_status_style() -> &'static str {
+    "width: min(100%, 1040px); box-sizing: border-box; border: 1px solid #303746; background: #171b24; border-radius: 4px; padding: 8px 10px; margin: 0 auto 14px; color: #aeb8c8; font-size: 13px;"
+}
+
+fn secondary_page_content_style() -> &'static str {
+    "display: grid; gap: 22px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 0 40px 44px;"
+}
+
+fn settings_page_header_style() -> &'static str {
+    "display: grid; gap: 8px; width: min(100%, 860px); box-sizing: border-box; margin: 0 auto; padding: 42px 40px 22px;"
+}
+
+fn settings_page_kicker_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #65f58b; font-weight: 800; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn settings_page_content_style() -> &'static str {
+    "display: grid; gap: 26px; width: min(100%, 860px); box-sizing: border-box; margin: 0 auto; padding: 0 40px 44px;"
+}
+
 fn settings_card_header_style() -> &'static str {
-    "display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; background: #2a2b37; border-bottom: 1px solid #303241;"
+    "display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 58px; padding: 16px 22px; background: #2a2b37; border-bottom: 1px solid #303241;"
+}
+
+fn settings_card_header_actions_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap;"
+}
+
+fn settings_focus_route_chip_style() -> &'static str {
+    "min-height: 24px; display: inline-flex; align-items: center; border: 1px solid #4ade80; background: #17251a; color: #d8ffe1; border-radius: 4px; padding: 0 8px; font-size: 10px; font-weight: 850; text-transform: uppercase; letter-spacing: 0.8px; white-space: nowrap;"
 }
 
 fn settings_card_body_style() -> &'static str {
-    "display: grid; gap: 18px; padding: 20px;"
+    "display: grid; gap: 0; padding: 20px 22px;"
 }
 
 fn settings_row_style() -> &'static str {
-    "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; padding-bottom: 18px; border-bottom: 1px solid #2b2d39;"
+    "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; min-height: 58px; padding: 14px 0; border-bottom: 1px solid #2b2d39;"
+}
+
+fn settings_field_style() -> &'static str {
+    "display: grid; gap: 8px; min-width: 0; padding: 14px 0; border-bottom: 1px solid #2b2d39;"
+}
+
+fn settings_inline_field_style() -> &'static str {
+    "display: grid; gap: 8px; min-width: 0;"
+}
+
+fn settings_path_action_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) 104px; gap: 10px; align-items: stretch;"
+}
+
+fn settings_helper_backend_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) 104px; gap: 10px; align-items: end; padding: 14px 0; border-bottom: 1px solid #2b2d39;"
+}
+
+fn settings_button_pair_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 14px 0;"
+}
+
+fn settings_launch_actions_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, 0.75fr); gap: 16px; align-items: center; padding: 18px 0 4px; border-top: 1px solid #2b2d39;"
+}
+
+fn settings_launch_actions_copy_style() -> &'static str {
+    "display: grid; gap: 4px; min-width: 0; color: #e5e7eb; font-size: 14px; line-height: 20px;"
+}
+
+fn settings_launch_button_row_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0;"
 }
 
 fn settings_input_style() -> &'static str {
@@ -2825,6 +4859,26 @@ fn settings_secondary_button_style() -> &'static str {
     "border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 14px;"
 }
 
+fn settings_primary_button_style() -> &'static str {
+    "border: 1px solid #4ade80; background: #65f58b; color: #06210d; border-radius: 5px; padding: 10px 12px; font-size: 14px; font-weight: 800;"
+}
+
+fn settings_danger_button_style() -> &'static str {
+    "border: 1px solid #7f1d1d; background: #451a1a; color: #fecaca; border-radius: 5px; padding: 10px 12px; font-size: 14px;"
+}
+
+fn collection_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; border: 1px solid #303746; background: #171b24; border-radius: 5px; padding: 12px 14px; color: #e5e7eb; font-size: 14px;"
+}
+
+fn collection_row_button_style(active: bool) -> &'static str {
+    if active {
+        "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; border: 1px solid #60a5fa; background: #172033; color: #bfdbfe; border-radius: 5px; padding: 12px 14px; text-align: left; font-size: 14px;"
+    } else {
+        "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; border: 1px solid #303746; background: #171b24; color: #e5e7eb; border-radius: 5px; padding: 12px 14px; text-align: left; font-size: 14px;"
+    }
+}
+
 fn archive_toolbar_button_style(primary: bool) -> &'static str {
     if primary {
         "min-height: 30px; border: 1px solid #2f80ed; background: #1f6feb; color: white; border-radius: 5px; padding: 6px 10px; font-size: 12px; font-weight: 650;"
@@ -2835,60 +4889,194 @@ fn archive_toolbar_button_style(primary: bool) -> &'static str {
 
 fn toggle_label_style(enabled: bool) -> &'static str {
     if enabled {
-        "min-width: 58px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #4ade80; background: #65f58b; color: #06210d; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 48px; height: 26px; display: inline-flex; align-items: center; justify-content: flex-start; border: 1px solid #4ade80; background: #65f58b; border-radius: 999px; padding: 2px; box-sizing: border-box; cursor: pointer;"
     } else {
-        "min-width: 58px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #475569; background: #353a43; color: #cbd5e1; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 48px; height: 26px; display: inline-flex; align-items: center; justify-content: flex-start; border: 1px solid #475569; background: #353a43; border-radius: 999px; padding: 2px; box-sizing: border-box; cursor: pointer;"
+    }
+}
+
+fn settings_toggle_knob_style(enabled: bool) -> &'static str {
+    if enabled {
+        "width: 18px; height: 18px; display: block; border-radius: 999px; background: #06210d; transform: translateX(22px);"
+    } else {
+        "width: 18px; height: 18px; display: block; border-radius: 999px; background: #cbd5e1; transform: translateX(0);"
     }
 }
 
 fn mod_enable_button_style(enabled: bool, locked: bool) -> &'static str {
     if locked {
-        "width: 54px; height: 26px; border: 1px solid #4b5563; background: #343946; color: #9aa4b7; border-radius: 999px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 44px; height: 24px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid #4b5563; background: #343946; border-radius: 999px; padding: 2px; box-sizing: border-box;"
     } else if enabled {
-        "width: 54px; height: 26px; border: 1px solid #4ade80; background: #65f58b; color: #06210d; border-radius: 999px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 44px; height: 24px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid #4ade80; background: #65f58b; border-radius: 999px; padding: 2px; box-sizing: border-box;"
     } else {
-        "width: 54px; height: 26px; border: 1px solid #475569; background: #353a43; color: #cbd5e1; border-radius: 999px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0.8px;"
+        "width: 44px; height: 24px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid #475569; background: #353a43; border-radius: 999px; padding: 2px; box-sizing: border-box;"
     }
+}
+
+fn mod_enable_knob_style(enabled: bool, locked: bool) -> &'static str {
+    if locked {
+        "width: 16px; height: 16px; display: block; border-radius: 999px; background: #9aa4b7; transform: translateX(20px);"
+    } else if enabled {
+        "width: 16px; height: 16px; display: block; border-radius: 999px; background: #06210d; transform: translateX(20px);"
+    } else {
+        "width: 16px; height: 16px; display: block; border-radius: 999px; background: #cbd5e1; transform: translateX(0);"
+    }
+}
+
+fn set_mod_sort_column(
+    mod_sort: &mut Signal<ModSortSpec>,
+    mod_status: &mut Signal<Option<String>>,
+    column: ModSortColumn,
+) {
+    let next = mod_sort.read().after_column_click(column);
+    match save_ui_sort_preference(next) {
+        Ok(()) => mod_sort.set(next),
+        Err(error) => mod_status.set(Some(error)),
+    }
+}
+
+fn mod_thumbnail_url(mod_row: &ModRowViewModel) -> String {
+    let Some(thumbnail_path) = mod_row.thumbnail_path.as_deref() else {
+        return String::new();
+    };
+    format!(
+        "/mod-thumbnail/{}",
+        thumbnail_asset_token(&mod_row.key, thumbnail_path)
+    )
+}
+
+fn thumbnail_asset_token(key: &str, thumbnail_path: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    thumbnail_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn app_icon_http_response(request_path: &str) -> HttpResponse<Vec<u8>> {
+    if request_path != "/app-icon/modmanager.ico" {
+        return thumbnail_error_response(StatusCode::NOT_FOUND);
+    }
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "image/x-icon")
+        .header("Cache-Control", "public, max-age=31536000, immutable")
+        .body(APP_ICON_BYTES.to_vec())
+        .unwrap_or_else(|_| thumbnail_error_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn thumbnail_asset_http_response(mods: &[ModRecord], request_path: &str) -> HttpResponse<Vec<u8>> {
+    let mut segments = request_path.trim_matches('/').split('/');
+    let valid_handler = segments.next() == Some("mod-thumbnail");
+    let token = segments.next().filter(|token| !token.is_empty());
+    if !valid_handler || segments.next().is_some() {
+        return thumbnail_error_response(StatusCode::BAD_REQUEST);
+    }
+    let Some(token) = token else {
+        return thumbnail_error_response(StatusCode::BAD_REQUEST);
+    };
+
+    let thumbnail_path = mods.iter().find_map(|mod_record| {
+        let path = mod_record.thumbnail_path.as_deref()?;
+        (thumbnail_asset_token(&mod_record.identity.stable_key(), path) == token)
+            .then_some(PathBuf::from(path))
+    });
+    let Some(thumbnail_path) = thumbnail_path else {
+        return thumbnail_error_response(StatusCode::NOT_FOUND);
+    };
+    let mime = match thumbnail_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        _ => return thumbnail_error_response(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    };
+    let Ok(bytes) = fs::read(&thumbnail_path) else {
+        return thumbnail_error_response(StatusCode::NOT_FOUND);
+    };
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", mime)
+        .header("Cache-Control", "private, max-age=300")
+        .body(bytes)
+        .unwrap_or_else(|_| thumbnail_error_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn thumbnail_error_response(status: StatusCode) -> HttpResponse<Vec<u8>> {
+    HttpResponse::builder()
+        .status(status)
+        .body(Vec::new())
+        .unwrap_or_default()
 }
 
 fn mod_source_label(mod_row: &ModRowViewModel) -> &'static str {
-    if mod_row
-        .tags
-        .iter()
-        .any(|tag| tag.eq_ignore_ascii_case("workshop"))
-        || mod_row.subtitle.to_ascii_lowercase().contains("workshop")
-    {
-        "WS"
-    } else if mod_row.locked {
-        "CORE"
-    } else {
-        "MOD"
+    match mod_row.source {
+        ModSource::Workshop => "WS",
+        ModSource::GameData => "DATA",
+        ModSource::GameDataModding => "MOD",
+        ModSource::Local => "LOCAL",
     }
 }
 
-fn mod_author_label(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
-    if let Some(metadata) = workshop_metadata_for_row(mod_row, metadata)
-        && !metadata.author.trim().is_empty()
-    {
-        return metadata.author.trim().to_string();
-    }
-
-    match mod_source_label(mod_row) {
-        "WS" => "Steam Workshop".to_string(),
-        "CORE" => "Core".to_string(),
-        _ => "Local".to_string(),
+fn mod_source_description(mod_row: &ModRowViewModel) -> &'static str {
+    match mod_row.source {
+        ModSource::Workshop => "Steam Workshop mod",
+        ModSource::GameData => "Mod stored in the WH3 data folder",
+        ModSource::GameDataModding => "Mod stored in data/modding",
+        ModSource::Local => "Mod from an additional local folder",
     }
 }
 
-fn mod_updated_label(
-    mod_row: &ModRowViewModel,
-    metadata: &[WorkshopModData],
-    now_ms: u64,
-) -> String {
-    let Some(metadata) = workshop_metadata_for_row(mod_row, metadata) else {
-        return "Local".to_string();
+fn mod_author_label(mod_row: &ModRowViewModel) -> String {
+    mod_row.author.clone().unwrap_or_else(|| "—".to_string())
+}
+
+fn mod_updated_label(mod_row: &ModRowViewModel, now_ms: u64) -> String {
+    let Some(updated_ms) = mod_row.updated_ms else {
+        return "—".to_string();
     };
-    relative_time_label(metadata.last_changed_ms, now_ms)
+    relative_time_label(updated_ms, now_ms)
+}
+
+fn mod_detail_description_text(mod_row: &ModRowViewModel) -> String {
+    mod_row
+        .description
+        .clone()
+        .unwrap_or_else(|| "No description is available for this mod.".to_string())
+}
+
+fn mod_detail_dependency_text(mod_row: &ModRowViewModel, metadata: &[WorkshopModData]) -> String {
+    let Some(metadata) = workshop_metadata_for_row(mod_row, metadata) else {
+        return "No workshop dependency metadata is cached for this record.".to_string();
+    };
+
+    if let Some(summary) = dependency_names_summary(metadata, 6) {
+        return summary;
+    }
+
+    if metadata.dependency_ids.is_empty() {
+        "No required workshop dependencies are recorded.".to_string()
+    } else {
+        let visible_ids = metadata
+            .dependency_ids
+            .iter()
+            .take(6)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut summary = visible_ids.join(", ");
+        let hidden_count = metadata
+            .dependency_ids
+            .len()
+            .saturating_sub(visible_ids.len());
+        if hidden_count > 0 {
+            summary.push_str(&format!(" +{hidden_count}"));
+        }
+        summary
+    }
 }
 
 fn workshop_metadata_for_row<'a>(
@@ -2902,6 +5090,14 @@ fn workshop_metadata_for_row<'a>(
 }
 
 fn mod_workshop_id_from_row(mod_row: &ModRowViewModel) -> Option<String> {
+    if let Some(workshop_id) = mod_row
+        .workshop_id
+        .as_deref()
+        .and_then(normalize_workshop_id)
+    {
+        return Some(workshop_id);
+    }
+
     if let Some(workshop_id) = mod_row
         .key
         .strip_prefix("workshop:")
@@ -2920,6 +5116,138 @@ fn mod_workshop_id_from_row(mod_row: &ModRowViewModel) -> Option<String> {
                 .next()
         })
         .and_then(normalize_workshop_id)
+}
+
+fn selected_mod_folder_target(mod_row: &ModRowViewModel) -> Option<String> {
+    let raw_path = mod_row.subtitle.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    if raw_path.to_ascii_lowercase().ends_with(".pack") {
+        return split_parent_path(raw_path).map(str::to_string);
+    }
+
+    Some(raw_path.to_string())
+}
+
+fn split_parent_path(path: &str) -> Option<&str> {
+    let slash_index = path.rfind('/');
+    let backslash_index = path.rfind('\\');
+    let separator_index = match (slash_index, backslash_index) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(index), None) | (None, Some(index)) => Some(index),
+        (None, None) => None,
+    }?;
+
+    if separator_index == 0 {
+        Some(&path[..1])
+    } else {
+        Some(&path[..separator_index])
+    }
+}
+
+fn workshop_url_for_mod_row(mod_row: &ModRowViewModel) -> Option<String> {
+    mod_workshop_id_from_row(mod_row).map(|workshop_id| {
+        format!("https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}")
+    })
+}
+
+fn open_selected_mod_folder(mod_row: &ModRowViewModel) -> Result<String, String> {
+    let Some(target) = selected_mod_folder_target(mod_row) else {
+        return Err("Could not open selected mod folder: no path is available.".to_string());
+    };
+
+    open_system_target(&target)?;
+    Ok(format!("Opened selected mod folder: {target}"))
+}
+
+fn open_selected_mod_workshop_page(mod_row: &ModRowViewModel) -> Result<String, String> {
+    let Some(url) = workshop_url_for_mod_row(mod_row) else {
+        return Err("Selected mod does not have a Steam Workshop ID.".to_string());
+    };
+
+    open_system_target(&url)?;
+    Ok(format!("Opened Steam Workshop page: {url}"))
+}
+
+fn current_executable_dir() -> Option<PathBuf> {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn project_readme_path() -> PathBuf {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    project_readme_path_from(current_executable_dir().as_deref(), &cwd)
+}
+
+fn project_readme_path_from(app_dir: Option<&Path>, cwd: &Path) -> PathBuf {
+    let packaged_path = app_dir.map(|path| path.join(PACKAGED_HELP_FILE));
+    let mut candidates = packaged_path.iter().cloned().collect::<Vec<_>>();
+    candidates.extend([
+        cwd.join(PACKAGED_HELP_FILE),
+        cwd.join("README.md"),
+        cwd.join("../../WINDOWS-VERIFICATION.md"),
+        cwd.join("../../README.md"),
+    ]);
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| packaged_path.unwrap_or_else(|| cwd.join(PACKAGED_HELP_FILE)))
+}
+
+fn open_project_readme() -> Result<String, String> {
+    let readme_path = project_readme_path();
+    let target = readme_path.display().to_string();
+    open_system_target(&target)?;
+    Ok(format!("Opened project README: {target}"))
+}
+
+fn open_system_target(target: &str) -> Result<(), String> {
+    let status = open_system_target_command(target)
+        .status()
+        .map_err(|error| format!("Could not open {target}: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not open {target}: opener exited with {status}"
+        ))
+    }
+}
+
+fn open_release_update(release_url: &str) -> Result<String, String> {
+    let expected_prefix = format!("{RELEASE_TAG_BASE_URL}/");
+    if !release_url.starts_with(&expected_prefix) {
+        return Err("Refused to open an untrusted update address.".to_string());
+    }
+
+    open_system_target(release_url)?;
+    Ok("Opened the latest WH3 Mod Manager release on GitHub.".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn open_system_target_command(target: &str) -> Command {
+    let mut command = Command::new("explorer.exe");
+    command.arg(target);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn open_system_target_command(target: &str) -> Command {
+    let mut command = Command::new("open");
+    command.arg(target);
+    command
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_system_target_command(target: &str) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(target);
+    command
 }
 
 fn relative_time_label(changed_ms: u64, now_ms: u64) -> String {
@@ -2955,36 +5283,120 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn source_tile_style(mod_row: &ModRowViewModel) -> &'static str {
-    match mod_source_label(mod_row) {
-        "WS" => {
-            "width: 42px; height: 42px; display: grid; place-items: center; justify-self: start; border: 1px solid #2563eb; background: #172554; color: #bfdbfe; border-radius: 5px; padding: 0; font-size: 11px; font-weight: 800; letter-spacing: 0;"
-        }
-        "CORE" => {
-            "width: 42px; height: 42px; display: grid; place-items: center; justify-self: start; border: 1px solid #4b5563; background: #272b35; color: #d1d5db; border-radius: 5px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
-        }
-        _ => {
-            "width: 42px; height: 42px; display: grid; place-items: center; justify-self: start; border: 1px solid #166534; background: #10281a; color: #86efac; border-radius: 5px; padding: 0; font-size: 10px; font-weight: 800; letter-spacing: 0;"
-        }
+fn detail_page_header_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 30px 40px 16px;"
+}
+
+fn mod_detail_breadcrumb() -> &'static str {
+    "Mod Archive / Mod Settings"
+}
+
+fn detail_page_kicker_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #65f58b; font-weight: 800; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn detail_header_actions_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; flex-wrap: wrap;"
+}
+
+fn detail_position_label_style() -> &'static str {
+    "min-height: 34px; display: inline-flex; align-items: center; border: 1px solid #303241; background: #171b24; color: #aeb8c8; border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700; white-space: nowrap;"
+}
+
+fn detail_header_nav_button_style(disabled: bool) -> &'static str {
+    if disabled {
+        "min-height: 34px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 5px; padding: 7px 10px; font-size: 13px; cursor: not-allowed;"
+    } else {
+        "min-height: 34px; border: 1px solid #3b3d4d; background: #292a35; color: #f2f5f2; border-radius: 5px; padding: 7px 10px; font-size: 13px;"
     }
 }
 
-fn detail_source_tile_style(mod_row: &ModRowViewModel) -> &'static str {
-    match mod_source_label(mod_row) {
-        "WS" => {
-            "aspect-ratio: 1 / 1; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #2563eb; background: #172554; color: #bfdbfe; border-radius: 8px; text-align: center;"
-        }
-        "CORE" => {
-            "aspect-ratio: 1 / 1; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #4b5563; background: #272b35; color: #d1d5db; border-radius: 8px; text-align: center;"
-        }
-        _ => {
-            "aspect-ratio: 1 / 1; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 8px; border: 1px solid #166534; background: #10281a; color: #86efac; border-radius: 8px; text-align: center;"
-        }
-    }
+fn detail_status_style() -> &'static str {
+    "width: min(100%, 1040px); box-sizing: border-box; border: 1px solid #303746; background: #171b24; border-radius: 4px; padding: 8px 10px; margin: 0 auto 14px; color: #aeb8c8; font-size: 13px;"
+}
+
+fn detail_empty_panel_style() -> &'static str {
+    "display: grid; align-content: center; gap: 12px; min-height: 180px; border: 1px solid #303241; border-left: 3px solid #303746; border-radius: 8px; background: #1f202b; padding: 24px 26px; color: #aeb8c8;"
+}
+
+fn detail_empty_title_style() -> &'static str {
+    "font-size: 18px; line-height: 24px; margin: 0; color: #edf2f7;"
+}
+
+fn detail_empty_body_style() -> &'static str {
+    "font-size: 13px; line-height: 19px; color: #aeb8c8; max-width: 620px;"
+}
+
+fn detail_empty_actions_style() -> &'static str {
+    "display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 2px;"
+}
+
+fn detail_page_content_style() -> &'static str {
+    "display: grid; gap: 18px; width: min(100%, 1040px); box-sizing: border-box; margin: 0 auto; padding: 0 40px 40px;"
+}
+
+fn detail_workspace_grid_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(210px, 260px) minmax(0, 1fr); gap: 18px; align-items: start;"
+}
+
+fn detail_side_column_style() -> &'static str {
+    "display: grid; gap: 12px; min-width: 0;"
+}
+
+fn detail_side_meta_panel_style() -> &'static str {
+    "display: grid; gap: 9px; border: 1px solid #303241; background: #1f202b; border-radius: 8px; padding: 14px 16px;"
+}
+
+fn detail_side_meta_row_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 0.75fr) minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; font-size: 12px; line-height: 16px; color: #aeb8c8;"
+}
+
+fn detail_main_panel_style() -> &'static str {
+    "display: grid; gap: 18px; min-width: 0; border: 1px solid #303241; background: #1f202b; border-radius: 8px; padding: 20px 22px;"
+}
+
+fn detail_metrics_grid_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px;"
 }
 
 fn detail_metric_style() -> &'static str {
     "display: grid; gap: 4px; min-width: 0; border-top: 1px solid #3b3d4d; padding-top: 10px; font-size: 12px; color: #aeb8c8;"
+}
+
+fn detail_section_label_style() -> &'static str {
+    "font-size: 11px; line-height: 14px; color: #aeb8c8; text-transform: uppercase; letter-spacing: 0;"
+}
+
+fn detail_tag_list_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; gap: 6px;"
+}
+
+fn detail_primary_description_panel_style() -> &'static str {
+    "display: grid; gap: 10px; min-height: 150px; border: 1px solid #303241; background: #1a1b26; border-radius: 6px; padding: 18px 20px;"
+}
+
+fn detail_primary_description_body_style() -> &'static str {
+    "font-size: 14px; line-height: 21px; color: #e2e8dd;"
+}
+
+fn detail_record_path_style() -> &'static str {
+    "display: grid; gap: 8px; min-width: 0; overflow: hidden; border-top: 1px solid #303241; padding-top: 14px;"
+}
+
+fn detail_description_panel_style() -> &'static str {
+    "display: grid; gap: 8px; border-top: 1px solid #303241; padding-top: 14px;"
+}
+
+fn detail_description_body_style() -> &'static str {
+    "font-size: 13px; line-height: 19px; color: #d8ded8;"
+}
+
+fn detail_category_assignment_style() -> &'static str {
+    "display: grid; grid-template-columns: minmax(0, 1fr) minmax(86px, auto) minmax(86px, auto); gap: 8px; align-items: stretch;"
+}
+
+fn detail_action_grid_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 8px;"
 }
 
 fn detail_action_button_style(danger: bool) -> &'static str {
@@ -2995,66 +5407,148 @@ fn detail_action_button_style(danger: bool) -> &'static str {
     }
 }
 
-#[cfg(test)]
-fn tool_panel_tab_label(tab: ToolPanelTab) -> &'static str {
-    match tab {
-        ToolPanelTab::Overview => "Overview",
-        ToolPanelTab::Launch => "Launch",
-        ToolPanelTab::Steam => "Steam",
-        ToolPanelTab::Workshop => "Workshop",
-        ToolPanelTab::Checks => "Checks",
-    }
-}
-
-fn toggle_tool_panel(current: ToolPanelTab, target: ToolPanelTab) -> ToolPanelTab {
-    if current == target {
-        ToolPanelTab::Overview
-    } else {
-        target
-    }
-}
-
-#[cfg(test)]
-fn library_tool_tab_label(tab: LibraryToolTab) -> &'static str {
-    match tab {
-        LibraryToolTab::None => "None",
-        LibraryToolTab::Presets => "Presets",
-        LibraryToolTab::Categories => "Cats",
-        LibraryToolTab::Config => "Config",
-    }
-}
-
-#[cfg(test)]
-fn tool_panel_button_style(active: bool) -> &'static str {
-    if active {
-        "border: 1px solid #4ade80; background: #1b2a1d; color: #edf2f7; border-radius: 6px; padding: 8px 8px; font-size: 12px; font-weight: 650;"
-    } else {
-        "border: 1px solid #2b352d; background: #111710; color: #cbd8cc; border-radius: 6px; padding: 8px 8px; font-size: 12px;"
-    }
-}
-
 fn launch_quick_button_style() -> &'static str {
     "min-height: 42px; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 14px; font-weight: 650;"
 }
 
+fn tools_rail_style() -> &'static str {
+    "grid-area: tools; min-width: 0; border-left: 1px solid #263041; background: #20212b; padding: 28px 18px; overflow-y: auto; display: flex; flex-direction: column;"
+}
+
+fn tools_header_style() -> &'static str {
+    "display: grid; gap: 4px; margin-bottom: 26px;"
+}
+
+fn play_primary_button_style() -> &'static str {
+    "width: 100%; min-height: 76px; display: flex; align-items: center; justify-content: center; gap: 12px; border: 1px solid #4ade80; background: #65f58b; color: #051d0c; border-radius: 8px; padding: 18px 14px; font-weight: 900; font-size: 24px; line-height: 30px; margin-bottom: 22px; letter-spacing: 0; box-shadow: 0 0 18px rgba(101, 245, 139, 0.14);"
+}
+
+fn play_icon_style() -> &'static str {
+    "width: 0; height: 0; display: inline-block; border-top: 9px solid transparent; border-bottom: 9px solid transparent; border-left: 14px solid currentColor;"
+}
+
 fn continue_save_button_style(needs_save_name: bool) -> &'static str {
     if needs_save_name {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 50px; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 5px; padding: 12px 16px; margin: -4px 0 18px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 6px; padding: 12px 16px; margin: -2px 0 22px; font-size: 15px; text-align: left;"
     } else {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 50px; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 5px; padding: 12px 16px; margin: -4px 0 18px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 6px; padding: 12px 16px; margin: -2px 0 22px; font-size: 15px; text-align: left;"
+    }
+}
+
+fn tool_action_group_style() -> &'static str {
+    "display: grid; gap: 10px; margin-bottom: 18px;"
+}
+
+fn tool_context_panel_style() -> &'static str {
+    "display: grid; gap: 8px; margin: -2px 0 18px; padding: 12px; border: 1px solid #303241; background: #1a1b25; border-radius: 6px;"
+}
+
+fn tool_context_summary_style() -> &'static str {
+    "display: grid; gap: 4px; min-width: 0; padding: 0 2px 8px; border-bottom: 1px solid #303241;"
+}
+
+fn tool_context_label_style() -> &'static str {
+    "font-size: 10px; line-height: 13px; color: #9fb0a3; text-transform: uppercase; letter-spacing: 1px;"
+}
+
+fn tool_settings_views_group_label() -> &'static str {
+    "Settings Views"
+}
+
+fn tool_other_screens_group_label() -> &'static str {
+    "Other Screens"
+}
+
+fn tool_context_name_style() -> &'static str {
+    "font-size: 14px; line-height: 18px; color: #f2f5f2; font-weight: 750; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
+}
+
+fn tool_context_path_style() -> &'static str {
+    "font-size: 11px; line-height: 15px; color: #9aa4b7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;"
+}
+
+fn tool_context_meta_style() -> &'static str {
+    "display: flex; flex-wrap: wrap; gap: 6px; padding-top: 4px;"
+}
+
+fn tool_context_meta_chip_style() -> &'static str {
+    "min-height: 22px; display: inline-flex; align-items: center; border: 1px solid #303746; background: #202532; color: #cbd5e1; border-radius: 4px; padding: 0 7px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px;"
+}
+
+fn tool_context_actions_style() -> &'static str {
+    "display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;"
+}
+
+fn tool_context_action_style(disabled: bool) -> &'static str {
+    if disabled {
+        "min-height: 40px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 5px; padding: 9px 10px; font-size: 13px; text-align: center;"
+    } else {
+        "min-height: 40px; border: 1px solid #3b3d4d; background: transparent; color: #d8ded8; border-radius: 5px; padding: 9px 10px; font-size: 13px; text-align: center;"
+    }
+}
+
+fn tool_context_toggle_style(locked: bool) -> &'static str {
+    if locked {
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 46px; border: 1px solid #303241; background: #20212b; color: #9aa4b7; border-radius: 5px; padding: 10px 12px; font-size: 14px; text-align: left;"
+    } else {
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 46px; border: 1px solid #3b3d4d; background: #292a35; color: #f2f5f2; border-radius: 5px; padding: 10px 12px; font-size: 14px; text-align: left;"
+    }
+}
+
+fn tool_context_screen_group_style() -> &'static str {
+    "display: grid; gap: 8px; margin: 0 0 18px; padding-top: 12px; border-top: 1px solid #303241;"
+}
+
+fn tool_context_screen_button_style(active: bool) -> &'static str {
+    if active {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #3b3d4d; background: #292f36; color: #f2f5f2; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left; cursor: default;"
+    } else {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #303241; background: transparent; color: #d8ded8; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left;"
+    }
+}
+
+fn tool_context_disabled_screen_button_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left; cursor: not-allowed;"
+}
+
+fn tool_more_group_style() -> &'static str {
+    "display: grid; gap: 8px; padding-left: 12px; border-left: 1px solid #343745;"
+}
+
+fn tool_aux_group_style() -> &'static str {
+    "display: grid; gap: 8px; margin: 2px 0 18px; padding-top: 12px; border-top: 1px solid #303241;"
+}
+
+fn tool_aux_button_style(active: bool) -> &'static str {
+    if active {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #3b3d4d; background: #292f36; color: #f2f5f2; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left;"
+    } else {
+        "display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 38px; border: 1px solid #303241; background: transparent; color: #d8ded8; border-radius: 5px; padding: 8px 10px; font-size: 13px; text-align: left;"
+    }
+}
+
+fn tool_footer_button_style(active: bool) -> &'static str {
+    if active {
+        "display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; min-height: 44px; border: 1px solid #3b3d4d; background: #343541; color: #f2f5f2; border-radius: 6px; padding: 10px 14px; font-size: 14px; text-align: center;"
+    } else {
+        "display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; min-height: 44px; border: 1px solid #303241; background: #11121a; color: #d8ded8; border-radius: 6px; padding: 10px 14px; font-size: 14px; text-align: center;"
     }
 }
 
 fn tool_action_button_style(active: bool) -> &'static str {
     if active {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 5px; padding: 14px 16px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #3b3d4d; background: #3a3b48; color: #f2f5f2; border-radius: 6px; padding: 13px 16px; font-size: 15px; text-align: left;"
     } else {
-        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 5px; padding: 14px 16px; font-size: 15px; text-align: left;"
+        "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #333541; background: #292a35; color: #d8ded8; border-radius: 6px; padding: 13px 16px; font-size: 15px; text-align: left;"
     }
 }
 
+fn tool_action_disabled_button_style() -> &'static str {
+    "display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 52px; border: 1px solid #303241; background: #20212b; color: #7f8798; border-radius: 6px; padding: 13px 16px; font-size: 15px; text-align: left; cursor: not-allowed;"
+}
+
 #[component]
-fn AlphaReadinessPanel(report: AlphaReadinessReport) -> Element {
+fn ReadinessPanel(report: ReadinessReport) -> Element {
     rsx! {
         section {
             style: "display: grid; gap: 8px; margin-bottom: 18px; border: 1px solid #2b352d; background: #111710; border-radius: 6px; padding: 10px;",
@@ -3062,7 +5556,7 @@ fn AlphaReadinessPanel(report: AlphaReadinessReport) -> Element {
                 style: "display: grid; gap: 3px;",
                 h3 {
                     style: "font-size: 12px; line-height: 16px; color: #9fb0a3; text-transform: uppercase; margin: 0;",
-                    "Alpha readiness"
+                    "System readiness"
                 }
                 div {
                     style: "font-size: 12px; color: #cbd8cc; overflow-wrap: anywhere;",
@@ -3081,12 +5575,12 @@ fn AlphaReadinessPanel(report: AlphaReadinessReport) -> Element {
                                 style: "font-size: 12px; color: #edf2f7; font-weight: 650;",
                                 "{row.label}"
                             }
-                            if row.status == AlphaReadinessStatus::Ready {
+                            if row.status == ReadinessStatus::Ready {
                                 span {
                                     style: "font-size: 11px; color: #86efac; text-transform: uppercase;",
                                     "Ready"
                                 }
-                            } else if row.status == AlphaReadinessStatus::Warning {
+                            } else if row.status == ReadinessStatus::Warning {
                                 span {
                                     style: "font-size: 11px; color: #fde68a; text-transform: uppercase;",
                                     "Check"
@@ -3510,6 +6004,85 @@ fn conflict_status(report: &PackConflictReport) -> String {
     )
 }
 
+fn start_compatibility_analysis(
+    app_state: Signal<AppState>,
+    mut compatibility_operation: Signal<Option<String>>,
+    mut mod_status: Signal<Option<String>>,
+    mut conflict_report: Signal<Option<PackConflictReport>>,
+    mut workspace_page: Signal<WorkspacePage>,
+) {
+    if compatibility_operation.read().is_some() {
+        return;
+    }
+
+    let mods = app_state.read().mods.clone();
+    let enabled_mod_count = mods
+        .iter()
+        .filter(|mod_record| mod_record.effectively_enabled())
+        .count();
+    let input_fingerprint = compatibility_input_fingerprint(&mods);
+    let operation = format!(
+        "Analyzing {enabled_mod_count} enabled mod{}",
+        plural_suffix(enabled_mod_count)
+    );
+
+    conflict_report.set(None);
+    compatibility_operation.set(Some(operation.clone()));
+    mod_status.set(Some(format!("{operation} in the background...")));
+    workspace_page.set(WorkspacePage::Compatibility);
+
+    let started_at = Instant::now();
+    let receiver = run_in_background(move || analyze_enabled_with_optional_schema(&mods));
+    spawn(async move {
+        let status = match receiver.await {
+            Ok(report) => {
+                let elapsed = compatibility_analysis_elapsed_label(started_at.elapsed());
+                let current_fingerprint =
+                    compatibility_input_fingerprint(&app_state.read().mods);
+                if current_fingerprint == input_fingerprint {
+                    let summary = conflict_status(&report);
+                    conflict_report.set(Some(report));
+                    format!("Compatibility analysis finished in {elapsed}. {summary}")
+                } else {
+                    format!(
+                        "Compatibility analysis finished in {elapsed}, but the enabled mod set changed while it was running. The stale result was discarded; run analysis again."
+                    )
+                }
+            }
+            Err(_) => {
+                "Compatibility analysis stopped unexpectedly. Check wh3mm-crash.log for a background-worker panic."
+                    .to_string()
+            }
+        };
+
+        mod_status.set(Some(status));
+        compatibility_operation.set(None);
+    });
+}
+
+fn compatibility_input_fingerprint(mods: &[ModRecord]) -> String {
+    mods.iter()
+        .filter(|mod_record| mod_record.effectively_enabled())
+        .map(|mod_record| {
+            format!(
+                "{}|{}|{}",
+                mod_record.identity.stable_key(),
+                mod_record.identity.path,
+                mod_record.display_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compatibility_analysis_elapsed_label(elapsed: Duration) -> String {
+    if elapsed.as_secs() == 0 {
+        return format!("{} ms", elapsed.as_millis());
+    }
+
+    format!("{:.1} s", elapsed.as_secs_f64())
+}
+
 fn analyze_enabled_with_optional_schema(mods: &[ModRecord]) -> PackConflictReport {
     let schema_path = schema_path();
     match wh3mm_core::load_schema_file(&schema_path) {
@@ -3517,6 +6090,82 @@ fn analyze_enabled_with_optional_schema(mods: &[ModRecord]) -> PackConflictRepor
             analyze_enabled_mod_conflicts_with_schema(mods, &PackReadOptions::default(), &schema)
         }
         Err(_) => analyze_enabled_mod_conflicts(mods, &PackReadOptions::default()),
+    }
+}
+
+#[component]
+fn FlowSummaryPanel(flow_summary: PackFlowSummaryViewModel) -> Element {
+    rsx! {
+        section {
+            style: "display: grid; gap: 10px; padding: 12px 14px; border: 1px solid #28323d; border-radius: 6px; background: #151b21;",
+            header {
+                style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end;",
+                div {
+                    style: "min-width: 0;",
+                    h3 {
+                        style: "font-size: 14px; margin: 0 0 3px; color: #f2f5f2;",
+                        "User flows"
+                    }
+                    div {
+                        style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{flow_summary.file_count_label} / {flow_summary.read_error_count_label}"
+                    }
+                }
+            }
+            for flow in flow_summary.files.iter() {
+                article {
+                    key: "{flow.name}",
+                    style: "display: grid; gap: 5px; border: 1px solid #222b34; border-radius: 6px; padding: 8px 10px; background: #11171d;",
+                    div {
+                        style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center;",
+                        div {
+                            style: "font-size: 13px; color: #edf2f7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                            "{flow.name}"
+                        }
+                        div {
+                            style: "font-size: 12px; color: #9fb0c0; white-space: nowrap;",
+                            "{flow.graph_label}"
+                        }
+                    }
+                    div {
+                        style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{flow.detail_label}"
+                    }
+                    if !flow.options.is_empty() {
+                        div {
+                            style: "display: flex; flex-wrap: wrap; gap: 6px;",
+                            for option in flow.options.iter() {
+                                span {
+                                    key: "{option.id}",
+                                    style: "border: 1px solid #334150; border-radius: 4px; padding: 3px 6px; font-size: 12px; color: #cbd8e4; background: #18212a;",
+                                    "{option.label}"
+                                    if let Some(default_value) = &option.default_value_label {
+                                        span {
+                                            style: "color: #9fb0c0;",
+                                            " / {default_value}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for error in flow_summary.read_errors.iter() {
+                article {
+                    key: "{error.name}",
+                    style: "display: grid; gap: 3px; border: 1px solid #5a3440; border-radius: 6px; padding: 8px 10px; background: #201418;",
+                    div {
+                        style: "font-size: 13px; color: #fecdd3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{error.name}"
+                    }
+                    div {
+                        style: "font-size: 12px; color: #fca5a5; overflow-wrap: anywhere;",
+                        "{error.message}"
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3537,75 +6186,9 @@ fn PackPanel(pack: PackViewModel) -> Element {
                 }
             }
             if let Some(flow_summary) = &pack.flow_summary {
-                section {
-                    style: "display: grid; gap: 10px; padding: 12px 14px; border-bottom: 1px solid #28323d;",
-                    header {
-                        style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end;",
-                        div {
-                            style: "min-width: 0;",
-                            h3 {
-                                style: "font-size: 14px; margin: 0 0 3px;",
-                                "User flows"
-                            }
-                            div {
-                                style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{flow_summary.file_count_label} / {flow_summary.read_error_count_label}"
-                            }
-                        }
-                    }
-                    for flow in flow_summary.files.iter() {
-                        article {
-                            key: "{flow.name}",
-                            style: "display: grid; gap: 5px; border: 1px solid #222b34; border-radius: 6px; padding: 8px 10px; background: #11171d;",
-                            div {
-                                style: "display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center;",
-                                div {
-                                    style: "font-size: 13px; color: #edf2f7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                    "{flow.name}"
-                                }
-                                div {
-                                    style: "font-size: 12px; color: #9fb0c0; white-space: nowrap;",
-                                    "{flow.graph_label}"
-                                }
-                            }
-                            div {
-                                style: "font-size: 12px; color: #9fb0c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{flow.detail_label}"
-                            }
-                            if !flow.options.is_empty() {
-                                div {
-                                    style: "display: flex; flex-wrap: wrap; gap: 6px;",
-                                    for option in flow.options.iter() {
-                                        span {
-                                            key: "{option.id}",
-                                            style: "border: 1px solid #334150; border-radius: 4px; padding: 3px 6px; font-size: 12px; color: #cbd8e4; background: #18212a;",
-                                            "{option.label}"
-                                            if let Some(default_value) = &option.default_value_label {
-                                                span {
-                                                    style: "color: #9fb0c0;",
-                                                    " / {default_value}"
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for error in flow_summary.read_errors.iter() {
-                        article {
-                            key: "{error.name}",
-                            style: "display: grid; gap: 3px; border: 1px solid #5a3440; border-radius: 6px; padding: 8px 10px; background: #201418;",
-                            div {
-                                style: "font-size: 13px; color: #fecdd3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                                "{error.name}"
-                            }
-                            div {
-                                style: "font-size: 12px; color: #fca5a5; overflow-wrap: anywhere;",
-                                "{error.message}"
-                            }
-                        }
-                    }
+                div {
+                    style: "padding: 12px 14px; border-bottom: 1px solid #28323d;",
+                    FlowSummaryPanel { flow_summary: flow_summary.clone() }
                 }
             }
             if let Some(preview) = &pack.table_preview {
@@ -4314,31 +6897,23 @@ fn load_saved_steam_helper_backend() -> String {
     STEAM_HELPER_BACKEND_NATIVE.to_string()
 }
 
-fn build_alpha_readiness_report(
-    game_folder: Option<&Path>,
-    helper_path: &str,
-) -> AlphaReadinessReport {
-    build_alpha_readiness_report_with_paths(
-        game_folder,
-        helper_path,
-        &schema_path(),
-        &app_config_dir(),
-    )
+fn build_readiness_report(game_folder: Option<&Path>, helper_path: &str) -> ReadinessReport {
+    build_readiness_report_with_paths(game_folder, helper_path, &schema_path(), &app_config_dir())
 }
 
-fn build_alpha_readiness_report_with_paths(
+fn build_readiness_report_with_paths(
     game_folder: Option<&Path>,
     helper_path: &str,
     schema_path: &Path,
     config_dir: &Path,
-) -> AlphaReadinessReport {
+) -> ReadinessReport {
     let mut rows = Vec::new();
     rows.push(readiness_row(
         "Config",
         if config_dir.is_dir() {
-            AlphaReadinessStatus::Ready
+            ReadinessStatus::Ready
         } else {
-            AlphaReadinessStatus::Warning
+            ReadinessStatus::Warning
         },
         if config_dir.is_dir() {
             format!("Using {}", config_dir.display())
@@ -4349,9 +6924,9 @@ fn build_alpha_readiness_report_with_paths(
     rows.push(readiness_row(
         "Schema",
         if schema_path.is_file() {
-            AlphaReadinessStatus::Ready
+            ReadinessStatus::Ready
         } else {
-            AlphaReadinessStatus::Error
+            ReadinessStatus::Error
         },
         if schema_path.is_file() {
             format!("Found {}", schema_path.display())
@@ -4366,7 +6941,7 @@ fn build_alpha_readiness_report_with_paths(
         Some(path) if path.is_file() => {
             rows.push(readiness_row(
                 "Steam helper",
-                AlphaReadinessStatus::Ready,
+                ReadinessStatus::Ready,
                 format!("Found {}", path.display()),
             ));
             rows.push(steam_runtime_readiness_row(path));
@@ -4374,24 +6949,24 @@ fn build_alpha_readiness_report_with_paths(
         Some(path) => {
             rows.push(readiness_row(
                 "Steam helper",
-                AlphaReadinessStatus::Error,
+                ReadinessStatus::Error,
                 format!("Missing {}", path.display()),
             ));
             rows.push(readiness_row(
                 "Steam DLL",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "Helper path must be valid before checking steam_api64.dll.".to_string(),
             ));
         }
         None => {
             rows.push(readiness_row(
                 "Steam helper",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No helper selected or auto-discovered.".to_string(),
             ));
             rows.push(readiness_row(
                 "Steam DLL",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No helper selected; steam_api64.dll should sit beside the packaged helper."
                     .to_string(),
             ));
@@ -4403,41 +6978,39 @@ fn build_alpha_readiness_report_with_paths(
         (Some(_), Some(Ok(validated))) => {
             rows.push(readiness_row(
                 "WH3 folder",
-                AlphaReadinessStatus::Ready,
+                ReadinessStatus::Ready,
                 format!("Found {}", validated.game_dir.display()),
             ));
             rows.push(match discover_wh3_workshop_folder(&validated.game_dir) {
                 Ok(workshop) => readiness_row(
                     "Workshop",
-                    AlphaReadinessStatus::Ready,
+                    ReadinessStatus::Ready,
                     format!("Found {}", workshop.workshop_content_dir.display()),
                 ),
-                Err(error) => {
-                    readiness_row("Workshop", AlphaReadinessStatus::Warning, error.message)
-                }
+                Err(error) => readiness_row("Workshop", ReadinessStatus::Warning, error.message),
             });
         }
         (Some(path), Some(Err(error))) => {
             rows.push(readiness_row(
                 "WH3 folder",
-                AlphaReadinessStatus::Error,
+                ReadinessStatus::Error,
                 format!("{} ({})", path.display(), error.message),
             ));
             rows.push(readiness_row(
                 "Workshop",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "WH3 folder must validate before checking workshop content.".to_string(),
             ));
         }
         _ => {
             rows.push(readiness_row(
                 "WH3 folder",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No WH3 folder selected.".to_string(),
             ));
             rows.push(readiness_row(
                 "Workshop",
-                AlphaReadinessStatus::Warning,
+                ReadinessStatus::Warning,
                 "No WH3 folder selected; workshop content is unknown.".to_string(),
             ));
         }
@@ -4445,36 +7018,36 @@ fn build_alpha_readiness_report_with_paths(
 
     let ready_count = rows
         .iter()
-        .filter(|row| row.status == AlphaReadinessStatus::Ready)
+        .filter(|row| row.status == ReadinessStatus::Ready)
         .count();
     let warning_count = rows
         .iter()
-        .filter(|row| row.status == AlphaReadinessStatus::Warning)
+        .filter(|row| row.status == ReadinessStatus::Warning)
         .count();
     let error_count = rows
         .iter()
-        .filter(|row| row.status == AlphaReadinessStatus::Error)
+        .filter(|row| row.status == ReadinessStatus::Error)
         .count();
 
-    AlphaReadinessReport {
+    ReadinessReport {
         summary: format!("{ready_count} ready / {warning_count} checks / {error_count} errors"),
         rows,
     }
 }
 
-fn readiness_row(label: &str, status: AlphaReadinessStatus, detail: String) -> AlphaReadinessRow {
-    AlphaReadinessRow {
+fn readiness_row(label: &str, status: ReadinessStatus, detail: String) -> ReadinessRow {
+    ReadinessRow {
         label: label.to_string(),
         status,
         detail,
     }
 }
 
-fn steam_runtime_readiness_row(helper_path: &Path) -> AlphaReadinessRow {
+fn steam_runtime_readiness_row(helper_path: &Path) -> ReadinessRow {
     let Some(helper_dir) = helper_path.parent() else {
         return readiness_row(
             "Steam DLL",
-            AlphaReadinessStatus::Error,
+            ReadinessStatus::Error,
             format!(
                 "Could not resolve helper directory for {}",
                 helper_path.display()
@@ -4485,13 +7058,13 @@ fn steam_runtime_readiness_row(helper_path: &Path) -> AlphaReadinessRow {
     if steam_dll.is_file() {
         readiness_row(
             "Steam DLL",
-            AlphaReadinessStatus::Ready,
+            ReadinessStatus::Ready,
             format!("Found {}", steam_dll.display()),
         )
     } else {
         readiness_row(
             "Steam DLL",
-            AlphaReadinessStatus::Error,
+            ReadinessStatus::Error,
             format!("Missing {}", steam_dll.display()),
         )
     }
@@ -4609,6 +7182,69 @@ fn steam_helper_config_read_path() -> PathBuf {
     config_file_read_path(STEAM_HELPER_CONFIG_FILE)
 }
 
+fn workshop_metadata_cache_path() -> PathBuf {
+    config_file_write_path(WORKSHOP_METADATA_CACHE_FILE)
+}
+
+fn workshop_metadata_cache_read_path() -> PathBuf {
+    config_file_read_path(WORKSHOP_METADATA_CACHE_FILE)
+}
+
+fn load_workshop_metadata_cache_or_default() -> WorkshopMetadataCache {
+    read_workshop_metadata_cache(workshop_metadata_cache_read_path()).unwrap_or_default()
+}
+
+fn load_cached_workshop_metadata() -> Vec<WorkshopModData> {
+    load_workshop_metadata_cache_or_default()
+        .entries
+        .into_iter()
+        .map(|entry| entry.metadata)
+        .collect()
+}
+
+fn ui_preferences_path() -> PathBuf {
+    config_file_write_path(UI_PREFERENCES_FILE)
+}
+
+fn ui_preferences_read_path() -> PathBuf {
+    config_file_read_path(UI_PREFERENCES_FILE)
+}
+
+fn load_ui_sort_preference() -> ModSortSpec {
+    load_ui_sort_preference_from(&ui_preferences_read_path())
+}
+
+fn load_ui_sort_preference_from(path: &Path) -> ModSortSpec {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
+        .filter(|preferences| preferences.version == 1)
+        .map(|preferences| preferences.mod_sort)
+        .unwrap_or_default()
+}
+
+fn save_ui_sort_preference(sort: ModSortSpec) -> Result<(), String> {
+    save_ui_sort_preference_to(&ui_preferences_path(), sort)
+}
+
+fn save_ui_sort_preference_to(path: &Path, sort: ModSortSpec) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create UI preferences folder: {error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(&UiPreferences {
+        version: 1,
+        mod_sort: sort,
+    })
+    .map_err(|error| format!("Could not encode UI preferences: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, bytes)
+        .map_err(|error| format!("Could not write UI preferences: {error}"))?;
+    fs::rename(&temp_path, path)
+        .map_err(|error| format!("Could not replace UI preferences: {error}"))?;
+    Ok(())
+}
+
 fn load_mods_from_folder(folder: PathBuf) -> wh3mm_core::CoreResult<(Vec<ModRecord>, String)> {
     let options = discovery_options_for_folder(folder.clone());
     let mut mods = discover_mods(&options)?;
@@ -4697,6 +7333,140 @@ fn read_existing_launch_mod_list_pack_names(game_dir: &Path) -> Option<(String, 
         }
     }
     None
+}
+
+fn run_in_background<T, F>(work: F) -> oneshot::Receiver<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+}
+
+fn start_release_update_check(
+    mut update_check_state: Signal<UpdateCheckState>,
+    mut mod_status: Signal<Option<String>>,
+    manual: bool,
+) {
+    if *update_check_state.read() == UpdateCheckState::Checking {
+        return;
+    }
+
+    update_check_state.set(UpdateCheckState::Checking);
+    let receiver = run_in_background(check_latest_github_release);
+    spawn(async move {
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(_) => UpdateCheckState::Failed(
+                "The update check ended before returning a result.".to_string(),
+            ),
+        };
+        let status = update_check_status_label(&result);
+        let _ = append_app_diagnostic_log_event(&format!("update check: {status}"));
+        if manual {
+            mod_status.set(Some(status.clone()));
+        }
+        update_check_state.set(result);
+    });
+}
+
+fn check_latest_github_release() -> UpdateCheckState {
+    match fetch_latest_github_release() {
+        Ok(Some(release)) => evaluate_github_release(
+            env!("CARGO_PKG_VERSION"),
+            &release.tag_name,
+            release.draft,
+            release.prerelease,
+        )
+        .unwrap_or_else(UpdateCheckState::Failed),
+        Ok(None) => UpdateCheckState::NoPublishedRelease,
+        Err(error) => UpdateCheckState::Failed(error),
+    }
+}
+
+fn fetch_latest_github_release() -> Result<Option<GitHubLatestRelease>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(UPDATE_CHECK_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("Could not prepare the update check: {error}"))?;
+    let response = client
+        .get(LATEST_RELEASE_API_URL)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(
+            USER_AGENT,
+            format!("WH3-Mod-Manager/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .map_err(|error| format!("Could not reach GitHub for updates: {error}"))?;
+
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+
+    response
+        .error_for_status()
+        .map_err(|error| format!("GitHub rejected the update check: {error}"))?
+        .json::<GitHubLatestRelease>()
+        .map(Some)
+        .map_err(|error| format!("GitHub returned malformed release data: {error}"))
+}
+
+fn evaluate_github_release(
+    current_version: &str,
+    release_tag: &str,
+    draft: bool,
+    prerelease: bool,
+) -> Result<UpdateCheckState, String> {
+    if draft || prerelease {
+        return Ok(UpdateCheckState::NoPublishedRelease);
+    }
+
+    let current = Version::parse(current_version)
+        .map_err(|error| format!("Invalid application version {current_version}: {error}"))?;
+    let tag = release_tag.trim();
+    let version_text = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    let latest = Version::parse(version_text)
+        .map_err(|error| format!("Invalid GitHub release tag {release_tag}: {error}"))?;
+
+    if latest > current {
+        let release_url = format!("{RELEASE_TAG_BASE_URL}/{tag}");
+        Ok(UpdateCheckState::Available {
+            version: latest.to_string(),
+            release_url,
+        })
+    } else {
+        Ok(UpdateCheckState::Current {
+            latest_version: latest.to_string(),
+        })
+    }
+}
+
+fn update_check_status_label(state: &UpdateCheckState) -> String {
+    match state {
+        UpdateCheckState::NotChecked => "Updates have not been checked yet.".to_string(),
+        UpdateCheckState::Checking => {
+            "Checking GitHub for the latest stable release...".to_string()
+        }
+        UpdateCheckState::Current { latest_version } => format!(
+            "WH3 Mod Manager {} is current (latest release: v{latest_version}).",
+            env!("CARGO_PKG_VERSION")
+        ),
+        UpdateCheckState::Available { version, .. } => {
+            format!("WH3 Mod Manager v{version} is available.")
+        }
+        UpdateCheckState::NoPublishedRelease => {
+            "No published stable GitHub release was found.".to_string()
+        }
+        UpdateCheckState::Failed(error) => format!("Could not check for updates: {error}"),
+    }
 }
 
 fn probe_steam_helper(helper_path: &Path, backend: &str) -> Result<String, String> {
@@ -4807,19 +7577,9 @@ fn refresh_steam_from_helper(
         .subscribed_workshop_ids()
         .map_err(|error| error.message)?;
 
-    let before_filter_len = state.mods.len();
-    if !subscribed_ids.is_empty() {
-        let subscribed_set = subscribed_ids.iter().cloned().collect::<BTreeSet<_>>();
-        state.mods.retain(|mod_record| {
-            mod_record
-                .identity
-                .workshop_id
-                .as_ref()
-                .is_none_or(|workshop_id| subscribed_set.contains(workshop_id))
-        });
-    }
-    let filtered_unsubscribed_count = before_filter_len.saturating_sub(state.mods.len());
-
+    // Refresh metadata for the current archive without deleting local/data rows
+    // whose inherited Workshop association is no longer subscribed.
+    let filtered_unsubscribed_count = 0;
     let workshop_ids = workshop_ids_from_mods(&state.mods);
     let mut metadata_adapter = TsSteamHelperMetadataAdapter::new(
         WH3_STEAM_APP_ID,
@@ -4836,6 +7596,19 @@ fn refresh_steam_from_helper(
         filtered_unsubscribed_count,
         renamed_count,
     })
+}
+
+fn fetch_metadata_from_helper(
+    workshop_ids: &[String],
+    helper_path: &Path,
+    backend: &str,
+) -> Result<SteamMetadataBatchResult, String> {
+    validate_steam_helper_path(helper_path)?;
+    let mut metadata_adapter = TsSteamHelperMetadataAdapter::new(
+        WH3_STEAM_APP_ID,
+        steam_helper_process_runner(helper_path, backend).map_err(|error| error.message)?,
+    );
+    fetch_steam_metadata_safely(&mut metadata_adapter, workshop_ids)
 }
 
 fn check_steam_updates_with_helper(
@@ -6174,14 +8947,22 @@ fn attach_first_table_preview(
 
 fn schema_path() -> PathBuf {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    [
-        cwd.join("schema/schema_wh3.json.zst"),
+    schema_path_from(current_executable_dir().as_deref(), &cwd)
+}
+
+fn schema_path_from(app_dir: Option<&Path>, cwd: &Path) -> PathBuf {
+    let relative_path = Path::new("schema").join("schema_wh3.json.zst");
+    let packaged_path = app_dir.map(|path| path.join(&relative_path));
+    let mut candidates = packaged_path.iter().cloned().collect::<Vec<_>>();
+    candidates.extend([
+        cwd.join(&relative_path),
         cwd.join("../../schema/schema_wh3.json.zst"),
-        PathBuf::from("schema/schema_wh3.json.zst"),
-    ]
-    .into_iter()
-    .find(|path| path.exists())
-    .unwrap_or_else(|| PathBuf::from("schema/schema_wh3.json.zst"))
+    ]);
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| packaged_path.unwrap_or_else(|| cwd.join(relative_path)))
 }
 
 #[cfg(test)]
@@ -6194,8 +8975,8 @@ mod tests {
     use wh3mm_core::{
         AppState, DbCell, DbFieldSchema, DbFieldType, DbPrimitiveValue, DbRows, DbSchema,
         DbVersionSchema, GameId, LegacyTsLaunchOptions, ModIdentity, ModListConfig, ModRecord,
-        PackDataOverwrite, PackDataOverwriteOperation, PackDataOverwriteValue, PackFileWrite,
-        PersistedModState, PersistedPreset, PreLaunchPackWrite, PresetConfig,
+        ModSource, PackDataOverwrite, PackDataOverwriteOperation, PackDataOverwriteValue,
+        PackFileWrite, PersistedModState, PersistedPreset, PreLaunchPackWrite, PresetConfig,
         SteamWorkshopAdapterError, SteamWorkshopMetadataAdapter,
         WH3_MAKE_UNITS_GENERALS_TABLE_PATH, WH3_START_GAME_PACK_NAME, Wh3StartGamePackOptions,
         WorkshopModData, build_pfh5_pack_bytes, build_wh3_start_game_pack_with_battle_permissions,
@@ -6208,46 +8989,363 @@ mod tests {
         WindowsProcessPriorityClass, WindowsProcessPriorityUpdate,
     };
 
+    macro_rules! mod_row {
+        ($($field:tt)*) => {
+            ModRowViewModel {
+                $($field)*
+                ..Default::default()
+            }
+        };
+    }
+
     use super::{
-        APP_DIAGNOSTIC_LOG_FILE, AlphaReadinessReport, AlphaReadinessRow, AlphaReadinessStatus,
-        DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput, LaunchOptionState, LibraryNavTarget,
-        LibraryToolTab, ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME,
-        STEAM_HELPER_COMMAND_LOG_ENV, STEAM_HELPER_COMMAND_LOG_FILE, SteamCommandAction,
-        SteamCommandPanelRow, SteamCommandPanelState, SteamRefreshResult, ToolPanelTab,
-        WorkspacePage, app_brand_subtitle, app_brand_title,
+        APP_DIAGNOSTIC_LOG_FILE, APP_ICON_BYTES, DIAGNOSTICS_DIR_NAME, DiagnosticSnapshotInput,
+        LaunchOptionState, LibraryNavTarget, ModListFilter, ON_LAST_GAME_LAUNCH_PRESET_NAME,
+        RELEASE_TAG_BASE_URL, ReadinessReport, ReadinessRow, ReadinessStatus,
+        STEAM_HELPER_COMMAND_LOG_ENV, STEAM_HELPER_COMMAND_LOG_FILE, SettingsFocus, StatusCode,
+        SteamCommandAction, SteamCommandPanelRow, SteamCommandPanelState, SteamRefreshResult,
+        UPDATE_CHECK_CONNECT_TIMEOUT_SECS, UPDATE_CHECK_TIMEOUT_SECS, UpdateCheckState,
+        WorkspacePage, app_brand_subtitle, app_brand_title, app_icon_http_response,
         append_app_diagnostic_log_event_to_path, append_pack_data_overwrite_packs,
         apply_saved_or_existing_game_mod_list, apply_steam_metadata_to_mods,
-        archive_filter_bar_style, archive_filter_button_style, archive_table_header_style,
-        archive_toolbar_button_style, build_alpha_readiness_report_with_paths,
-        build_windows_launch_options, continue_save_button_style, delete_category_config_for_state,
-        dependency_names_summary, detail_action_button_style, detail_metric_style,
-        detail_source_tile_style, diagnostic_snapshot_text, enabled_pack_paths_for_start_game,
-        fetch_steam_metadata_safely, first_existing_steam_helper_path, generated_pack_details,
-        initial_app_state, launch_options_from_legacy_ts, launch_priority_status,
-        launch_quick_button_style, launch_state_fingerprint, launch_status_with_close_on_play,
+        archive_empty_actions_style, archive_empty_body, archive_empty_body_style,
+        archive_empty_button_style, archive_empty_panel_style, archive_empty_title,
+        archive_empty_title_style, archive_filter_bar_style, archive_filter_button_style,
+        archive_filter_chip_style, archive_header_icon_button_style,
+        archive_source_action_row_style, archive_status_style, archive_table_header_style,
+        archive_toolbar_button_style, archive_utility_dock_style, archive_workspace_style,
+        build_readiness_report_with_paths, build_windows_launch_options,
+        collection_row_button_style, collection_row_style, compatibility_analysis_elapsed_label,
+        compatibility_input_fingerprint, continue_save_button_style, default_tool_workspace_pages,
+        delete_category_config_for_state, dependency_names_summary, desktop_app_icon,
+        desktop_window_title, detail_action_button_style, detail_action_grid_style,
+        detail_category_assignment_style, detail_description_body_style,
+        detail_description_panel_style, detail_empty_actions_style, detail_empty_body_style,
+        detail_empty_panel_style, detail_empty_title_style, detail_header_actions_style,
+        detail_header_nav_button_style, detail_main_panel_style, detail_metric_style,
+        detail_metrics_grid_style, detail_page_content_style, detail_page_header_style,
+        detail_page_kicker_style, detail_position_label_style,
+        detail_primary_description_body_style, detail_primary_description_panel_style,
+        detail_record_path_style, detail_section_label_style, detail_side_column_style,
+        detail_side_meta_panel_style, detail_side_meta_row_style, detail_status_style,
+        detail_tag_list_style, detail_workspace_grid_style, diagnostic_snapshot_text,
+        enabled_pack_paths_for_start_game, evaluate_github_release, fetch_steam_metadata_safely,
+        first_existing_steam_helper_path, generated_pack_details, initial_app_state,
+        launch_options_from_legacy_ts, launch_priority_status, launch_quick_button_style,
+        launch_state_fingerprint, launch_status_with_close_on_play,
         legacy_ts_launch_option_import_summary, legacy_ts_launch_options_from_state,
-        library_nav_active, library_tool_tab_label, library_utility_button_style, mod_author_label,
-        mod_categories_label, mod_enable_button_style, mod_list_filter_label,
-        mod_row_matches_filter, mod_row_matches_query, mod_row_style, mod_source_label,
-        mod_state_label, mod_updated_label, mod_workshop_id_from_row, nav_badge_style,
-        nav_button_style, normalize_steam_helper_backend, read_existing_launch_mod_list_pack_names,
-        relative_time_label, rename_category_config_for_state, resolve_config_file_read_path,
+        library_nav_active, library_settings_nav_visible, library_utility_button_style,
+        load_ui_sort_preference_from, mod_author_label, mod_categories_label, mod_context_label,
+        mod_detail_breadcrumb, mod_detail_dependency_text, mod_detail_description_text,
+        mod_detail_empty_body, mod_detail_empty_title, mod_enable_button_style,
+        mod_enable_knob_style, mod_list_filter_label, mod_order_label, mod_row_matches_filter,
+        mod_row_matches_query, mod_row_style, mod_settings_action_disabled,
+        mod_settings_action_title, mod_source_label, mod_state_label, mod_updated_label,
+        mod_workshop_id_from_row, nav_button_style, nav_count_chip_style, nav_icon_dot_style,
+        nav_icon_line_style, nav_icon_ring_style, nav_icon_stack_style, nav_icon_tile_style,
+        normalize_steam_helper_backend, open_release_update, play_icon_style,
+        play_primary_button_style, project_readme_path, project_readme_path_from,
+        read_existing_launch_mod_list_pack_names, relative_time_label,
+        rename_category_config_for_state, resolve_config_file_read_path, run_in_background,
         run_steam_command_action, save_on_last_game_launch_preset_to_path,
-        selected_or_first_mod_row, selected_pack_from_optional_arg, settings_card_style,
-        settings_input_style, source_tile_style, start_game_source_pack_paths,
+        save_ui_sort_preference_to, schema_path_from, secondary_page_breadcrumb,
+        secondary_page_content_style, secondary_page_header_style, secondary_page_kicker_style,
+        secondary_status_style, selected_mod_folder_target, selected_mod_neighbor_key,
+        selected_mod_position_label, selected_or_first_mod_row, selected_pack_from_optional_arg,
+        settings_card_header_actions_style, settings_card_style, settings_danger_button_style,
+        settings_field_style, settings_focus_active, settings_focus_breadcrumb,
+        settings_focus_card_style, settings_focus_description, settings_focus_route_chip_style,
+        settings_focus_tab_label, settings_focus_tab_style, settings_focus_tabs_style,
+        settings_focus_title, settings_game_data_label, settings_game_executable_label,
+        settings_helper_backend_row_style, settings_inline_field_style, settings_input_style,
+        settings_launch_actions_copy_style, settings_launch_actions_style,
+        settings_launch_button_row_style, settings_page_content_style, settings_page_header_style,
+        settings_page_kicker_style, settings_path_action_row_style, settings_primary_button_style,
+        settings_toggle_knob_style, settings_workspace_active, start_game_source_pack_paths,
         start_game_temp_packs_dir_for_config_dir, steam_check_update_panel_state,
         steam_check_update_status, steam_command_panel_state, steam_command_status,
         steam_helper_process_config, steam_probe_status, steam_refresh_panel_state,
-        steam_resubscribe_panel_state, steam_resubscribe_status, toggle_label_style,
-        toggle_tool_panel, tool_action_button_style, tool_panel_button_style, tool_panel_tab_label,
-        top_icon_button_style, workshop_id_summary, workshop_ids_from_input,
-        workshop_ids_from_mods,
+        steam_resubscribe_panel_state, steam_resubscribe_status, thumbnail_asset_http_response,
+        thumbnail_asset_token, toggle_label_style, tool_action_button_style,
+        tool_action_disabled_button_style, tool_action_group_style, tool_aux_button_style,
+        tool_aux_group_style, tool_context_action_style, tool_context_actions_style,
+        tool_context_disabled_screen_button_style, tool_context_label_style,
+        tool_context_meta_chip_style, tool_context_meta_style, tool_context_name_style,
+        tool_context_panel_style, tool_context_path_style, tool_context_screen_button_style,
+        tool_context_screen_group_style, tool_context_summary_style, tool_context_toggle_style,
+        tool_footer_button_style, tool_more_group_style, tool_other_screens_group_label,
+        tool_settings_views_group_label, tools_header_style, tools_rail_style, top_actions_style,
+        top_brand_title_style, top_icon_button_style, top_search_should_route_to_mods,
+        top_search_style, top_shell_header_style, top_update_button_style,
+        update_check_status_label, workshop_id_summary, workshop_ids_from_input,
+        workshop_ids_from_mods, workshop_url_for_mod_row,
     };
-    use wh3mm_ui::ModRowViewModel;
+    use wh3mm_ui::{ModRowViewModel, ModSortColumn, ModSortSpec, SortDirection};
+
+    #[test]
+    fn desktop_window_title_is_branded() {
+        assert_eq!(desktop_window_title(), "WH3 Mod Manager");
+        assert_ne!(desktop_window_title(), "Dioxus App");
+    }
+
+    #[test]
+    fn ts_parity_app_icon_decodes_and_is_served_from_embedded_bytes() {
+        assert!(desktop_app_icon().is_some());
+        assert_eq!(&APP_ICON_BYTES[..4], &[0, 0, 1, 0]);
+
+        let response = app_icon_http_response("/app-icon/modmanager.ico");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/x-icon")
+        );
+        assert_eq!(response.body().as_slice(), APP_ICON_BYTES);
+        assert_eq!(
+            app_icon_http_response("/app-icon/not-allowlisted.ico").status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn github_release_check_uses_semver_and_a_fixed_repository_url() {
+        assert_eq!(
+            evaluate_github_release("1.0.0", "v1.2.3", false, false).unwrap(),
+            UpdateCheckState::Available {
+                version: "1.2.3".to_string(),
+                release_url: format!("{RELEASE_TAG_BASE_URL}/v1.2.3"),
+            }
+        );
+        assert_eq!(
+            evaluate_github_release("1.2.3", "v1.2.3", false, false).unwrap(),
+            UpdateCheckState::Current {
+                latest_version: "1.2.3".to_string(),
+            }
+        );
+        assert_eq!(
+            evaluate_github_release("2.0.0", "v1.9.9", false, false).unwrap(),
+            UpdateCheckState::Current {
+                latest_version: "1.9.9".to_string(),
+            }
+        );
+        assert!(evaluate_github_release("1.0.0", "latest", false, false).is_err());
+    }
+
+    #[test]
+    fn github_release_check_ignores_non_stable_releases_and_has_bounded_timeouts() {
+        assert_eq!(
+            evaluate_github_release("1.0.0", "v2.0.0", true, false).unwrap(),
+            UpdateCheckState::NoPublishedRelease
+        );
+        assert_eq!(
+            evaluate_github_release("1.0.0", "v2.0.0-beta.1", false, true).unwrap(),
+            UpdateCheckState::NoPublishedRelease
+        );
+        assert!(UPDATE_CHECK_CONNECT_TIMEOUT_SECS <= UPDATE_CHECK_TIMEOUT_SECS);
+        assert!(UPDATE_CHECK_TIMEOUT_SECS <= 10);
+    }
+
+    #[test]
+    fn update_ui_reports_state_and_refuses_untrusted_destinations() {
+        let available = UpdateCheckState::Available {
+            version: "1.1.0".to_string(),
+            release_url: format!("{RELEASE_TAG_BASE_URL}/v1.1.0"),
+        };
+        assert!(update_check_status_label(&available).contains("v1.1.0"));
+        assert!(top_update_button_style().contains("inline-flex"));
+        assert_eq!(
+            open_release_update("https://example.com/releases/tag/v9.9.9").unwrap_err(),
+            "Refused to open an untrusted update address."
+        );
+    }
+
+    #[test]
+    fn background_work_returns_without_using_the_ui_thread() {
+        let mut receiver = run_in_background(|| 42_u32);
+
+        for _ in 0..100 {
+            match receiver.try_recv() {
+                Ok(Some(value)) => {
+                    assert_eq!(value, 42);
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("background work channel was canceled: {error}"),
+            }
+        }
+
+        panic!("background work did not finish within 100ms");
+    }
+
+    #[test]
+    fn compatibility_fingerprint_tracks_the_enabled_ordered_snapshot() {
+        let mut first = mod_record("first.pack", None, "First");
+        first.enabled = true;
+        let mut second = mod_record("second.pack", None, "Second");
+        second.always_enabled = true;
+        let disabled = mod_record("disabled.pack", None, "Disabled");
+
+        let fingerprint =
+            compatibility_input_fingerprint(&[first.clone(), disabled.clone(), second.clone()]);
+        assert_eq!(
+            fingerprint,
+            compatibility_input_fingerprint(&[first.clone(), second.clone()])
+        );
+        assert_ne!(
+            fingerprint,
+            compatibility_input_fingerprint(&[second, first])
+        );
+    }
+
+    #[test]
+    fn compatibility_elapsed_label_is_compact() {
+        assert_eq!(
+            compatibility_analysis_elapsed_label(Duration::from_millis(450)),
+            "450 ms"
+        );
+        assert_eq!(
+            compatibility_analysis_elapsed_label(Duration::from_millis(1_250)),
+            "1.2 s"
+        );
+    }
+
+    #[test]
+    fn project_readme_path_targets_windows_verification_guide() {
+        let readme_path = project_readme_path();
+        assert_eq!(
+            readme_path.file_name().and_then(|name| name.to_str()),
+            Some("WINDOWS-VERIFICATION.md")
+        );
+    }
+
+    #[test]
+    fn ui_sort_preferences_round_trip_and_invalid_files_fall_back() {
+        let root = unique_temp_root("ui-sort-preferences");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("preferences.json");
+        let sort = ModSortSpec {
+            column: ModSortColumn::Updated,
+            direction: SortDirection::Descending,
+        };
+
+        save_ui_sort_preference_to(&path, sort).unwrap();
+        assert_eq!(load_ui_sort_preference_from(&path), sort);
+
+        fs::write(
+            &path,
+            br#"{"version":999,"mod_sort":{"column":"name","direction":"ascending"}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_ui_sort_preference_from(&path), ModSortSpec::default());
+        fs::write(&path, b"not-json").unwrap();
+        assert_eq!(load_ui_sort_preference_from(&path), ModSortSpec::default());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn thumbnail_asset_handler_serves_only_allowlisted_png_and_jpeg_files() {
+        let root = unique_temp_root("thumbnail-assets");
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("preview.png");
+        let jpeg = root.join("preview.JPEG");
+        fs::write(&png, b"png-bytes").unwrap();
+        fs::write(&jpeg, b"jpeg-bytes").unwrap();
+
+        let mut png_mod = mod_record("mods/png.pack", None, "PNG");
+        png_mod.thumbnail_path = Some(png.display().to_string());
+        let mut jpeg_mod = mod_record("mods/jpeg.pack", None, "JPEG");
+        jpeg_mod.thumbnail_path = Some(jpeg.display().to_string());
+        let mods = vec![png_mod, jpeg_mod];
+
+        let png_token = thumbnail_asset_token(
+            &mods[0].identity.stable_key(),
+            mods[0].thumbnail_path.as_deref().unwrap(),
+        );
+        let png_response =
+            thumbnail_asset_http_response(&mods, &format!("/mod-thumbnail/{png_token}"));
+        assert_eq!(png_response.status().as_u16(), 200);
+        assert_eq!(png_response.headers()["content-type"], "image/png");
+        assert_eq!(png_response.body(), b"png-bytes");
+
+        let jpeg_token = thumbnail_asset_token(
+            &mods[1].identity.stable_key(),
+            mods[1].thumbnail_path.as_deref().unwrap(),
+        );
+        let jpeg_response =
+            thumbnail_asset_http_response(&mods, &format!("/mod-thumbnail/{jpeg_token}"));
+        assert_eq!(jpeg_response.status().as_u16(), 200);
+        assert_eq!(jpeg_response.headers()["content-type"], "image/jpeg");
+
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, "/mod-thumbnail/not-allowlisted")
+                .status()
+                .as_u16(),
+            404
+        );
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, "/wrong-handler/token")
+                .status()
+                .as_u16(),
+            400
+        );
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, "/mod-thumbnail/token/extra")
+                .status()
+                .as_u16(),
+            400
+        );
+
+        fs::remove_file(&png).unwrap();
+        assert_eq!(
+            thumbnail_asset_http_response(&mods, &format!("/mod-thumbnail/{png_token}"))
+                .status()
+                .as_u16(),
+            404
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn responsive_shell_collapses_both_rails_without_horizontal_scrolling() {
+        assert!(super::RESPONSIVE_SHELL_CSS.contains("max-width: 1279px"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains("max-width: 959px"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains(".tools-rail.drawer-open"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains(".library-rail.drawer-open"));
+        assert!(super::RESPONSIVE_SHELL_CSS.contains("overflow-x: hidden"));
+    }
+
+    #[test]
+    fn packaged_resources_prefer_the_executable_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "wh3mm-dioxus-packaged-resources-{}",
+            std::process::id()
+        ));
+        let app_dir = root.join("app");
+        let cwd = root.join("working-dir");
+        let packaged_schema = app_dir.join("schema/schema_wh3.json.zst");
+        let cwd_schema = cwd.join("schema/schema_wh3.json.zst");
+        let packaged_help = app_dir.join(super::PACKAGED_HELP_FILE);
+
+        fs::create_dir_all(packaged_schema.parent().unwrap()).unwrap();
+        fs::create_dir_all(cwd_schema.parent().unwrap()).unwrap();
+        fs::write(&packaged_schema, b"packaged schema").unwrap();
+        fs::write(&cwd_schema, b"working-dir schema").unwrap();
+        fs::write(&packaged_help, b"packaged help").unwrap();
+
+        assert_eq!(schema_path_from(Some(&app_dir), &cwd), packaged_schema);
+        assert_eq!(
+            project_readme_path_from(Some(&app_dir), &cwd),
+            packaged_help
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn mod_row_search_matches_name_path_category_and_tag() {
-        let row = ModRowViewModel {
+        let row = mod_row! {
             key: "mod-a".to_string(),
             display_name: "Community Balance".to_string(),
             subtitle: "workshop/content/1142710/123456789/mod.pack".to_string(),
@@ -6267,7 +9365,7 @@ mod tests {
 
     #[test]
     fn mod_list_filter_matches_expected_row_states() {
-        let enabled = ModRowViewModel {
+        let enabled = mod_row! {
             key: "enabled".to_string(),
             display_name: "Enabled".to_string(),
             subtitle: "enabled.pack".to_string(),
@@ -6277,7 +9375,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let disabled = ModRowViewModel {
+        let disabled = mod_row! {
             key: "disabled".to_string(),
             display_name: "Disabled".to_string(),
             subtitle: "disabled.pack".to_string(),
@@ -6287,7 +9385,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let locked = ModRowViewModel {
+        let locked = mod_row! {
             key: "locked".to_string(),
             display_name: "Locked".to_string(),
             subtitle: "locked.pack".to_string(),
@@ -6297,7 +9395,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let hidden = ModRowViewModel {
+        let hidden = mod_row! {
             key: "hidden".to_string(),
             display_name: "Hidden".to_string(),
             subtitle: "hidden.pack".to_string(),
@@ -6315,13 +9413,18 @@ mod tests {
         assert!(mod_row_matches_filter(&hidden, ModListFilter::Hidden));
         assert!(!mod_row_matches_filter(&locked, ModListFilter::Disabled));
         assert_eq!(mod_list_filter_label(ModListFilter::Hidden), "Hidden");
+        assert_eq!(archive_empty_title(0), "No mods loaded");
+        assert_eq!(archive_empty_title(4), "No visible mods");
+        assert_eq!(archive_empty_body(0), "No source selected.");
+        assert!(archive_empty_body(4).contains("search or filters"));
     }
 
     #[test]
     fn selected_mod_detail_helpers_prefer_selected_then_first_row() {
-        let first = ModRowViewModel {
+        let first = mod_row! {
             key: "first".to_string(),
             display_name: "First".to_string(),
+            load_order: 1,
             subtitle: "first.pack".to_string(),
             enabled: false,
             locked: false,
@@ -6329,9 +9432,10 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let second = ModRowViewModel {
+        let second = mod_row! {
             key: "second".to_string(),
             display_name: "Second".to_string(),
+            load_order: 2,
             subtitle: "second.pack".to_string(),
             enabled: true,
             locked: false,
@@ -6349,40 +9453,172 @@ mod tests {
             selected_or_first_mod_row(&rows, Some("missing")),
             Some(first)
         );
+        assert_eq!(
+            selected_mod_position_label(&rows, Some("second"), true),
+            "Mod 2 of 2"
+        );
+        assert_eq!(
+            selected_mod_position_label(&rows, Some("second"), false),
+            "First visible / 2"
+        );
+        assert_eq!(
+            selected_mod_position_label(&rows, Some("missing"), false),
+            "2 mods"
+        );
+        assert_eq!(selected_mod_position_label(&[], None, false), "No mods");
+        assert_eq!(
+            selected_mod_neighbor_key(&rows, Some("first"), 1).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            selected_mod_neighbor_key(&rows, Some("second"), -1).as_deref(),
+            Some("first")
+        );
+        assert_eq!(selected_mod_neighbor_key(&rows, Some("first"), -1), None);
+        assert_eq!(selected_mod_neighbor_key(&rows, Some("second"), 1), None);
+        assert_eq!(selected_mod_neighbor_key(&rows, Some("missing"), 1), None);
+        assert_eq!(mod_detail_empty_title(0), "No mod selected");
+        assert_eq!(mod_detail_empty_title(2), "No visible mod selected");
+        assert!(mod_detail_empty_body(0).contains("Load game mods"));
+        assert!(mod_detail_empty_body(2).contains("Clear them"));
         assert_eq!(mod_state_label(&second), "enabled");
         assert_eq!(mod_categories_label(&second), "Gameplay, Balance");
     }
 
     #[test]
-    fn tool_panel_tabs_are_labeled_and_styled_for_segmented_rail() {
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Overview), "Overview");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Launch), "Launch");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Steam), "Steam");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Workshop), "Workshop");
-        assert_eq!(tool_panel_tab_label(ToolPanelTab::Checks), "Checks");
+    fn mod_order_label_uses_archive_order_not_filtered_position() {
+        let first = mod_row! {
+            key: "first".to_string(),
+            display_name: "First".to_string(),
+            load_order: 1,
+            subtitle: "first.pack".to_string(),
+            enabled: false,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+        let second = mod_row! {
+            key: "second".to_string(),
+            display_name: "Second".to_string(),
+            load_order: 2,
+            subtitle: "second.pack".to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+        let third = mod_row! {
+            key: "third".to_string(),
+            display_name: "Third".to_string(),
+            load_order: 3,
+            subtitle: "third.pack".to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+        let rows = vec![first, second, third];
+
+        assert_eq!(mod_order_label(&rows, "second"), "2");
+        assert_eq!(mod_order_label(&rows, "third"), "3");
+        assert_eq!(mod_order_label(&rows, "missing"), "-");
+    }
+
+    #[test]
+    fn tool_actions_are_styled_for_screen_navigation() {
         assert_eq!(
-            toggle_tool_panel(ToolPanelTab::Overview, ToolPanelTab::Launch),
-            ToolPanelTab::Launch
+            default_tool_workspace_pages(),
+            [
+                WorkspacePage::Compatibility,
+                WorkspacePage::Settings,
+                WorkspacePage::ModDetail,
+                WorkspacePage::DbViewer,
+                WorkspacePage::Skills,
+            ]
         );
-        assert_eq!(
-            toggle_tool_panel(ToolPanelTab::Launch, ToolPanelTab::Launch),
-            ToolPanelTab::Overview
-        );
-        assert_eq!(library_tool_tab_label(LibraryToolTab::None), "None");
-        assert_eq!(library_tool_tab_label(LibraryToolTab::Presets), "Presets");
-        assert_eq!(library_tool_tab_label(LibraryToolTab::Categories), "Cats");
-        assert_eq!(library_tool_tab_label(LibraryToolTab::Config), "Config");
-        assert!(tool_panel_button_style(true).contains("font-weight: 650"));
-        assert!(tool_panel_button_style(false).contains("background: #111710"));
         assert!(tool_action_button_style(true).contains("background: #3a3b48"));
         assert!(tool_action_button_style(false).contains("justify-content: space-between"));
+        assert!(tool_action_disabled_button_style().contains("cursor: not-allowed"));
+        assert!(tool_action_disabled_button_style().contains("color: #7f8798"));
+        assert!(!mod_settings_action_disabled(true));
+        assert!(mod_settings_action_disabled(false));
+        assert_eq!(
+            mod_settings_action_title(0, false, false),
+            "Load game mods before opening Mod Settings"
+        );
+        assert_eq!(
+            mod_settings_action_title(3, false, false),
+            "Clear search or filters before opening Mod Settings"
+        );
+        assert_eq!(
+            mod_settings_action_title(3, true, false),
+            "Open first visible mod settings"
+        );
+        assert_eq!(
+            mod_settings_action_title(3, true, true),
+            "Open selected mod settings"
+        );
+        assert_eq!(mod_context_label(true), "Selected Mod");
+        assert_eq!(mod_context_label(false), "First Visible Mod");
+        assert!(tools_rail_style().contains("grid-area: tools"));
+        assert!(tools_rail_style().contains("flex-direction: column"));
+        assert!(tools_header_style().contains("margin-bottom: 26px"));
+        assert!(play_primary_button_style().contains("min-height: 76px"));
+        assert!(play_primary_button_style().contains("justify-content: center"));
+        assert!(play_primary_button_style().contains("font-size: 24px"));
+        assert!(play_icon_style().contains("border-left: 14px solid currentColor"));
+        assert!(tool_action_group_style().contains("display: grid"));
+        assert!(tool_context_panel_style().contains("background: #1a1b25"));
+        assert!(tool_context_summary_style().contains("border-bottom"));
+        assert!(tool_context_label_style().contains("text-transform: uppercase"));
+        assert_eq!(tool_settings_views_group_label(), "Settings Views");
+        assert_eq!(tool_other_screens_group_label(), "Other Screens");
+        assert!(tool_context_name_style().contains("text-overflow: ellipsis"));
+        assert!(tool_context_path_style().contains("ui-monospace"));
+        assert!(tool_context_meta_style().contains("flex-wrap"));
+        assert!(tool_context_meta_chip_style().contains("text-transform: uppercase"));
+        assert!(tool_context_actions_style().contains("repeat(2"));
+        assert!(tool_context_action_style(false).contains("background: transparent"));
+        assert!(tool_context_action_style(true).contains("color: #7f8798"));
+        assert!(tool_context_toggle_style(false).contains("justify-content: space-between"));
+        assert!(tool_context_toggle_style(true).contains("color: #9aa4b7"));
+        assert!(tool_context_screen_group_style().contains("border-top"));
+        assert!(tool_context_screen_button_style(false).contains("min-height: 38px"));
+        assert!(tool_context_screen_button_style(false).contains("justify-content: space-between"));
+        assert!(tool_context_screen_button_style(true).contains("cursor: default"));
+        assert!(tool_context_screen_button_style(true).contains("background: #292f36"));
+        assert!(tool_context_disabled_screen_button_style().contains("min-height: 38px"));
+        assert!(tool_context_disabled_screen_button_style().contains("cursor: not-allowed"));
+        assert!(tool_more_group_style().contains("border-left"));
+        assert!(tool_aux_group_style().contains("border-top"));
+        assert!(tool_aux_group_style().contains("margin: 2px 0 18px"));
+        assert!(tool_aux_button_style(false).contains("min-height: 38px"));
+        assert!(tool_aux_button_style(false).contains("background: transparent"));
+        assert!(tool_aux_button_style(true).contains("background: #292f36"));
+        assert!(tool_footer_button_style(false).contains("background: #11121a"));
+        assert!(tool_footer_button_style(true).contains("background: #343541"));
         assert!(launch_quick_button_style().contains("min-height: 42px"));
-        assert!(continue_save_button_style(false).contains("min-height: 50px"));
+        assert!(continue_save_button_style(false).contains("min-height: 52px"));
         assert!(continue_save_button_style(true).contains("background: #292a35"));
-        assert!(top_icon_button_style(true).contains("width: 34px"));
-        assert!(top_icon_button_style(false).contains("flex: 0 0 34px"));
+        assert!(top_icon_button_style(true).contains("width: 38px"));
+        assert!(top_icon_button_style(false).contains("flex: 0 0 auto"));
         assert!(archive_toolbar_button_style(true).contains("#1f6feb"));
         assert!(archive_toolbar_button_style(false).contains("min-height: 30px"));
+        assert!(archive_utility_dock_style().contains("position: sticky"));
+        assert!(archive_utility_dock_style().contains("grid-template-columns"));
+        assert!(archive_filter_chip_style(false).contains("min-width: 130px"));
+        assert!(archive_filter_chip_style(true).contains("background: #343541"));
+        assert!(top_shell_header_style().contains("minmax(260px, 420px)"));
+        assert!(!top_shell_header_style().contains("minmax(250px, 1fr)"));
+        assert!(top_brand_title_style().contains("#65f58b"));
+        assert!(top_search_style().contains("background: #242531"));
+        assert!(!top_search_should_route_to_mods(WorkspacePage::Mods));
+        assert!(top_search_should_route_to_mods(WorkspacePage::Settings));
+        assert!(top_search_should_route_to_mods(WorkspacePage::ModDetail));
+        assert!(top_actions_style().contains("justify-content: flex-end"));
     }
 
     #[test]
@@ -6391,59 +9627,91 @@ mod tests {
             LibraryNavTarget::AllMods,
             WorkspacePage::Mods,
             ModListFilter::All,
-            LibraryToolTab::None,
         ));
         assert!(!library_nav_active(
-            LibraryNavTarget::AllMods,
+            LibraryNavTarget::Enabled,
             WorkspacePage::Mods,
             ModListFilter::All,
-            LibraryToolTab::Presets,
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Collections,
-            WorkspacePage::Mods,
+            WorkspacePage::Collections,
             ModListFilter::All,
-            LibraryToolTab::Presets,
         ));
         assert!(!library_nav_active(
             LibraryNavTarget::AllMods,
             WorkspacePage::Mods,
-            ModListFilter::All,
-            LibraryToolTab::Categories,
+            ModListFilter::Hidden,
+        ));
+        assert!(library_nav_active(
+            LibraryNavTarget::AllMods,
+            WorkspacePage::ModDetail,
+            ModListFilter::Hidden,
+        ));
+        assert!(!library_nav_active(
+            LibraryNavTarget::Enabled,
+            WorkspacePage::ModDetail,
+            ModListFilter::Enabled,
         ));
         assert!(library_nav_active(
             LibraryNavTarget::Categories,
-            WorkspacePage::Mods,
+            WorkspacePage::Categories,
             ModListFilter::All,
-            LibraryToolTab::Categories,
         ));
         assert!(!library_nav_active(
             LibraryNavTarget::Collections,
-            WorkspacePage::Mods,
+            WorkspacePage::Categories,
             ModListFilter::All,
-            LibraryToolTab::Categories,
         ));
-        assert!(library_nav_active(
-            LibraryNavTarget::Settings,
+        assert!(settings_focus_active(
             WorkspacePage::Settings,
-            ModListFilter::Enabled,
-            LibraryToolTab::Config,
+            SettingsFocus::General,
+            SettingsFocus::General,
+        ));
+        assert!(settings_workspace_active(WorkspacePage::Settings));
+        assert!(!settings_workspace_active(WorkspacePage::Mods));
+        assert!(library_settings_nav_visible(WorkspacePage::Settings));
+        assert!(!library_settings_nav_visible(WorkspacePage::Mods));
+        assert!(!library_settings_nav_visible(WorkspacePage::ModDetail));
+        assert!(settings_focus_active(
+            WorkspacePage::Settings,
+            SettingsFocus::Launch,
+            SettingsFocus::Launch,
+        ));
+        assert!(!settings_focus_active(
+            WorkspacePage::Settings,
+            SettingsFocus::Launch,
+            SettingsFocus::General,
+        ));
+        assert!(!settings_focus_active(
+            WorkspacePage::Mods,
+            SettingsFocus::Diagnostics,
+            SettingsFocus::Diagnostics,
         ));
         assert_eq!(app_brand_title(), "Mod Archive");
         assert_eq!(
             app_brand_subtitle("WH3 Mod Manager"),
-            "WH3 Mod Manager / Windows alpha"
+            "WH3 Mod Manager / Windows"
         );
-        assert!(nav_badge_style().contains("width: 26px"));
+        assert!(nav_icon_tile_style(true).contains("grid-template-columns"));
+        assert!(nav_icon_tile_style(false).contains("#3d4a3e"));
+        assert!(nav_icon_dot_style().contains("border-radius: 999px"));
+        assert!(nav_icon_line_style().contains("grid-column: 1 / -1"));
+        assert!(nav_icon_stack_style().contains("box-shadow"));
+        assert!(nav_icon_ring_style().contains("border-radius: 999px"));
+        assert!(nav_count_chip_style(true).contains("min-width: 28px"));
+        assert!(nav_count_chip_style(true).contains("#25322b"));
+        assert!(nav_count_chip_style(false).contains("#20232d"));
         assert!(library_utility_button_style(true).contains("min-height: 38px"));
         assert!(library_utility_button_style(false).contains("background: transparent"));
     }
 
     #[test]
     fn archive_row_helpers_distinguish_source_and_status_styles() {
-        let workshop = ModRowViewModel {
+        let workshop = mod_row! {
             key: "workshop".to_string(),
             display_name: "Workshop".to_string(),
+            source: ModSource::Workshop,
             subtitle: "workshop/content/1142710/123/mod.pack".to_string(),
             enabled: true,
             locked: false,
@@ -6451,9 +9719,10 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let local = ModRowViewModel {
+        let local = mod_row! {
             key: "local".to_string(),
             display_name: "Local".to_string(),
+            source: ModSource::GameDataModding,
             subtitle: "data/modding/local.pack".to_string(),
             enabled: false,
             locked: false,
@@ -6461,9 +9730,10 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let locked = ModRowViewModel {
+        let locked = mod_row! {
             key: "core".to_string(),
             display_name: "Core".to_string(),
+            source: ModSource::GameData,
             subtitle: "data/core.pack".to_string(),
             enabled: true,
             locked: true,
@@ -6474,28 +9744,47 @@ mod tests {
 
         assert_eq!(mod_source_label(&workshop), "WS");
         assert_eq!(mod_source_label(&local), "MOD");
-        assert_eq!(mod_source_label(&locked), "CORE");
-        assert!(source_tile_style(&workshop).contains("#2563eb"));
-        assert!(source_tile_style(&workshop).contains("width: 42px"));
+        assert_eq!(mod_source_label(&locked), "DATA");
         assert!(mod_row_style(false).contains("minmax(0, 1.9fr)"));
         assert!(!mod_row_style(false).contains("154px"));
+        assert!(archive_status_style().contains("position: fixed"));
+        assert!(archive_workspace_style().contains("padding: 0 10px 24px"));
         assert!(archive_table_header_style().contains("minmax(0, 1.9fr)"));
+        assert!(archive_table_header_style().contains("38px"));
         assert!(!archive_table_header_style().contains("Actions"));
-        assert!(archive_filter_bar_style().contains("max-width: max-content"));
-        assert!(archive_filter_button_style(true).contains("#65f58b"));
+        assert!(archive_empty_panel_style().contains("min-height: 118px"));
+        assert!(archive_empty_panel_style().contains("background: #151722"));
+        assert!(archive_empty_title_style().contains("font-size: 17px"));
+        assert!(archive_empty_body_style().contains("color: #9aa4b7"));
+        assert!(archive_empty_actions_style().contains("flex-wrap"));
+        assert!(archive_empty_button_style(true).contains("#65f58b"));
+        assert!(archive_empty_button_style(false).contains("#242936"));
+        assert!(archive_header_icon_button_style(false).contains("width: 34px"));
+        assert!(archive_header_icon_button_style(true).contains("#65f58b"));
+        assert!(archive_filter_bar_style().contains("min-width: 0"));
+        assert!(archive_source_action_row_style().contains("justify-content: flex-end"));
+        assert!(archive_filter_chip_style(false).contains("justify-content: space-between"));
+        assert!(archive_filter_button_style(true).contains("#60a5fa"));
         assert!(archive_filter_button_style(false).contains("min-width: 78px"));
         assert!(mod_row_style(false).contains("cursor: pointer"));
         assert!(mod_enable_button_style(true, false).contains("#65f58b"));
-        assert!(mod_enable_button_style(false, false).contains("#353a43"));
+        assert!(mod_enable_button_style(false, false).contains("width: 44px"));
         assert!(mod_enable_button_style(true, true).contains("#343946"));
+        assert!(mod_enable_knob_style(true, false).contains("translateX(20px)"));
+        assert!(mod_enable_knob_style(false, false).contains("translateX(0)"));
         assert!(nav_button_style(true).contains("border-left: 2px solid #65f58b"));
     }
 
     #[test]
     fn archive_row_metadata_uses_real_workshop_author_and_update_age() {
-        let workshop = ModRowViewModel {
+        let workshop = mod_row! {
             key: "workshop:111".to_string(),
             display_name: "Workshop".to_string(),
+            source: ModSource::Workshop,
+            workshop_id: Some("111".to_string()),
+            author: Some("Groove Wizard".to_string()),
+            updated_ms: Some(86_400_000),
+            description: Some("Real description".to_string()),
             subtitle: "workshop/content/1142710/111/mod.pack".to_string(),
             enabled: true,
             locked: false,
@@ -6503,9 +9792,11 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let path_only = ModRowViewModel {
+        let path_only = mod_row! {
             key: "path".to_string(),
             display_name: "Workshop Path".to_string(),
+            source: ModSource::Workshop,
+            workshop_id: Some("222".to_string()),
             subtitle: "C:\\Steam\\steamapps\\workshop\\content\\1142710\\222\\mod.pack".to_string(),
             enabled: true,
             locked: false,
@@ -6513,9 +9804,10 @@ mod tests {
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        let local = ModRowViewModel {
+        let local = mod_row! {
             key: "local".to_string(),
             display_name: "Local".to_string(),
+            source: ModSource::GameDataModding,
             subtitle: "data/modding/local.pack".to_string(),
             enabled: false,
             locked: false,
@@ -6523,49 +9815,264 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
         };
-        let metadata = vec![WorkshopModData {
-            workshop_id: "111".to_string(),
-            title: "Workshop".to_string(),
-            author: "Groove Wizard".to_string(),
-            dependency_ids: Vec::new(),
-            dependency_id_to_name: Vec::new(),
-            last_changed_ms: 86_400_000,
-        }];
+        let metadata = vec![
+            WorkshopModData {
+                workshop_id: "111".to_string(),
+                title: "Workshop".to_string(),
+                author: "Groove Wizard".to_string(),
+                description: "Real description".to_string(),
+                tags: vec!["mod".to_string()],
+                dependency_ids: Vec::new(),
+                dependency_id_to_name: vec![("222".to_string(), "Required Mod".to_string())],
+                last_changed_ms: 86_400_000,
+            },
+            WorkshopModData {
+                workshop_id: "222".to_string(),
+                title: "Workshop Path".to_string(),
+                author: "".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
+                dependency_ids: vec!["333".to_string(), "444".to_string()],
+                dependency_id_to_name: Vec::new(),
+                last_changed_ms: 0,
+            },
+        ];
 
         assert_eq!(mod_workshop_id_from_row(&workshop).as_deref(), Some("111"));
         assert_eq!(mod_workshop_id_from_row(&path_only).as_deref(), Some("222"));
-        assert_eq!(mod_author_label(&workshop, &metadata), "Groove Wizard");
+        assert_eq!(mod_author_label(&workshop), "Groove Wizard");
+        assert_eq!(mod_updated_label(&workshop, 3 * 86_400_000), "2 days ago");
+        assert_eq!(mod_author_label(&local), "—");
+        assert_eq!(mod_updated_label(&local, 3 * 86_400_000), "—");
+        assert_eq!(mod_detail_description_text(&workshop), "Real description");
         assert_eq!(
-            mod_updated_label(&workshop, &metadata, 3 * 86_400_000),
-            "2 days ago"
+            mod_detail_dependency_text(&workshop, &metadata),
+            "Required Mod"
         );
-        assert_eq!(mod_author_label(&local, &metadata), "Local");
         assert_eq!(
-            mod_updated_label(&local, &metadata, 3 * 86_400_000),
-            "Local"
+            mod_detail_dependency_text(&path_only, &metadata),
+            "333, 444"
+        );
+        assert_eq!(
+            mod_detail_dependency_text(&local, &metadata),
+            "No workshop dependency metadata is cached for this record."
+        );
+        assert_eq!(
+            mod_detail_description_text(&local),
+            "No description is available for this mod."
         );
         assert_eq!(relative_time_label(0, 3 * 86_400_000), "Unknown");
         assert_eq!(relative_time_label(3 * 86_400_000, 3 * 86_400_000), "Today");
     }
 
     #[test]
-    fn settings_workspace_styles_match_card_and_toggle_language() {
-        assert!(settings_card_style().contains("background: #1f202b"));
-        assert!(settings_input_style().contains("box-sizing: border-box"));
-        assert!(toggle_label_style(true).contains("#65f58b"));
-        assert!(toggle_label_style(false).contains("#353a43"));
-        let workshop = ModRowViewModel {
-            key: "workshop".to_string(),
+    fn selected_mod_context_actions_use_real_path_and_workshop_id() {
+        let workshop = mod_row! {
+            key: "workshop:111".to_string(),
             display_name: "Workshop".to_string(),
-            subtitle: "workshop/content/1142710/123/mod.pack".to_string(),
+            subtitle:
+                r"C:\Program Files (x86)\Steam\steamapps\workshop\content\1142710\111\mod.pack"
+                    .to_string(),
             enabled: true,
             locked: false,
             hidden: false,
             categories: Vec::new(),
             tags: vec!["workshop".to_string()],
         };
-        assert!(detail_source_tile_style(&workshop).contains("aspect-ratio: 1 / 1"));
+        let local = mod_row! {
+            key: "local".to_string(),
+            display_name: "Local".to_string(),
+            subtitle: "/mods/local_pack/local.pack".to_string(),
+            enabled: true,
+            locked: false,
+            hidden: false,
+            categories: Vec::new(),
+            tags: Vec::new(),
+        };
+
+        assert_eq!(
+            selected_mod_folder_target(&workshop).as_deref(),
+            Some(r"C:\Program Files (x86)\Steam\steamapps\workshop\content\1142710\111")
+        );
+        assert_eq!(
+            workshop_url_for_mod_row(&workshop).as_deref(),
+            Some("https://steamcommunity.com/sharedfiles/filedetails/?id=111")
+        );
+        assert_eq!(
+            selected_mod_folder_target(&local).as_deref(),
+            Some("/mods/local_pack")
+        );
+        assert_eq!(workshop_url_for_mod_row(&local), None);
+    }
+
+    #[test]
+    fn settings_workspace_styles_match_card_and_toggle_language() {
+        assert!(settings_card_style().contains("background: #1f202b"));
+        assert_eq!(
+            settings_focus_title(SettingsFocus::General),
+            "General Settings"
+        );
+        assert_eq!(
+            settings_focus_title(SettingsFocus::Launch),
+            "Launch Options"
+        );
+        assert_eq!(settings_focus_tab_label(SettingsFocus::General), "General");
+        assert_eq!(
+            settings_focus_tab_label(SettingsFocus::GamePaths),
+            "Game Paths"
+        );
+        assert_eq!(
+            settings_focus_tab_label(SettingsFocus::Launch),
+            "Launch Options"
+        );
+        assert_eq!(
+            settings_focus_tab_label(SettingsFocus::Diagnostics),
+            "Diagnostics"
+        );
+        assert_eq!(
+            settings_focus_breadcrumb(SettingsFocus::Launch),
+            "Settings / Launch Options"
+        );
+        assert_eq!(
+            settings_focus_breadcrumb(SettingsFocus::General),
+            "Settings / General"
+        );
+        assert_eq!(
+            settings_game_executable_label(None),
+            "No WH3 executable path selected"
+        );
+        assert_eq!(
+            settings_game_data_label(None),
+            "No WH3 data folder selected"
+        );
+        let windows_game_root =
+            PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III");
+        assert_eq!(
+            settings_game_executable_label(Some(&windows_game_root)),
+            r"C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III\Warhammer3.exe"
+        );
+        assert_eq!(
+            settings_game_data_label(Some(&windows_game_root)),
+            r"C:\Program Files (x86)\Steam\steamapps\common\Total War WARHAMMER III\data"
+        );
+        let unix_game_root = PathBuf::from("/games/wh3");
+        assert_eq!(
+            settings_game_executable_label(Some(&unix_game_root)),
+            "/games/wh3/Warhammer3.exe"
+        );
+        assert_eq!(
+            settings_game_data_label(Some(&unix_game_root)),
+            "/games/wh3/data"
+        );
+        assert!(settings_focus_description(SettingsFocus::General).contains("import"));
+        assert!(settings_focus_description(SettingsFocus::Diagnostics).contains("snapshot"));
+        assert!(settings_focus_tabs_style().contains("repeat(4"));
+        assert!(settings_focus_tab_style(true).contains("#65f58b"));
+        assert!(settings_focus_tab_style(false).contains("#20212b"));
+        assert!(
+            settings_focus_card_style(SettingsFocus::Launch, SettingsFocus::Launch)
+                .contains("order: 0")
+        );
+        assert!(
+            settings_focus_card_style(SettingsFocus::General, SettingsFocus::Launch)
+                .contains("display: none")
+        );
+        assert!(secondary_page_header_style().contains("width: min(100%, 1040px)"));
+        assert!(secondary_page_header_style().contains("margin: 0 auto"));
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Compatibility),
+            "Mod Archive / Compatibility"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::DbViewer),
+            "Packs / DB Viewer"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Categories),
+            "Library / Categories"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Steam),
+            "Tools / Steam"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Checks),
+            "Tools / Checks"
+        );
+        assert_eq!(
+            secondary_page_breadcrumb(WorkspacePage::Workshop),
+            "Tools / Workshop"
+        );
+        assert_eq!(secondary_page_breadcrumb(WorkspacePage::Mods), "");
+        assert!(secondary_page_kicker_style().contains("text-transform: uppercase"));
+        assert!(secondary_page_kicker_style().contains("#65f58b"));
+        assert!(secondary_status_style().contains("width: min(100%, 1040px)"));
+        assert!(secondary_status_style().contains("margin: 0 auto 14px"));
+        assert!(secondary_page_content_style().contains("gap: 22px"));
+        assert!(secondary_page_content_style().contains("padding: 0 40px 44px"));
+        assert!(settings_page_header_style().contains("margin: 0 auto"));
+        assert!(settings_page_kicker_style().contains("text-transform: uppercase"));
+        assert!(settings_page_kicker_style().contains("#65f58b"));
+        assert!(settings_page_content_style().contains("width: min(100%, 860px)"));
+        assert!(settings_field_style().contains("min-width: 0"));
+        assert!(!settings_inline_field_style().contains("border-bottom"));
+        assert!(settings_path_action_row_style().contains("104px"));
+        assert!(settings_helper_backend_row_style().contains("align-items: end"));
+        assert!(settings_input_style().contains("box-sizing: border-box"));
+        assert!(settings_primary_button_style().contains("#65f58b"));
+        assert!(settings_danger_button_style().contains("#451a1a"));
+        assert!(settings_launch_actions_style().contains("border-top"));
+        assert!(settings_launch_actions_style().contains("minmax(250px"));
+        assert!(settings_launch_actions_copy_style().contains("line-height: 20px"));
+        assert!(settings_launch_button_row_style().contains("repeat(2"));
+        assert!(settings_card_header_actions_style().contains("flex-wrap"));
+        assert!(!settings_focus_route_chip_style().contains("Current screen"));
+        assert!(settings_focus_route_chip_style().contains("text-transform: uppercase"));
+        assert!(settings_focus_route_chip_style().contains("white-space: nowrap"));
+        assert!(collection_row_style().contains("grid-template-columns"));
+        assert!(collection_row_button_style(true).contains("#60a5fa"));
+        assert!(collection_row_button_style(false).contains("#171b24"));
+        assert!(toggle_label_style(true).contains("width: 48px"));
+        assert!(toggle_label_style(true).contains("#65f58b"));
+        assert!(toggle_label_style(false).contains("#353a43"));
+        assert!(settings_toggle_knob_style(true).contains("translateX(22px)"));
+        assert!(settings_toggle_knob_style(false).contains("translateX(0)"));
+        assert_eq!(mod_detail_breadcrumb(), "Mod Archive / Mod Settings");
+        assert!(detail_page_header_style().contains("width: min(100%, 1040px)"));
+        assert!(detail_page_kicker_style().contains("text-transform: uppercase"));
+        assert!(detail_page_kicker_style().contains("#65f58b"));
+        assert!(detail_header_actions_style().contains("flex-wrap"));
+        assert!(detail_position_label_style().contains("white-space: nowrap"));
+        assert!(detail_header_nav_button_style(false).contains("background: #292a35"));
+        assert!(detail_header_nav_button_style(true).contains("cursor: not-allowed"));
+        assert!(detail_status_style().contains("margin: 0 auto"));
+        assert!(detail_empty_panel_style().contains("min-height: 180px"));
+        assert!(detail_empty_panel_style().contains("background: #1f202b"));
+        assert!(detail_empty_title_style().contains("font-size: 18px"));
+        assert!(detail_empty_body_style().contains("max-width: 620px"));
+        assert!(detail_empty_actions_style().contains("flex-wrap"));
+        assert!(detail_page_content_style().contains("width: min(100%, 1040px)"));
+        assert!(detail_workspace_grid_style().contains("260px"));
+        assert!(detail_side_column_style().contains("display: grid"));
+        assert!(detail_side_meta_panel_style().contains("background: #1f202b"));
+        assert!(detail_side_meta_row_style().contains("grid-template-columns"));
+        assert!(detail_side_meta_row_style().contains("minmax(0, 1fr)"));
+        assert!(detail_main_panel_style().contains("background: #1f202b"));
+        assert!(detail_metrics_grid_style().contains("auto-fit"));
+        assert!(detail_metrics_grid_style().contains("minmax(120px, 1fr)"));
+        assert!(detail_tag_list_style().contains("flex-wrap"));
         assert!(detail_metric_style().contains("border-top"));
+        assert!(detail_section_label_style().contains("uppercase"));
+        assert!(detail_primary_description_panel_style().contains("min-height: 150px"));
+        assert!(detail_primary_description_panel_style().contains("background: #1a1b26"));
+        assert!(detail_primary_description_body_style().contains("font-size: 14px"));
+        assert!(detail_record_path_style().contains("overflow"));
+        assert!(detail_record_path_style().contains("min-width: 0"));
+        assert!(detail_description_panel_style().contains("border-top"));
+        assert!(detail_description_body_style().contains("line-height: 19px"));
+        assert!(detail_category_assignment_style().contains("grid-template-columns"));
+        assert!(detail_category_assignment_style().contains("minmax(0, 1fr)"));
+        assert!(detail_action_grid_style().contains("auto-fit"));
         assert!(detail_action_button_style(false).contains("background: #343541"));
         assert!(detail_action_button_style(true).contains("background: #451a1a"));
     }
@@ -6640,7 +10147,7 @@ mod tests {
     }
 
     #[test]
-    fn alpha_readiness_report_accepts_packaged_windows_shape() {
+    fn readiness_report_accepts_packaged_windows_shape() {
         let root = std::env::temp_dir().join(format!("wh3mm-dioxus-ready-{}", std::process::id()));
         let payload = root.join("payload");
         let helper_dir = payload.join("helpers");
@@ -6669,7 +10176,7 @@ mod tests {
         fs::write(&schema, b"schema").unwrap();
         fs::write(game_dir.join("Warhammer3.exe"), b"exe").unwrap();
 
-        let report = build_alpha_readiness_report_with_paths(
+        let report = build_readiness_report_with_paths(
             Some(&game_dir),
             helper.to_str().unwrap(),
             &schema,
@@ -6681,21 +10188,21 @@ mod tests {
             report
                 .rows
                 .iter()
-                .all(|row| row.status == super::AlphaReadinessStatus::Ready)
+                .all(|row| row.status == super::ReadinessStatus::Ready)
         );
 
         fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn alpha_readiness_report_surfaces_missing_alpha_files() {
+    fn readiness_report_surfaces_missing_required_files() {
         let root =
             std::env::temp_dir().join(format!("wh3mm-dioxus-not-ready-{}", std::process::id()));
         let missing_helper = root.join("helpers/wh3mm-steam-helper.exe");
         let missing_schema = root.join("schema/schema_wh3.json.zst");
         let config_dir = root.join("config");
 
-        let report = build_alpha_readiness_report_with_paths(
+        let report = build_readiness_report_with_paths(
             None,
             missing_helper.to_str().unwrap(),
             &missing_schema,
@@ -6704,11 +10211,11 @@ mod tests {
 
         assert_eq!(report.summary, "0 ready / 4 checks / 2 errors");
         assert_eq!(report.rows[1].label, "Schema");
-        assert_eq!(report.rows[1].status, super::AlphaReadinessStatus::Error);
+        assert_eq!(report.rows[1].status, super::ReadinessStatus::Error);
         assert_eq!(report.rows[2].label, "Steam helper");
-        assert_eq!(report.rows[2].status, super::AlphaReadinessStatus::Error);
+        assert_eq!(report.rows[2].status, super::ReadinessStatus::Error);
         assert_eq!(report.rows[4].label, "WH3 folder");
-        assert_eq!(report.rows[4].status, super::AlphaReadinessStatus::Warning);
+        assert_eq!(report.rows[4].status, super::ReadinessStatus::Warning);
     }
 
     #[test]
@@ -6731,13 +10238,16 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_snapshot_text_captures_alpha_context() {
+    fn diagnostic_snapshot_text_captures_release_context() {
         let state = AppState::with_mods(
             GameId::Warhammer3,
             vec![
                 ModRecord {
                     identity: ModIdentity::new("data/core.pack", None::<String>, "core.pack"),
                     display_name: "Core".to_string(),
+                    source: ModSource::GameData,
+                    thumbnail_path: None,
+                    local_modified_ms: None,
                     enabled: true,
                     always_enabled: true,
                     hidden: false,
@@ -6751,6 +10261,9 @@ mod tests {
                         "mod.pack",
                     ),
                     display_name: "Workshop Mod".to_string(),
+                    source: ModSource::Workshop,
+                    thumbnail_path: None,
+                    local_modified_ms: None,
                     enabled: true,
                     always_enabled: false,
                     hidden: true,
@@ -6759,11 +10272,11 @@ mod tests {
                 },
             ],
         );
-        let readiness = AlphaReadinessReport {
+        let readiness = ReadinessReport {
             summary: "1 ready / 0 checks / 0 errors".to_string(),
-            rows: vec![AlphaReadinessRow {
+            rows: vec![ReadinessRow {
                 label: "Config".to_string(),
-                status: AlphaReadinessStatus::Ready,
+                status: ReadinessStatus::Ready,
                 detail: "Using test config".to_string(),
             }],
         };
@@ -6796,6 +10309,7 @@ mod tests {
         });
 
         assert!(snapshot.contains("status=Loaded 2 mods."));
+        assert!(snapshot.contains("crash_log="));
         assert!(snapshot.contains("helper.backend=native"));
         assert!(snapshot.contains("mods.total=2"));
         assert!(snapshot.contains("mods.enabled=2"));
@@ -7827,6 +11341,8 @@ mod tests {
                 workshop_id: "111".to_string(),
                 title: "A".to_string(),
                 author: "Author".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
                 dependency_ids: Vec::new(),
                 dependency_id_to_name: Vec::new(),
                 last_changed_ms: 0,
@@ -8134,6 +11650,13 @@ mod tests {
         ModRecord {
             identity: ModIdentity::new(path, workshop_id, name),
             display_name: name.to_string(),
+            source: if workshop_id.is_some() {
+                ModSource::Workshop
+            } else {
+                ModSource::Local
+            },
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled: false,
             always_enabled: false,
             hidden: false,
@@ -8147,6 +11670,8 @@ mod tests {
             workshop_id: workshop_id.to_string(),
             title: title.to_string(),
             author: String::new(),
+            description: String::new(),
+            tags: Vec::new(),
             dependency_ids: Vec::new(),
             dependency_id_to_name: Vec::new(),
             last_changed_ms: 0,

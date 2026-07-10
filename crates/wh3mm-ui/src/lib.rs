@@ -9,11 +9,13 @@ pub mod view_model;
 
 pub use intents::UiIntent;
 pub use presenter::{
-    build_app_view_model, build_db_table_preview_view_model, build_pack_contents_view_model,
-    build_pack_flow_summary_view_model, build_pack_view_model,
+    build_app_view_model, build_db_table_preview_view_model, build_mod_archive_rows,
+    build_pack_contents_view_model, build_pack_flow_summary_view_model, build_pack_view_model,
+    sort_mod_archive_rows,
 };
 pub use view_model::{
     AppViewModel, DbTableColumnViewModel, DbTablePreviewViewModel, DbTableRowViewModel,
-    ModRowViewModel, PackFileRowViewModel, PackFlowErrorViewModel, PackFlowFileViewModel,
-    PackFlowOptionViewModel, PackFlowSummaryViewModel, PackViewModel,
+    ModRowViewModel, ModSortColumn, ModSortSpec, PackFileRowViewModel, PackFlowErrorViewModel,
+    PackFlowFileViewModel, PackFlowOptionViewModel, PackFlowSummaryViewModel, PackViewModel,
+    SortDirection,
 };

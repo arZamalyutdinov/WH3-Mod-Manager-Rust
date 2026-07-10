@@ -1,5 +1,79 @@
 //! Toolkit-neutral view-model structs.
 
+use serde::{Deserialize, Serialize};
+use wh3mm_core::ModSource;
+
+/// Sortable fields in the mod archive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModSortColumn {
+    /// Persistent launch/load order.
+    Order,
+    /// Effective enabled/disabled state.
+    Status,
+    /// Resolved Steam title with pack-name fallback.
+    Name,
+    /// Resolved Steam author.
+    Author,
+    /// Steam update time or local pack modification time.
+    Updated,
+}
+
+/// Direction for a mod archive sort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SortDirection {
+    /// Lowest/textual-first values first.
+    Ascending,
+    /// Highest/textual-last values first.
+    Descending,
+}
+
+/// Current mod archive sorting choice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModSortSpec {
+    /// Column being sorted.
+    pub column: ModSortColumn,
+    /// Sort direction.
+    pub direction: SortDirection,
+}
+
+impl Default for ModSortSpec {
+    fn default() -> Self {
+        Self {
+            column: ModSortColumn::Order,
+            direction: SortDirection::Ascending,
+        }
+    }
+}
+
+impl ModSortSpec {
+    /// Returns a new choice for a clicked column, toggling when already active.
+    #[must_use]
+    pub fn after_column_click(self, column: ModSortColumn) -> Self {
+        if self.column == column {
+            return Self {
+                column,
+                direction: match self.direction {
+                    SortDirection::Ascending => SortDirection::Descending,
+                    SortDirection::Descending => SortDirection::Ascending,
+                },
+            };
+        }
+
+        Self {
+            column,
+            direction: match column {
+                ModSortColumn::Updated => SortDirection::Descending,
+                ModSortColumn::Order
+                | ModSortColumn::Status
+                | ModSortColumn::Name
+                | ModSortColumn::Author => SortDirection::Ascending,
+            },
+        }
+    }
+}
+
 /// Full view model for the main window.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppViewModel {
@@ -16,12 +90,28 @@ pub struct AppViewModel {
 }
 
 /// View model for one mod-list row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModRowViewModel {
     /// Toolkit-neutral stable key.
     pub key: String,
     /// Primary row label.
     pub display_name: String,
+    /// One-based launch/load order shown independently from visual sorting.
+    pub load_order: usize,
+    /// Pack filename without its parent directory.
+    pub pack_name: String,
+    /// Explicit discovered source.
+    pub source: ModSource,
+    /// Workshop ID associated with this row, including data-shadowed Workshop mods.
+    pub workshop_id: Option<String>,
+    /// Readable local thumbnail path, when discovered.
+    pub thumbnail_path: Option<String>,
+    /// Resolved Workshop author, when available.
+    pub author: Option<String>,
+    /// Steam update or local modification timestamp in Unix milliseconds.
+    pub updated_ms: Option<u64>,
+    /// Resolved Workshop description, when available.
+    pub description: Option<String>,
     /// Secondary row label.
     pub subtitle: String,
     /// Effective enablement, including forced-on mods.

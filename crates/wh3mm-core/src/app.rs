@@ -139,6 +139,9 @@ mod tests {
         ModRecord {
             identity: ModIdentity::new(path, workshop_id, name),
             display_name: name.to_string(),
+            source: crate::domain::ModSource::Local,
+            thumbnail_path: None,
+            local_modified_ms: None,
             enabled,
             always_enabled: false,
             hidden: false,

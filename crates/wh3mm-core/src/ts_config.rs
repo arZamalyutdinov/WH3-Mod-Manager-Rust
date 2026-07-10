@@ -1,7 +1,7 @@
 //! Legacy TypeScript `config.json` import/export bridge.
 //!
-//! The Rust prototype stores narrow, workflow-specific config files. The
-//! legacy Electron app stores the same alpha-critical data inside one larger
+//! The Rust application stores focused, workflow-specific config files. The
+//! legacy Electron app stores the same release-critical data inside one larger
 //! `config.json`. This module maps only the shared mod-manager fields:
 //! active order/enablement, named presets, categories, hidden/always-enabled
 //! mod state, selected game folder, and currently ported launch options.
@@ -75,7 +75,7 @@ pub struct LegacyTsLaunchOptions {
     pub enabled_merged_mod_count: usize,
 }
 
-/// Reads a legacy TypeScript config file and converts its alpha-critical fields.
+/// Reads a legacy TypeScript config file and converts its release-critical fields.
 ///
 /// # Errors
 ///

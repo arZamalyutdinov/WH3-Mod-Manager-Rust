@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 wh3mm-core = { path = "../wh3mm-core" }
 
 [lib]

@@ -7,12 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const WH3MM_WORKSHOP_ID: &str = "2845454582";
 
 /// Resolved Steam Workshop metadata used by mod-list and dependency flows.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkshopModData {
     /// Workshop ID.
     pub workshop_id: String,
@@ -20,12 +20,123 @@ pub struct WorkshopModData {
     pub title: String,
     /// Resolved author display name, when available.
     pub author: String,
+    /// Steam Workshop description, when supplied by the helper.
+    #[serde(default)]
+    pub description: String,
+    /// Steam Workshop tags, when supplied by the helper.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Required workshop dependency IDs.
     pub dependency_ids: Vec<String>,
     /// Required workshop dependency IDs paired with known titles.
     pub dependency_id_to_name: Vec<(String, String)>,
     /// Last update timestamp in Unix milliseconds.
     pub last_changed_ms: u64,
+}
+
+/// Versioned on-disk cache of Workshop metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkshopMetadataCache {
+    /// Cache schema version.
+    pub version: u32,
+    /// Cached entries keyed by their embedded Workshop IDs.
+    pub entries: Vec<WorkshopMetadataCacheEntry>,
+}
+
+/// One Workshop metadata record plus the time it was fetched.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkshopMetadataCacheEntry {
+    /// Metadata returned by the helper.
+    pub metadata: WorkshopModData,
+    /// Cache insertion/update time in Unix milliseconds.
+    pub fetched_at_ms: u64,
+}
+
+impl Default for WorkshopMetadataCache {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl WorkshopMetadataCache {
+    /// Returns every cached metadata row matching the normalized requested IDs.
+    #[must_use]
+    pub fn metadata_for_ids(&self, workshop_ids: &[String]) -> Vec<WorkshopModData> {
+        let requested = workshop_ids
+            .iter()
+            .filter_map(|id| normalize_workshop_id(id))
+            .collect::<BTreeSet<_>>();
+        self.entries
+            .iter()
+            .filter(|entry| requested.contains(&entry.metadata.workshop_id))
+            .map(|entry| entry.metadata.clone())
+            .collect()
+    }
+
+    /// Returns normalized IDs that are absent or older than `ttl_ms`.
+    #[must_use]
+    pub fn ids_needing_refresh(
+        &self,
+        workshop_ids: &[String],
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Vec<String> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| (entry.metadata.workshop_id.as_str(), entry.fetched_at_ms))
+            .collect::<BTreeMap<_, _>>();
+        workshop_ids
+            .iter()
+            .filter_map(|id| normalize_workshop_id(id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|id| {
+                entries
+                    .get(id.as_str())
+                    .is_none_or(|fetched_at_ms| now_ms.saturating_sub(*fetched_at_ms) >= ttl_ms)
+            })
+            .collect()
+    }
+
+    /// Inserts or replaces metadata rows and records one shared fetch time.
+    pub fn merge(&mut self, metadata: &[WorkshopModData], fetched_at_ms: u64) {
+        for metadata in metadata {
+            let Some(workshop_id) = normalize_workshop_id(&metadata.workshop_id) else {
+                continue;
+            };
+            let mut metadata = metadata.clone();
+            metadata.workshop_id.clone_from(&workshop_id);
+            if let Some(existing) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.metadata.workshop_id == workshop_id)
+            {
+                existing.metadata = metadata;
+                existing.fetched_at_ms = fetched_at_ms;
+            } else {
+                self.entries.push(WorkshopMetadataCacheEntry {
+                    metadata,
+                    fetched_at_ms,
+                });
+            }
+        }
+        self.entries
+            .sort_by(|left, right| left.metadata.workshop_id.cmp(&right.metadata.workshop_id));
+    }
+
+    /// Removes cache entries that are no longer part of the supplied library.
+    pub fn retain_ids(&mut self, workshop_ids: &[String]) {
+        let requested = workshop_ids
+            .iter()
+            .filter_map(|id| normalize_workshop_id(id))
+            .collect::<BTreeSet<_>>();
+        self.entries
+            .retain(|entry| requested.contains(&entry.metadata.workshop_id));
+    }
 }
 
 /// Safety settings for workshop metadata requests.
@@ -666,6 +777,8 @@ fn workshop_mod_data_from_ts_helper_response(
                 workshop_id,
                 title: item.title,
                 author,
+                description: item.description,
+                tags: item.tags,
                 dependency_ids,
                 dependency_id_to_name,
                 last_changed_ms: item.time_updated.saturating_mul(1_000),
@@ -690,6 +803,10 @@ struct TsSteamModsData {
 struct TsSteamWorkshopItem {
     published_file_id: String,
     title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tags: Vec<String>,
     owner: TsSteamWorkshopOwner,
     #[serde(default)]
     time_updated: u64,
@@ -708,7 +825,7 @@ mod tests {
     use super::{
         CachedWorkshopData, SteamWorkshopAdapterError, SteamWorkshopAdapterErrorKind,
         SteamWorkshopMetadataAdapter, SteamWorkshopRequestState, SteamWorkshopSafetyConfig,
-        WorkshopMetadataFetchStep, WorkshopModData, normalize_workshop_id,
+        WorkshopMetadataCache, WorkshopMetadataFetchStep, WorkshopModData, normalize_workshop_id,
         parse_ts_steam_helper_mod_data_response, ts_steam_helper_dependency_ids_needing_titles,
     };
 
@@ -885,6 +1002,45 @@ mod tests {
     }
 
     #[test]
+    fn persistent_metadata_cache_returns_fresh_rows_and_flags_stale_or_missing_ids() {
+        let mut cache = WorkshopMetadataCache::default();
+        cache.merge(
+            &[workshop_mod_data("2", "Two"), workshop_mod_data("1", "One")],
+            1_000,
+        );
+
+        let ids = vec!["2".to_string(), "1".to_string(), "3".to_string()];
+        assert_eq!(
+            cache
+                .metadata_for_ids(&ids)
+                .into_iter()
+                .map(|row| row.workshop_id)
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(cache.ids_needing_refresh(&ids, 1_999, 1_000), ["3"]);
+        assert_eq!(
+            cache.ids_needing_refresh(&ids, 2_000, 1_000),
+            ["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn persistent_metadata_cache_normalizes_replaces_and_retain_ids() {
+        let mut cache = WorkshopMetadataCache::default();
+        cache.merge(&[workshop_mod_data(" 2 ", "Old")], 100);
+        cache.merge(&[workshop_mod_data("2", "New")], 200);
+        cache.merge(&[workshop_mod_data("invalid", "Ignored")], 300);
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].metadata.title, "New");
+        assert_eq!(cache.entries[0].fetched_at_ms, 200);
+
+        cache.retain_ids(&["3".to_string()]);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
     fn parses_ts_steam_helper_mod_data_response() {
         let mods_data_json = r#"
             {
@@ -892,6 +1048,8 @@ mod tests {
                 {
                   "publishedFileId": "111",
                   "title": "Main Mod",
+                  "description": "A detailed description",
+                  "tags": ["Units", "Campaign"],
                   "owner": { "steamId64": "76561198000000001" },
                   "timeUpdated": 1234
                 }
@@ -925,6 +1083,8 @@ mod tests {
                 workshop_id: "111".to_string(),
                 title: "Main Mod".to_string(),
                 author: "Mod Author".to_string(),
+                description: "A detailed description".to_string(),
+                tags: vec!["Units".to_string(), "Campaign".to_string()],
                 dependency_ids: vec!["222".to_string()],
                 dependency_id_to_name: vec![("222".to_string(), "Dependency Mod".to_string())],
                 last_changed_ms: 1_234_000,
@@ -993,6 +1153,8 @@ mod tests {
             workshop_id: workshop_id.to_string(),
             title: title.to_string(),
             author: "author".to_string(),
+            description: String::new(),
+            tags: Vec::new(),
             dependency_ids: Vec::new(),
             dependency_id_to_name: Vec::new(),
             last_changed_ms: 1_000,
