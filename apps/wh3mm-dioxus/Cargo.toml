@@ -16,6 +16,7 @@ FileDescription = "WH3 Mod Manager"
 dioxus = { version = "0.7", features = ["desktop"] }
 dioxus-desktop = "0.7"
 futures-channel = "0.3"
+futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rfd = "0.17.2"
 semver = "1"

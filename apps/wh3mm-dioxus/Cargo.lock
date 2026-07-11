@@ -5432,6 +5432,7 @@ dependencies = [
  "dioxus",
  "dioxus-desktop",
  "futures-channel",
+ "futures-util",
  "reqwest",
  "rfd",
  "semver",
@@ -5447,6 +5448,7 @@ dependencies = [
 name = "wh3mm-runtime"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "wh3mm-core",
 ]

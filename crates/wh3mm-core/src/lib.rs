@@ -83,9 +83,14 @@ pub use start_game::{
 pub use steam::{
     CachedWorkshopData, QueueWorkshopIdsResult, RetryDelayPlan, SteamWorkshopAdapterError,
     SteamWorkshopAdapterErrorKind, SteamWorkshopMetadataAdapter, SteamWorkshopRequestState,
-    SteamWorkshopSafetyConfig, WorkshopBatchPlan, WorkshopMetadataCache,
-    WorkshopMetadataCacheEntry, WorkshopMetadataFetchStep, WorkshopModData, normalize_workshop_id,
-    parse_ts_steam_helper_mod_data_response, ts_steam_helper_dependency_ids_needing_titles,
+    SteamWorkshopSafetyConfig, WORKSHOP_BULK_ACTION_LIMIT, WORKSHOP_CATALOG_PAGE_SIZE,
+    WorkshopBatchPlan, WorkshopCatalogItem, WorkshopCatalogItemKind, WorkshopCatalogPage,
+    WorkshopCatalogQuery, WorkshopCatalogScope, WorkshopCatalogSort, WorkshopItemState,
+    WorkshopItemStatistics, WorkshopMetadataCache, WorkshopMetadataCacheEntry,
+    WorkshopMetadataFetchStep, WorkshopModData, WorkshopMonitorCompletion,
+    WorkshopMonitorCompletionReason, WorkshopMonitorSnapshot, merge_workshop_item_states,
+    normalize_workshop_id, parse_ts_steam_helper_mod_data_response,
+    ts_steam_helper_dependency_ids_needing_titles,
 };
 pub use ts_config::{
     LegacyTsConfigSnapshot, LegacyTsLaunchOptions, export_legacy_ts_config_bytes,

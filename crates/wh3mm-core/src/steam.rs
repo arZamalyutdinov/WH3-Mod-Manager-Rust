@@ -11,6 +11,310 @@ use serde::{Deserialize, Serialize};
 
 const WH3MM_WORKSHOP_ID: &str = "2845454582";
 
+/// Maximum number of Workshop items returned by one Steam UGC query page.
+pub const WORKSHOP_CATALOG_PAGE_SIZE: usize = 50;
+/// Maximum number of items accepted by one explicit bulk action.
+pub const WORKSHOP_BULK_ACTION_LIMIT: usize = 200;
+
+/// Workshop catalog to query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub enum WorkshopCatalogScope {
+    #[default]
+    Discover,
+    Subscribed,
+    Favorites,
+    Published,
+    VotedUp,
+    VotedDown,
+    Followed,
+}
+
+impl WorkshopCatalogScope {
+    /// Whether Steam supports full-text and tag filters for this scope.
+    #[must_use]
+    pub fn supports_discovery_filters(self) -> bool {
+        self == Self::Discover
+    }
+}
+
+/// Sorting mode for Workshop discovery or user-list queries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub enum WorkshopCatalogSort {
+    Relevance,
+    #[default]
+    Popular,
+    Newest,
+    Trending,
+    MostSubscribed,
+    Updated,
+    Oldest,
+    Title,
+    SubscriptionDate,
+    Score,
+}
+
+impl WorkshopCatalogSort {
+    /// Whether this sort is accepted for the requested catalog scope.
+    #[must_use]
+    pub fn supports_scope(self, scope: WorkshopCatalogScope) -> bool {
+        if scope == WorkshopCatalogScope::Discover {
+            matches!(
+                self,
+                Self::Relevance
+                    | Self::Popular
+                    | Self::Newest
+                    | Self::Trending
+                    | Self::MostSubscribed
+                    | Self::Updated
+            )
+        } else {
+            matches!(
+                self,
+                Self::Newest
+                    | Self::Oldest
+                    | Self::Title
+                    | Self::Updated
+                    | Self::SubscriptionDate
+                    | Self::Score
+            )
+        }
+    }
+}
+
+/// One explicit, paginated Workshop catalog request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub struct WorkshopCatalogQuery {
+    pub scope: WorkshopCatalogScope,
+    pub sort: WorkshopCatalogSort,
+    #[serde(default)]
+    pub search_text: String,
+    #[serde(default)]
+    pub required_tags: Vec<String>,
+    #[serde(default)]
+    pub match_any_tag: bool,
+    pub page: u32,
+}
+
+impl Default for WorkshopCatalogQuery {
+    fn default() -> Self {
+        Self {
+            scope: WorkshopCatalogScope::Discover,
+            sort: WorkshopCatalogSort::Popular,
+            search_text: String::new(),
+            required_tags: Vec::new(),
+            match_any_tag: false,
+            page: 1,
+        }
+    }
+}
+
+impl WorkshopCatalogQuery {
+    /// Returns a trimmed, deduplicated request or a user-facing validation error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the page is zero, the selected sort is invalid for
+    /// the scope, or Discover-only filters are supplied to a user-list scope.
+    pub fn normalized(&self) -> Result<Self, String> {
+        if self.page == 0 {
+            return Err("Workshop catalog pages start at 1".to_string());
+        }
+        if !self.sort.supports_scope(self.scope) {
+            return Err(format!(
+                "Workshop sort {:?} is not supported for {:?}",
+                self.sort, self.scope
+            ));
+        }
+        if !self.scope.supports_discovery_filters()
+            && (!self.search_text.trim().is_empty() || !self.required_tags.is_empty())
+        {
+            return Err("Search text and tag filters are only supported by Discover".to_string());
+        }
+
+        let mut seen = BTreeSet::new();
+        let required_tags = self
+            .required_tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .filter(|tag| seen.insert(tag.to_ascii_lowercase()))
+            .map(ToString::to_string)
+            .take(20)
+            .collect();
+        let search_text = self
+            .search_text
+            .trim()
+            .chars()
+            .take(200)
+            .collect::<String>();
+        let sort = if self.scope == WorkshopCatalogScope::Discover
+            && self.sort == WorkshopCatalogSort::Relevance
+            && search_text.is_empty()
+        {
+            WorkshopCatalogSort::Popular
+        } else {
+            self.sort
+        };
+        Ok(Self {
+            scope: self.scope,
+            sort,
+            search_text,
+            required_tags,
+            match_any_tag: self.match_any_tag,
+            page: self.page,
+        })
+    }
+
+    /// Stable fingerprint used to reject stale asynchronous responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::normalized`], or a JSON
+    /// serialization error if the normalized query cannot be encoded.
+    pub fn fingerprint(&self) -> Result<String, String> {
+        serde_json::to_string(&self.normalized()?).map_err(|error| error.to_string())
+    }
+}
+
+/// Kind of published Workshop entry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub enum WorkshopCatalogItemKind {
+    #[default]
+    Item,
+    Collection,
+}
+
+/// Read-only aggregate statistics returned by Steam.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+#[allow(missing_docs)]
+pub struct WorkshopItemStatistics {
+    pub subscriptions: u64,
+    pub favorites: u64,
+    pub followers: u64,
+    pub views: u64,
+    pub comments: u64,
+}
+
+/// Local Steam client state and optional download byte counters.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+#[allow(missing_docs)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct WorkshopItemState {
+    pub workshop_id: String,
+    pub subscribed: bool,
+    pub installed: bool,
+    pub needs_update: bool,
+    pub downloading: bool,
+    pub download_pending: bool,
+    pub bytes_downloaded: Option<u64>,
+    pub bytes_total: Option<u64>,
+}
+
+impl WorkshopItemState {
+    /// Download progress in the inclusive range 0..=100 when totals are known.
+    #[must_use]
+    pub fn progress_percent(&self) -> Option<u8> {
+        let total = self.bytes_total?;
+        (total > 0)
+            .then(|| ((self.bytes_downloaded.unwrap_or(0).min(total) * 100) / total).min(100) as u8)
+    }
+
+    /// Whether this item no longer needs monitoring.
+    #[must_use]
+    pub fn download_complete(&self) -> bool {
+        self.installed && !self.needs_update && !self.downloading && !self.download_pending
+    }
+}
+
+/// Enriched Workshop catalog item suitable for toolkit-neutral presentation.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+#[allow(missing_docs)]
+pub struct WorkshopCatalogItem {
+    pub workshop_id: String,
+    pub kind: WorkshopCatalogItemKind,
+    pub title: String,
+    pub description: String,
+    pub owner_steam_id: String,
+    pub author: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub tags: Vec<String>,
+    pub preview_url: Option<String>,
+    pub file_size: u64,
+    pub upvotes: u32,
+    pub downvotes: u32,
+    pub score: f32,
+    pub child_ids: Vec<String>,
+    pub statistics: WorkshopItemStatistics,
+    pub state: WorkshopItemState,
+}
+
+/// One page of Workshop catalog results.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub struct WorkshopCatalogPage {
+    pub page: u32,
+    pub total_results: u32,
+    pub was_cached: bool,
+    pub items: Vec<WorkshopCatalogItem>,
+}
+
+/// One bounded monitor sample for a set of Workshop IDs.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub struct WorkshopMonitorSnapshot {
+    pub elapsed_ms: u64,
+    pub items: Vec<WorkshopItemState>,
+}
+
+/// Why a bounded Workshop monitor stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub enum WorkshopMonitorCompletionReason {
+    Complete,
+    Timeout,
+    Cancelled,
+}
+
+/// Final state emitted by a Workshop monitor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)]
+pub struct WorkshopMonitorCompletion {
+    pub reason: WorkshopMonitorCompletionReason,
+    pub snapshot: WorkshopMonitorSnapshot,
+}
+
+/// Replaces item states by normalized Workshop ID without changing item order.
+pub fn merge_workshop_item_states(items: &mut [WorkshopCatalogItem], states: &[WorkshopItemState]) {
+    let states = states
+        .iter()
+        .filter_map(|state| normalize_workshop_id(&state.workshop_id).map(|id| (id, state)))
+        .collect::<BTreeMap<_, _>>();
+    for item in items {
+        if let Some(state) = states.get(&item.workshop_id) {
+            item.state = (*state).clone();
+        }
+    }
+}
+
 /// Resolved Steam Workshop metadata used by mod-list and dependency flows.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkshopModData {
@@ -825,8 +1129,10 @@ mod tests {
     use super::{
         CachedWorkshopData, SteamWorkshopAdapterError, SteamWorkshopAdapterErrorKind,
         SteamWorkshopMetadataAdapter, SteamWorkshopRequestState, SteamWorkshopSafetyConfig,
-        WorkshopMetadataCache, WorkshopMetadataFetchStep, WorkshopModData, normalize_workshop_id,
-        parse_ts_steam_helper_mod_data_response, ts_steam_helper_dependency_ids_needing_titles,
+        WorkshopCatalogItem, WorkshopCatalogQuery, WorkshopCatalogScope, WorkshopCatalogSort,
+        WorkshopItemState, WorkshopMetadataCache, WorkshopMetadataFetchStep, WorkshopModData,
+        merge_workshop_item_states, normalize_workshop_id, parse_ts_steam_helper_mod_data_response,
+        ts_steam_helper_dependency_ids_needing_titles,
     };
 
     #[test]
@@ -835,6 +1141,77 @@ mod tests {
         assert_eq!(normalize_workshop_id(""), None);
         assert_eq!(normalize_workshop_id("abc"), None);
         assert_eq!(normalize_workshop_id("12x"), None);
+    }
+
+    #[test]
+    fn catalog_query_normalizes_tags_search_and_relevance() {
+        let query = WorkshopCatalogQuery {
+            search_text: "  balance  ".to_string(),
+            required_tags: vec![
+                "Units".to_string(),
+                " units ".to_string(),
+                "Campaign".to_string(),
+            ],
+            sort: WorkshopCatalogSort::Relevance,
+            ..WorkshopCatalogQuery::default()
+        };
+        let normalized = query.normalized().unwrap();
+        assert_eq!(normalized.search_text, "balance");
+        assert_eq!(normalized.required_tags, ["Units", "Campaign"]);
+        assert_eq!(normalized.sort, WorkshopCatalogSort::Relevance);
+
+        let empty = WorkshopCatalogQuery {
+            sort: WorkshopCatalogSort::Relevance,
+            ..WorkshopCatalogQuery::default()
+        };
+        assert_eq!(
+            empty.normalized().unwrap().sort,
+            WorkshopCatalogSort::Popular
+        );
+    }
+
+    #[test]
+    fn catalog_query_rejects_discovery_filters_on_user_lists() {
+        let query = WorkshopCatalogQuery {
+            scope: WorkshopCatalogScope::Favorites,
+            sort: WorkshopCatalogSort::Updated,
+            search_text: "units".to_string(),
+            ..WorkshopCatalogQuery::default()
+        };
+        assert!(query.normalized().is_err());
+    }
+
+    #[test]
+    fn catalog_fingerprint_is_stable_after_normalization() {
+        let left = WorkshopCatalogQuery {
+            search_text: "  balance".to_string(),
+            required_tags: vec!["Units".to_string(), "units".to_string()],
+            ..WorkshopCatalogQuery::default()
+        };
+        let right = WorkshopCatalogQuery {
+            search_text: "balance".to_string(),
+            required_tags: vec!["Units".to_string()],
+            ..WorkshopCatalogQuery::default()
+        };
+        assert_eq!(left.fingerprint().unwrap(), right.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn merges_item_states_and_clamps_progress() {
+        let mut items = vec![WorkshopCatalogItem {
+            workshop_id: "11".to_string(),
+            ..WorkshopCatalogItem::default()
+        }];
+        let state = WorkshopItemState {
+            workshop_id: "11".to_string(),
+            downloading: true,
+            bytes_downloaded: Some(150),
+            bytes_total: Some(100),
+            ..WorkshopItemState::default()
+        };
+        merge_workshop_item_states(&mut items, std::slice::from_ref(&state));
+        assert_eq!(items[0].state, state);
+        assert_eq!(items[0].state.progress_percent(), Some(100));
     }
 
     #[test]

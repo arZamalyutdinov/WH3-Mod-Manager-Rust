@@ -16,6 +16,7 @@ use dioxus_desktop::{
     wry::http::{Response as HttpResponse, StatusCode},
 };
 use futures_channel::oneshot;
+use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wh3mm_core::{
@@ -34,8 +39,10 @@ use wh3mm_core::{
     PackContents, PackDataOverwrite, PackFileMetadata, PackReadOptions, PreLaunchPackWrite,
     PresetConfig, SteamWorkshopMetadataAdapter, SteamWorkshopRequestState,
     SteamWorkshopSafetyConfig, WH3_START_GAME_PACK_NAME, WH3_START_GAME_SOURCE_PACK_NAMES,
-    Wh3StartGamePackOptions, WindowsLaunchOptions, WindowsLaunchPackGroup, WorkshopMetadataCache,
-    WorkshopMetadataFetchStep, WorkshopModData, add_mod_category, analyze_enabled_mod_conflicts,
+    Wh3StartGamePackOptions, WindowsLaunchOptions, WindowsLaunchPackGroup, WorkshopCatalogItem,
+    WorkshopCatalogPage, WorkshopCatalogQuery, WorkshopCatalogScope, WorkshopCatalogSort,
+    WorkshopMetadataCache, WorkshopMetadataFetchStep, WorkshopModData, WorkshopMonitorCompletion,
+    WorkshopMonitorSnapshot, add_mod_category, analyze_enabled_mod_conflicts,
     analyze_enabled_mod_conflicts_with_schema, apply_mod_list_config, apply_mod_list_pack_names,
     apply_mod_user_config, apply_preset_config, build_pack_data_overwrite_pack,
     build_wh3_start_game_pack_with_battle_permissions, capture_game_folder_config,
@@ -53,10 +60,10 @@ use wh3mm_core::{
 };
 use wh3mm_runtime::{
     LaunchPreparationOptions, SteamResubscribeResult, SteamResubscribeSafetyConfig,
-    SteamWorkshopCheckStateResult, SteamWorkshopCommandAdapter, SteamWorkshopCommandResult,
-    SteamWorkshopCommandRunner, SteamWorkshopHelperProcessConfig, SteamWorkshopHelperProcessRunner,
-    TsSteamHelperMetadataAdapter, WH3_STEAM_APP_ID, WindowsLaunchSpawnOptions,
-    WindowsProcessPriorityClass, WindowsProcessPriorityUpdate,
+    SteamWorkshopCatalogAdapter, SteamWorkshopCheckStateResult, SteamWorkshopCommandAdapter,
+    SteamWorkshopCommandResult, SteamWorkshopCommandRunner, SteamWorkshopHelperProcessConfig,
+    SteamWorkshopHelperProcessRunner, TsSteamHelperMetadataAdapter, WH3_STEAM_APP_ID,
+    WindowsLaunchSpawnOptions, WindowsProcessPriorityClass, WindowsProcessPriorityUpdate,
     discover_wh3_steam_install_from_windows_registry, discover_wh3_workshop_folder,
     prepare_windows_launch_files, resubscribe_with_cleanup_and_verification,
     spawn_prepared_windows_launch_with_options, validate_wh3_game_folder,
@@ -106,6 +113,7 @@ const RESPONSIVE_SHELL_CSS: &str = r#"
 .workspace-content { min-width: 0; overflow-x: hidden; }
 .responsive-nav-toggle { display: none !important; }
 .drawer-backdrop { display: none; }
+.workshop-browser-layout { min-width: 0; }
 @media (max-width: 1279px) {
   .app-shell-grid {
     grid-template-columns: minmax(220px, 252px) minmax(0, 1fr) !important;
@@ -153,6 +161,7 @@ const RESPONSIVE_SHELL_CSS: &str = r#"
     box-shadow: 18px 0 36px rgba(0, 0, 0, 0.34);
   }
   .library-rail.drawer-open { transform: translateX(0); }
+  .workshop-browser-layout { grid-template-columns: minmax(0, 1fr) !important; }
 }
 "#;
 
@@ -274,6 +283,11 @@ struct SteamCommandPanelRow {
 struct SteamCommandUiResult {
     status: String,
     panel: SteamCommandPanelState,
+}
+
+enum WorkshopMonitorUiEvent {
+    Snapshot(WorkshopMonitorSnapshot),
+    Complete(Result<WorkshopMonitorCompletion, String>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -473,6 +487,18 @@ fn App() -> Element {
     let mut steam_helper_path = use_signal(load_saved_steam_helper_path);
     let mut steam_helper_backend = use_signal(load_saved_steam_helper_backend);
     let mut steam_command_ids = use_signal(String::new);
+    let mut workshop_catalog_query = use_signal(WorkshopCatalogQuery::default);
+    let mut workshop_search_text = use_signal(String::new);
+    let mut workshop_tag_text = use_signal(String::new);
+    let workshop_catalog_page = use_signal(|| None::<WorkshopCatalogPage>);
+    let workshop_catalog_request = use_signal(|| None::<String>);
+    let mut selected_workshop_id = use_signal(|| None::<String>);
+    let mut workshop_advanced_open = use_signal(|| false);
+    let mut workshop_collection_page = use_signal(|| 1_u32);
+    let mut workshop_collection_parent = use_signal(|| None::<String>);
+    let mut workshop_collection_metadata = use_signal(Vec::<WorkshopModData>::new);
+    let workshop_monitor_snapshot = use_signal(|| None::<WorkshopMonitorSnapshot>);
+    let workshop_monitor_cancel = use_signal(|| None::<Arc<AtomicBool>>);
     let mut workshop_metadata_cache = use_signal(load_workshop_metadata_cache_or_default);
     let mut steam_metadata = use_signal(load_cached_workshop_metadata);
     let mut subscribed_workshop_ids = use_signal(Vec::<String>::new);
@@ -696,6 +722,20 @@ fn App() -> Element {
         .collect::<Vec<_>>();
     let preset_summaries = saved_presets.read().clone();
     let current_steam_metadata = steam_metadata.read().clone();
+    let current_workshop_catalog_page = workshop_catalog_page.read().clone();
+    let selected_workshop_item = selected_workshop_id
+        .read()
+        .as_ref()
+        .and_then(|selected_id| {
+            current_workshop_catalog_page
+                .as_ref()
+                .and_then(|page| {
+                    page.items
+                        .iter()
+                        .find(|item| &item.workshop_id == selected_id)
+                })
+                .cloned()
+        });
     let current_time_ms = current_unix_ms();
     let diagnostics_log_path_label = app_diagnostic_log_path().display().to_string();
     let panic_log_path_label = panic_diagnostic_log_path().display().to_string();
@@ -2438,7 +2478,7 @@ fn App() -> Element {
                             }
                             div {
                                 style: "font-size: 14px; line-height: 20px; color: #cbd5c9;",
-                                "Run bounded subscribe, download, unsubscribe, and resubscribe actions for workshop IDs."
+                                "Browse, search, inspect, subscribe to, and monitor Total War: WARHAMMER III Workshop content."
                             }
                         }
                         if let Some(status_message) = view_model.status_message.clone() {
@@ -2450,6 +2490,316 @@ fn App() -> Element {
                         div {
                             style: secondary_page_content_style(),
                             section {
+                                style: settings_card_style(),
+                                header {
+                                    style: settings_card_header_style(),
+                                    h3 { style: "font-size: 18px; margin: 0;", "Workshop Browser" }
+                                    if workshop_monitor_cancel.read().is_some() {
+                                        button {
+                                            style: settings_danger_button_style(),
+                                            onclick: move |_| {
+                                                if let Some(cancel) = workshop_monitor_cancel.read().as_ref() {
+                                                    cancel.store(true, Ordering::Release);
+                                                }
+                                            },
+                                            "Cancel Monitoring"
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: settings_card_body_style(),
+                                    div {
+                                        style: "display: flex; gap: 8px; flex-wrap: wrap;",
+                                        for scope in workshop_scope_options() {
+                                            button {
+                                                style: if workshop_catalog_query.read().scope == scope { settings_primary_button_style() } else { settings_secondary_button_style() },
+                                                onclick: move |_| {
+                                                    let mut query = workshop_catalog_query.read().clone();
+                                                    query.scope = scope;
+                                                    query.page = 1;
+                                                    query.sort = if scope == WorkshopCatalogScope::Discover {
+                                                        WorkshopCatalogSort::Popular
+                                                    } else {
+                                                        WorkshopCatalogSort::Updated
+                                                    };
+                                                    if scope != WorkshopCatalogScope::Discover {
+                                                        workshop_search_text.set(String::new());
+                                                        workshop_tag_text.set(String::new());
+                                                    }
+                                                    workshop_catalog_query.set(query);
+                                                },
+                                                "{workshop_scope_label(scope)}"
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: grid; grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.45fr) auto; gap: 10px; align-items: end;",
+                                        if workshop_catalog_query.read().scope == WorkshopCatalogScope::Discover {
+                                            input {
+                                                style: settings_input_style(),
+                                                value: "{workshop_search_text}",
+                                                placeholder: "Search titles and descriptions",
+                                                oninput: move |event| workshop_search_text.set(event.value()),
+                                            }
+                                        } else {
+                                            div {
+                                                style: "min-height: 38px; display: flex; align-items: center; color: #aeb8c8; font-size: 13px;",
+                                                "Steam user lists are paged directly; search and tags apply to Discover."
+                                            }
+                                        }
+                                        select {
+                                            style: settings_input_style(),
+                                            value: "{workshop_sort_value(workshop_catalog_query.read().sort)}",
+                                            onchange: move |event| {
+                                                let mut query = workshop_catalog_query.read().clone();
+                                                query.sort = workshop_sort_from_value(&event.value());
+                                                query.page = 1;
+                                                workshop_catalog_query.set(query);
+                                            },
+                                            for (sort, label) in workshop_sort_options(workshop_catalog_query.read().scope) {
+                                                option { value: "{workshop_sort_value(sort)}", "{label}" }
+                                            }
+                                        }
+                                        button {
+                                            style: settings_primary_button_style(),
+                                            disabled: steam_operation_in_progress || steam_helper_path.read().trim().is_empty(),
+                                            onclick: move |_| {
+                                                let mut query = workshop_catalog_query.read().clone();
+                                                query.page = 1;
+                                                if query.scope == WorkshopCatalogScope::Discover {
+                                                    query.search_text = workshop_search_text.read().clone();
+                                                    query.required_tags = workshop_tags_from_input(&workshop_tag_text.read());
+                                                }
+                                                workshop_catalog_query.set(query.clone());
+                                                start_workshop_catalog_fetch(
+                                                    query,
+                                                    PathBuf::from(steam_helper_path.read().trim()),
+                                                    steam_helper_backend.read().clone(),
+                                                    workshop_catalog_request,
+                                                    workshop_catalog_page,
+                                                    selected_workshop_id,
+                                                    steam_operation,
+                                                    mod_status,
+                                                );
+                                            },
+                                            "Search / Apply"
+                                        }
+                                    }
+                                    if workshop_catalog_query.read().scope == WorkshopCatalogScope::Discover {
+                                        input {
+                                            style: settings_input_style(),
+                                            value: "{workshop_tag_text}",
+                                            placeholder: "Required tags, comma separated (click result tags to add)",
+                                            oninput: move |event| workshop_tag_text.set(event.value()),
+                                        }
+                                        label {
+                                            style: "display: flex; align-items: center; gap: 8px; color: #cbd5c9; font-size: 13px;",
+                                            input {
+                                                r#type: "checkbox",
+                                                checked: workshop_catalog_query.read().match_any_tag,
+                                                onchange: move |event| {
+                                                    let mut query = workshop_catalog_query.read().clone();
+                                                    query.match_any_tag = event.checked();
+                                                    workshop_catalog_query.set(query);
+                                                }
+                                            }
+                                            "Match any selected tag"
+                                        }
+                                    }
+                                    if let Some(snapshot) = workshop_monitor_snapshot.read().as_ref() {
+                                        div {
+                                            style: "border: 1px solid #31533a; background: #16251a; padding: 10px; border-radius: 5px; color: #ccefd3; font-size: 13px;",
+                                            "{workshop_monitor_summary(snapshot)}"
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(page) = current_workshop_catalog_page.clone() {
+                                section {
+                                    class: "workshop-browser-layout",
+                                    style: "display: grid; grid-template-columns: minmax(300px, 0.9fr) minmax(340px, 1.1fr); gap: 16px; align-items: start;",
+                                    div {
+                                        style: "display: grid; gap: 8px;",
+                                        div {
+                                            style: "display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #aeb8c8; font-size: 12px;",
+                                            span { "Page {page.page} · {page.total_results} results" }
+                                            div {
+                                                style: "display: flex; gap: 6px;",
+                                                button {
+                                                    style: settings_secondary_button_style(),
+                                                    disabled: steam_operation_in_progress || page.page <= 1,
+                                                    onclick: move |_| {
+                                                        let mut query = workshop_catalog_query.read().clone();
+                                                        query.page = query.page.saturating_sub(1).max(1);
+                                                        workshop_catalog_query.set(query.clone());
+                                                        start_workshop_catalog_fetch(query, PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), workshop_catalog_request, workshop_catalog_page, selected_workshop_id, steam_operation, mod_status);
+                                                    },
+                                                    "Previous"
+                                                }
+                                                button {
+                                                    style: settings_secondary_button_style(),
+                                                    disabled: steam_operation_in_progress || (page.page as usize * 50 >= page.total_results as usize),
+                                                    onclick: move |_| {
+                                                        let mut query = workshop_catalog_query.read().clone();
+                                                        query.page = query.page.saturating_add(1);
+                                                        workshop_catalog_query.set(query.clone());
+                                                        start_workshop_catalog_fetch(query, PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), workshop_catalog_request, workshop_catalog_page, selected_workshop_id, steam_operation, mod_status);
+                                                    },
+                                                    "Next"
+                                                }
+                                            }
+                                        }
+                                        for item in page.items.iter() {
+                                            button {
+                                                style: if selected_workshop_id.read().as_deref() == Some(item.workshop_id.as_str()) {
+                                                    "width: 100%; border: 1px solid #65f58b; background: #1b2a20; color: #f2f5f2; border-radius: 6px; padding: 10px; display: grid; grid-template-columns: 72px minmax(0,1fr); gap: 10px; text-align: left;"
+                                                } else {
+                                                    "width: 100%; border: 1px solid #303241; background: #1f202b; color: #f2f5f2; border-radius: 6px; padding: 10px; display: grid; grid-template-columns: 72px minmax(0,1fr); gap: 10px; text-align: left;"
+                                                },
+                                                onclick: {
+                                                    let id = item.workshop_id.clone();
+                                                    move |_| {
+                                                        selected_workshop_id.set(Some(id.clone()));
+                                                        if workshop_collection_parent.read().as_deref() != Some(id.as_str()) {
+                                                            workshop_collection_parent.set(None);
+                                                            workshop_collection_metadata.set(Vec::new());
+                                                            workshop_collection_page.set(1);
+                                                        }
+                                                    }
+                                                },
+                                                if let Some(preview_url) = &item.preview_url {
+                                                    img { src: "{preview_url}", alt: "", style: "width: 72px; height: 54px; object-fit: cover; border-radius: 4px; background: #11151b;" }
+                                                } else {
+                                                    div { style: "width: 72px; height: 54px; border-radius: 4px; background: #11151b; display: grid; place-items: center; color: #657080;", "WS" }
+                                                }
+                                                div {
+                                                    style: "min-width: 0; display: grid; gap: 3px;",
+                                                    strong { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{item.title}" }
+                                                    span { style: "color: #aeb8c8; font-size: 12px;", "{item.author} · {workshop_item_state_label(item)}" }
+                                                    if let Some(progress) = workshop_item_progress_label(item) {
+                                                        span { style: "color: #65f58b; font-size: 12px;", "{progress}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(item) = selected_workshop_item.clone() {
+                                        section {
+                                            style: settings_card_style(),
+                                            if let Some(preview_url) = &item.preview_url {
+                                                img { src: "{preview_url}", alt: "", style: "width: 100%; max-height: 260px; object-fit: cover; background: #11151b;" }
+                                            }
+                                            div {
+                                                style: "padding: 18px; display: grid; gap: 12px;",
+                                                h3 { style: "font-size: 21px; margin: 0;", "{item.title}" }
+                                                div { style: "color: #aeb8c8; font-size: 13px;", "By {item.author} · {workshop_item_state_label(&item)} · ID {item.workshop_id}" }
+                                                div { style: "color: #cbd5c9; font-size: 13px; white-space: pre-wrap; max-height: 220px; overflow: auto;", "{item.description}" }
+                                                div { style: "display: flex; flex-wrap: wrap; gap: 6px;", for tag in item.tags.iter() { button { style: "border: 1px solid #3b4655; background: #222a35; color: #cbd5c9; border-radius: 999px; padding: 4px 8px; font-size: 11px;", onclick: { let tag = tag.clone(); move |_| { let mut tags = workshop_tags_from_input(&workshop_tag_text.read()); if !tags.iter().any(|value| value.eq_ignore_ascii_case(&tag)) { tags.push(tag.clone()); } workshop_tag_text.set(tags.join(", ")); } }, "{tag}" } } }
+                                                div { style: "display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; color: #aeb8c8; font-size: 12px;", span { "{item.statistics.subscriptions} subscribers" } span { "{item.statistics.favorites} favorites" } span { "{item.statistics.views} views" } span { "{item.upvotes} upvotes" } span { "{item.downvotes} downvotes" } span { "{item.statistics.comments} comments" } }
+                                                if !item.child_ids.is_empty() {
+                                                    div { style: "color: #cbd5c9; font-size: 13px;", "Collection contains {item.child_ids.len()} item(s)." }
+                                                    div {
+                                                        style: "display: flex; gap: 8px; flex-wrap: wrap;",
+                                                        button {
+                                                            style: settings_secondary_button_style(),
+                                                            disabled: steam_operation_in_progress,
+                                                            onclick: {
+                                                                let parent_id = item.workshop_id.clone();
+                                                                let child_ids = item.child_ids.clone();
+                                                                move |_| start_collection_metadata_fetch(parent_id.clone(), child_ids.clone(), 1, PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), steam_operation, mod_status, workshop_collection_parent, workshop_collection_page, workshop_collection_metadata)
+                                                            },
+                                                            "Load Collection Items"
+                                                        }
+                                                        if workshop_collection_parent.read().as_deref() == Some(item.workshop_id.as_str()) {
+                                                            button {
+                                                                style: settings_secondary_button_style(),
+                                                                disabled: steam_operation_in_progress || *workshop_collection_page.read() <= 1,
+                                                                onclick: {
+                                                                    let parent_id = item.workshop_id.clone();
+                                                                    let child_ids = item.child_ids.clone();
+                                                                    move |_| start_collection_metadata_fetch(parent_id.clone(), child_ids.clone(), workshop_collection_page.read().saturating_sub(1).max(1), PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), steam_operation, mod_status, workshop_collection_parent, workshop_collection_page, workshop_collection_metadata)
+                                                                },
+                                                                "Previous Children"
+                                                            }
+                                                            button {
+                                                                style: settings_secondary_button_style(),
+                                                                disabled: steam_operation_in_progress || (*workshop_collection_page.read() as usize * 50 >= item.child_ids.len()),
+                                                                onclick: {
+                                                                    let parent_id = item.workshop_id.clone();
+                                                                    let child_ids = item.child_ids.clone();
+                                                                    move |_| start_collection_metadata_fetch(parent_id.clone(), child_ids.clone(), workshop_collection_page.read().saturating_add(1), PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), steam_operation, mod_status, workshop_collection_parent, workshop_collection_page, workshop_collection_metadata)
+                                                                },
+                                                                "Next Children"
+                                                            }
+                                                        }
+                                                    }
+                                                    if workshop_collection_parent.read().as_deref() == Some(item.workshop_id.as_str()) {
+                                                        div {
+                                                            style: "display: grid; gap: 5px; border-left: 2px solid #3b4655; padding-left: 10px;",
+                                                            for child in workshop_collection_metadata.read().iter() {
+                                                                div { style: "color: #cbd5c9; font-size: 12px;", "{child.title} · {child.author} · {child.workshop_id}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; flex-wrap: wrap; gap: 8px;",
+                                                    if !item.state.subscribed {
+                                                        button { style: settings_primary_button_style(), disabled: steam_operation_in_progress, onclick: { let id = item.workshop_id.clone(); move |_| start_workshop_catalog_action(SteamCommandAction::Subscribe, vec![id.clone()], PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), app_state.read().mods.clone(), game_folder.read().clone(), steam_operation, mod_status, last_steam_command, workshop_monitor_cancel, workshop_monitor_snapshot, workshop_catalog_page, app_state) }, "Subscribe" }
+                                                    }
+                                                    if item.state.subscribed {
+                                                        button { style: settings_secondary_button_style(), disabled: steam_operation_in_progress, onclick: { let id = item.workshop_id.clone(); move |_| start_workshop_catalog_action(SteamCommandAction::Download, vec![id.clone()], PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), app_state.read().mods.clone(), game_folder.read().clone(), steam_operation, mod_status, last_steam_command, workshop_monitor_cancel, workshop_monitor_snapshot, workshop_catalog_page, app_state) }, if item.state.needs_update { "Update" } else { "Download" } }
+                                                        button { style: settings_danger_button_style(), disabled: steam_operation_in_progress, onclick: { let id = item.workshop_id.clone(); move |_| start_workshop_catalog_action(SteamCommandAction::Unsubscribe, vec![id.clone()], PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), app_state.read().mods.clone(), game_folder.read().clone(), steam_operation, mod_status, last_steam_command, workshop_monitor_cancel, workshop_monitor_snapshot, workshop_catalog_page, app_state) }, "Unsubscribe" }
+                                                    }
+                                                    button { style: settings_secondary_button_style(), onclick: { let id = item.workshop_id.clone(); move |_| { let url = format!("https://steamcommunity.com/sharedfiles/filedetails/?id={id}"); let _ = open_system_target(&url); } }, "Open in Steam" }
+                                                    button {
+                                                        style: settings_secondary_button_style(),
+                                                        disabled: steam_operation_in_progress,
+                                                        onclick: move |_| {
+                                                            let query = workshop_catalog_query.read().clone();
+                                                            start_workshop_catalog_fetch(query, PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), workshop_catalog_request, workshop_catalog_page, selected_workshop_id, steam_operation, mod_status);
+                                                        },
+                                                        "Refresh Status"
+                                                    }
+                                                    if !item.child_ids.is_empty() {
+                                                        button {
+                                                            style: settings_primary_button_style(),
+                                                            disabled: steam_operation_in_progress || item.child_ids.len() > 200,
+                                                            onclick: {
+                                                                let ids = item.child_ids.clone();
+                                                                move |_| {
+                                                                    if ids.len() > 200 {
+                                                                        mod_status.set(Some("Collection exceeds the safe 200-item bulk limit; use individual actions.".to_string()));
+                                                                        return;
+                                                                    }
+                                                                    let confirmed = rfd::MessageDialog::new()
+                                                                        .set_title("Subscribe to collection")
+                                                                        .set_description(format!("Subscribe to {} Workshop items using paced batches?", ids.len()))
+                                                                        .set_buttons(rfd::MessageButtons::YesNo)
+                                                                        .show() == rfd::MessageDialogResult::Yes;
+                                                                    if confirmed {
+                                                                        start_workshop_catalog_action(SteamCommandAction::Subscribe, ids.clone(), PathBuf::from(steam_helper_path.read().trim()), steam_helper_backend.read().clone(), app_state.read().mods.clone(), game_folder.read().clone(), steam_operation, mod_status, last_steam_command, workshop_monitor_cancel, workshop_monitor_snapshot, workshop_catalog_page, app_state);
+                                                                    }
+                                                                }
+                                                            },
+                                                            "Subscribe Missing Items"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            button {
+                                style: settings_secondary_button_style(),
+                                onclick: move |_| {
+                                    let next = !*workshop_advanced_open.read();
+                                    workshop_advanced_open.set(next);
+                                },
+                                if *workshop_advanced_open.read() { "Hide Advanced ID Queue" } else { "Show Advanced ID Queue" }
+                            }
+                            if *workshop_advanced_open.read() { section {
                                 style: settings_card_style(),
                                 header {
                                     style: settings_card_header_style(),
@@ -2584,7 +2934,7 @@ fn App() -> Element {
                                         }
                                     }
                                 }
-                            }
+                            } }
                             if let Some(command_panel) = last_steam_command.read().clone() {
                                 SteamCommandPanel { state: command_panel }
                             }
@@ -7669,7 +8019,7 @@ fn run_steam_command_with_helper(
     mods: &[ModRecord],
 ) -> Result<SteamCommandUiResult, String> {
     validate_steam_helper_path(helper_path)?;
-    let ids = workshop_ids_from_input(raw_ids);
+    let mut ids = workshop_ids_from_input(raw_ids);
     if ids.is_empty() {
         return Err("at least one numeric workshop ID is required".to_string());
     }
@@ -7690,6 +8040,15 @@ fn run_steam_command_with_helper(
             status: steam_resubscribe_status(&result),
             panel: steam_resubscribe_panel_state(&result),
         });
+    }
+
+    if action == SteamCommandAction::Subscribe {
+        let subscribed = command_adapter
+            .subscribed_workshop_ids()
+            .map_err(|error| error.message)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        ids.retain(|id| !subscribed.contains(id));
     }
 
     let result = run_steam_command_action(action, &mut command_adapter, &ids)
@@ -7950,6 +8309,456 @@ fn workshop_ids_from_input(raw_ids: &str) -> Vec<String> {
         }
     }
     ids
+}
+
+fn workshop_scope_label(scope: WorkshopCatalogScope) -> &'static str {
+    match scope {
+        WorkshopCatalogScope::Discover => "Discover",
+        WorkshopCatalogScope::Subscribed => "Subscribed",
+        WorkshopCatalogScope::Favorites => "Favorites",
+        WorkshopCatalogScope::Published => "Published",
+        WorkshopCatalogScope::VotedUp => "Voted Up",
+        WorkshopCatalogScope::VotedDown => "Voted Down",
+        WorkshopCatalogScope::Followed => "Followed",
+    }
+}
+
+fn workshop_scope_options() -> [WorkshopCatalogScope; 7] {
+    [
+        WorkshopCatalogScope::Discover,
+        WorkshopCatalogScope::Subscribed,
+        WorkshopCatalogScope::Favorites,
+        WorkshopCatalogScope::Published,
+        WorkshopCatalogScope::VotedUp,
+        WorkshopCatalogScope::VotedDown,
+        WorkshopCatalogScope::Followed,
+    ]
+}
+
+fn workshop_sort_options(scope: WorkshopCatalogScope) -> Vec<(WorkshopCatalogSort, &'static str)> {
+    if scope == WorkshopCatalogScope::Discover {
+        vec![
+            (WorkshopCatalogSort::Relevance, "Relevance"),
+            (WorkshopCatalogSort::Popular, "Popular"),
+            (WorkshopCatalogSort::Newest, "Newest"),
+            (WorkshopCatalogSort::Trending, "Trending (7 days)"),
+            (WorkshopCatalogSort::MostSubscribed, "Most subscribed"),
+            (WorkshopCatalogSort::Updated, "Recently updated"),
+        ]
+    } else {
+        vec![
+            (WorkshopCatalogSort::Newest, "Newest"),
+            (WorkshopCatalogSort::Oldest, "Oldest"),
+            (WorkshopCatalogSort::Title, "Title"),
+            (WorkshopCatalogSort::Updated, "Recently updated"),
+            (WorkshopCatalogSort::SubscriptionDate, "Subscription date"),
+            (WorkshopCatalogSort::Score, "Score"),
+        ]
+    }
+}
+
+fn workshop_sort_value(sort: WorkshopCatalogSort) -> &'static str {
+    match sort {
+        WorkshopCatalogSort::Relevance => "relevance",
+        WorkshopCatalogSort::Popular => "popular",
+        WorkshopCatalogSort::Newest => "newest",
+        WorkshopCatalogSort::Trending => "trending",
+        WorkshopCatalogSort::MostSubscribed => "mostSubscribed",
+        WorkshopCatalogSort::Updated => "updated",
+        WorkshopCatalogSort::Oldest => "oldest",
+        WorkshopCatalogSort::Title => "title",
+        WorkshopCatalogSort::SubscriptionDate => "subscriptionDate",
+        WorkshopCatalogSort::Score => "score",
+    }
+}
+
+fn workshop_sort_from_value(value: &str) -> WorkshopCatalogSort {
+    match value {
+        "relevance" => WorkshopCatalogSort::Relevance,
+        "newest" => WorkshopCatalogSort::Newest,
+        "trending" => WorkshopCatalogSort::Trending,
+        "mostSubscribed" => WorkshopCatalogSort::MostSubscribed,
+        "updated" => WorkshopCatalogSort::Updated,
+        "oldest" => WorkshopCatalogSort::Oldest,
+        "title" => WorkshopCatalogSort::Title,
+        "subscriptionDate" => WorkshopCatalogSort::SubscriptionDate,
+        "score" => WorkshopCatalogSort::Score,
+        _ => WorkshopCatalogSort::Popular,
+    }
+}
+
+fn workshop_tags_from_input(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn fetch_workshop_catalog_from_helper(
+    query: &WorkshopCatalogQuery,
+    helper_path: &Path,
+    backend: &str,
+) -> Result<(String, WorkshopCatalogPage), String> {
+    let fingerprint = query.fingerprint()?;
+    let runner =
+        steam_helper_process_runner(helper_path, backend).map_err(|error| error.message)?;
+    let mut adapter = SteamWorkshopCatalogAdapter::new(WH3_STEAM_APP_ID, runner);
+    let page = adapter.query(query).map_err(|error| error.message)?;
+    Ok((fingerprint, page))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_workshop_catalog_fetch(
+    query: WorkshopCatalogQuery,
+    helper_path: PathBuf,
+    backend: String,
+    mut request_signal: Signal<Option<String>>,
+    mut page_signal: Signal<Option<WorkshopCatalogPage>>,
+    mut selected_signal: Signal<Option<String>>,
+    mut operation_signal: Signal<Option<String>>,
+    mut status_signal: Signal<Option<String>>,
+) {
+    let Ok(fingerprint) = query.fingerprint() else {
+        status_signal.set(Some("Workshop query is invalid.".to_string()));
+        return;
+    };
+    if operation_signal.read().is_some() {
+        return;
+    }
+    request_signal.set(Some(fingerprint.clone()));
+    operation_signal.set(Some("Querying Steam Workshop".to_string()));
+    status_signal.set(Some("Querying Steam Workshop...".to_string()));
+    let receiver = run_in_background(move || {
+        fetch_workshop_catalog_from_helper(&query, &helper_path, &backend)
+    });
+    spawn(async move {
+        match receiver.await {
+            Ok(Ok((response_fingerprint, page)))
+                if request_signal.read().as_deref() == Some(response_fingerprint.as_str()) =>
+            {
+                let first_id = page.items.first().map(|item| item.workshop_id.clone());
+                status_signal.set(Some(format!(
+                    "Loaded {} of {} Workshop result{}.",
+                    page.items.len(),
+                    page.total_results,
+                    plural_suffix(page.total_results as usize)
+                )));
+                page_signal.set(Some(page));
+                selected_signal.set(first_id);
+            }
+            Ok(Ok(_)) => {
+                // A newer explicit request replaced this response.
+            }
+            Ok(Err(error)) => {
+                status_signal.set(Some(format!("Workshop query failed: {error}")));
+            }
+            Err(_) => status_signal.set(Some(
+                "Workshop query ended before returning a result.".to_string(),
+            )),
+        }
+        operation_signal.set(None);
+    });
+}
+
+fn apply_workshop_monitor_snapshot(
+    page: &mut Option<WorkshopCatalogPage>,
+    snapshot: &WorkshopMonitorSnapshot,
+) {
+    let Some(page) = page else {
+        return;
+    };
+    for item in &mut page.items {
+        if let Some(state) = snapshot
+            .items
+            .iter()
+            .find(|state| state.workshop_id == item.workshop_id)
+        {
+            item.state = state.clone();
+        }
+    }
+}
+
+fn workshop_item_state_label(item: &WorkshopCatalogItem) -> &'static str {
+    if item.state.downloading {
+        "Downloading"
+    } else if item.state.download_pending {
+        "Pending"
+    } else if item.state.needs_update {
+        "Update available"
+    } else if item.state.installed {
+        "Installed"
+    } else if item.state.subscribed {
+        "Subscribed"
+    } else {
+        "Not subscribed"
+    }
+}
+
+fn workshop_item_progress_label(item: &WorkshopCatalogItem) -> Option<String> {
+    item.state
+        .progress_percent()
+        .map(|percent| format!("{percent}%"))
+}
+
+fn workshop_monitor_summary(snapshot: &WorkshopMonitorSnapshot) -> String {
+    format!(
+        "Monitoring {} item(s) · {}s elapsed",
+        snapshot.items.len(),
+        snapshot.elapsed_ms / 1_000
+    )
+}
+
+fn workshop_monitor_replacement_ids(
+    requested_ids: Vec<String>,
+    previous_active: bool,
+    previous_snapshot: Option<&WorkshopMonitorSnapshot>,
+) -> Vec<String> {
+    let mut ids = requested_ids
+        .into_iter()
+        .filter_map(|id| normalize_workshop_id(&id))
+        .collect::<BTreeSet<_>>();
+    if previous_active && let Some(snapshot) = previous_snapshot {
+        ids.extend(
+            snapshot
+                .items
+                .iter()
+                .filter(|state| !state.download_complete())
+                .filter_map(|state| normalize_workshop_id(&state.workshop_id)),
+        );
+    }
+    ids.into_iter().collect()
+}
+
+fn start_workshop_monitor_worker(
+    helper_path: PathBuf,
+    backend: String,
+    ids: Vec<String>,
+    cancel: Arc<AtomicBool>,
+    sender: futures_channel::mpsc::UnboundedSender<WorkshopMonitorUiEvent>,
+) {
+    thread::spawn(move || {
+        let result = steam_helper_process_runner(&helper_path, &backend)
+            .map_err(|error| error.message)
+            .and_then(|runner| {
+                runner
+                    .monitor_workshop_items(WH3_STEAM_APP_ID, &ids, &cancel, |snapshot| {
+                        let _ = sender
+                            .unbounded_send(WorkshopMonitorUiEvent::Snapshot(snapshot.clone()));
+                    })
+                    .map_err(|error| error.message)
+            });
+        let _ = sender.unbounded_send(WorkshopMonitorUiEvent::Complete(result));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_workshop_monitor_ui(
+    ids: Vec<String>,
+    helper_path: PathBuf,
+    backend: String,
+    game_folder: Option<PathBuf>,
+    mut cancel_signal: Signal<Option<Arc<AtomicBool>>>,
+    mut snapshot_signal: Signal<Option<WorkshopMonitorSnapshot>>,
+    mut page_signal: Signal<Option<WorkshopCatalogPage>>,
+    mut app_state_signal: Signal<AppState>,
+    mut status_signal: Signal<Option<String>>,
+) {
+    let previous_active = cancel_signal.read().is_some();
+    let ids =
+        workshop_monitor_replacement_ids(ids, previous_active, snapshot_signal.read().as_ref());
+    if let Some(previous) = cancel_signal.read().as_ref() {
+        previous.store(true, Ordering::Release);
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancel_signal.set(Some(cancel.clone()));
+    let (sender, mut receiver) = futures_channel::mpsc::unbounded();
+    start_workshop_monitor_worker(helper_path, backend, ids, cancel.clone(), sender);
+    spawn(async move {
+        while let Some(event) = receiver.next().await {
+            let is_current = cancel_signal
+                .read()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &cancel));
+            if !is_current {
+                break;
+            }
+            match event {
+                WorkshopMonitorUiEvent::Snapshot(snapshot) => {
+                    let mut page = page_signal.read().clone();
+                    apply_workshop_monitor_snapshot(&mut page, &snapshot);
+                    page_signal.set(page);
+                    snapshot_signal.set(Some(snapshot));
+                }
+                WorkshopMonitorUiEvent::Complete(result) => {
+                    cancel_signal.set(None);
+                    match result {
+                        Ok(completion) => {
+                            snapshot_signal.set(Some(completion.snapshot.clone()));
+                            status_signal.set(Some(format!(
+                                "Workshop download monitor finished: {:?}.",
+                                completion.reason
+                            )));
+                            if completion.reason
+                                == wh3mm_core::WorkshopMonitorCompletionReason::Complete
+                                && let Some(game_folder) = game_folder.clone()
+                            {
+                                let reload = run_in_background(move || {
+                                    load_mods_from_game_folder(game_folder)
+                                });
+                                match reload.await {
+                                    Ok(Ok((mods, status))) => {
+                                        let mut state = app_state_signal.read().clone();
+                                        state.mods = mods;
+                                        app_state_signal.set(state);
+                                        status_signal.set(Some(format!(
+                                            "Downloads completed. {status}"
+                                        )));
+                                    }
+                                    Ok(Err(error)) => status_signal.set(Some(format!(
+                                        "Downloads completed, but the archive could not refresh: {}",
+                                        error.message
+                                    ))),
+                                    Err(_) => status_signal.set(Some(
+                                        "Downloads completed, but archive refresh ended unexpectedly."
+                                            .to_string(),
+                                    )),
+                                }
+                            }
+                        }
+                        Err(error) => status_signal
+                            .set(Some(format!("Workshop download monitor failed: {error}"))),
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_workshop_catalog_action(
+    action: SteamCommandAction,
+    ids: Vec<String>,
+    helper_path: PathBuf,
+    backend: String,
+    mods: Vec<ModRecord>,
+    game_folder: Option<PathBuf>,
+    mut operation_signal: Signal<Option<String>>,
+    mut status_signal: Signal<Option<String>>,
+    mut command_signal: Signal<Option<SteamCommandPanelState>>,
+    cancel_signal: Signal<Option<Arc<AtomicBool>>>,
+    snapshot_signal: Signal<Option<WorkshopMonitorSnapshot>>,
+    mut page_signal: Signal<Option<WorkshopCatalogPage>>,
+    app_state_signal: Signal<AppState>,
+) {
+    if operation_signal.read().is_some() || ids.is_empty() {
+        return;
+    }
+    let raw_ids = ids.join(",");
+    operation_signal.set(Some(format!("{} Workshop items", action.status_prefix())));
+    status_signal.set(Some(format!(
+        "{} Workshop items...",
+        action.status_prefix()
+    )));
+    let helper_for_monitor = helper_path.clone();
+    let backend_for_monitor = backend.clone();
+    let monitored_ids = ids.clone();
+    let receiver = run_in_background(move || {
+        run_steam_command_with_helper(action, &helper_path, &backend, &raw_ids, &mods)
+    });
+    spawn(async move {
+        match receiver.await {
+            Ok(Ok(result)) => {
+                status_signal.set(Some(result.status));
+                command_signal.set(Some(result.panel));
+                if matches!(
+                    action,
+                    SteamCommandAction::Subscribe | SteamCommandAction::Download
+                ) {
+                    start_workshop_monitor_ui(
+                        monitored_ids,
+                        helper_for_monitor,
+                        backend_for_monitor,
+                        game_folder,
+                        cancel_signal,
+                        snapshot_signal,
+                        page_signal,
+                        app_state_signal,
+                        status_signal,
+                    );
+                } else if action == SteamCommandAction::Unsubscribe {
+                    let requested = ids.iter().cloned().collect::<BTreeSet<_>>();
+                    let mut page = page_signal.read().clone();
+                    if let Some(page) = &mut page {
+                        for item in &mut page.items {
+                            if requested.contains(&item.workshop_id) {
+                                item.state.subscribed = false;
+                            }
+                        }
+                    }
+                    page_signal.set(page);
+                }
+            }
+            Ok(Err(error)) => {
+                status_signal.set(Some(format!("Workshop action failed: {error}")));
+            }
+            Err(_) => status_signal.set(Some(
+                "Workshop action ended before returning a result.".to_string(),
+            )),
+        }
+        operation_signal.set(None);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_collection_metadata_fetch(
+    parent_id: String,
+    child_ids: Vec<String>,
+    page: u32,
+    helper_path: PathBuf,
+    backend: String,
+    mut operation_signal: Signal<Option<String>>,
+    mut status_signal: Signal<Option<String>>,
+    mut parent_signal: Signal<Option<String>>,
+    mut page_signal: Signal<u32>,
+    mut metadata_signal: Signal<Vec<WorkshopModData>>,
+) {
+    if operation_signal.read().is_some() {
+        return;
+    }
+    let start = page.saturating_sub(1) as usize * 50;
+    let ids = child_ids
+        .into_iter()
+        .skip(start)
+        .take(50)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return;
+    }
+    operation_signal.set(Some("Loading Workshop collection items".to_string()));
+    let receiver =
+        run_in_background(move || fetch_metadata_from_helper(&ids, &helper_path, &backend));
+    spawn(async move {
+        match receiver.await {
+            Ok(Ok(result)) => {
+                parent_signal.set(Some(parent_id));
+                page_signal.set(page);
+                metadata_signal.set(result.metadata);
+                status_signal.set(Some(format!(
+                    "Loaded collection item details for page {page}."
+                )));
+            }
+            Ok(Err(error)) => status_signal.set(Some(format!(
+                "Could not load collection item details: {error}"
+            ))),
+            Err(_) => status_signal.set(Some(
+                "Collection item lookup ended unexpectedly.".to_string(),
+            )),
+        }
+        operation_signal.set(None);
+    });
 }
 
 fn workshop_id_summary(ids: &[String], max_ids: usize) -> Option<String> {
@@ -11676,5 +12485,89 @@ mod tests {
             dependency_id_to_name: Vec::new(),
             last_changed_ms: 0,
         }
+    }
+
+    #[test]
+    fn workshop_browser_exposes_all_supported_scopes_and_sorts() {
+        assert_eq!(super::workshop_scope_options().len(), 7);
+        assert!(
+            super::workshop_sort_options(wh3mm_core::WorkshopCatalogScope::Discover)
+                .iter()
+                .any(|(sort, _)| *sort == wh3mm_core::WorkshopCatalogSort::Trending)
+        );
+        assert!(
+            super::workshop_sort_options(wh3mm_core::WorkshopCatalogScope::Favorites)
+                .iter()
+                .any(|(sort, _)| *sort == wh3mm_core::WorkshopCatalogSort::SubscriptionDate)
+        );
+    }
+
+    #[test]
+    fn workshop_tag_input_is_explicit_and_trimmed() {
+        assert_eq!(
+            super::workshop_tags_from_input(" Units, Campaign , ,"),
+            ["Units", "Campaign"]
+        );
+    }
+
+    #[test]
+    fn workshop_monitor_snapshot_updates_matching_catalog_rows_only() {
+        let mut page = Some(wh3mm_core::WorkshopCatalogPage {
+            items: vec![wh3mm_core::WorkshopCatalogItem {
+                workshop_id: "111".to_string(),
+                ..wh3mm_core::WorkshopCatalogItem::default()
+            }],
+            ..wh3mm_core::WorkshopCatalogPage::default()
+        });
+        super::apply_workshop_monitor_snapshot(
+            &mut page,
+            &wh3mm_core::WorkshopMonitorSnapshot {
+                elapsed_ms: 1_000,
+                items: vec![wh3mm_core::WorkshopItemState {
+                    workshop_id: "111".to_string(),
+                    downloading: true,
+                    bytes_downloaded: Some(5),
+                    bytes_total: Some(10),
+                    ..wh3mm_core::WorkshopItemState::default()
+                }],
+            },
+        );
+        assert!(page.unwrap().items[0].state.downloading);
+    }
+
+    #[test]
+    fn workshop_monitor_replacement_keeps_only_unfinished_previous_ids() {
+        let snapshot = wh3mm_core::WorkshopMonitorSnapshot {
+            elapsed_ms: 1_000,
+            items: vec![
+                wh3mm_core::WorkshopItemState {
+                    workshop_id: "111".to_string(),
+                    downloading: true,
+                    ..wh3mm_core::WorkshopItemState::default()
+                },
+                wh3mm_core::WorkshopItemState {
+                    workshop_id: "222".to_string(),
+                    installed: true,
+                    ..wh3mm_core::WorkshopItemState::default()
+                },
+            ],
+        };
+
+        assert_eq!(
+            super::workshop_monitor_replacement_ids(
+                vec!["333".to_string(), "111".to_string()],
+                true,
+                Some(&snapshot),
+            ),
+            ["111", "333"]
+        );
+        assert_eq!(
+            super::workshop_monitor_replacement_ids(
+                vec!["333".to_string()],
+                false,
+                Some(&snapshot),
+            ),
+            ["333"]
+        );
     }
 }

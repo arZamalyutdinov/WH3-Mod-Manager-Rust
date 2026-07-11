@@ -41,9 +41,29 @@ Open **Steam** and keep the backend set to `native`.
 1. Run **Probe** and confirm the native backend and `steam_api64.dll` are
    available.
 2. Run **Refresh** and confirm subscribed Workshop IDs and mod metadata load.
-3. Open **Workshop** and run **Check updates**.
-4. Use subscribe/download/unsubscribe/resubscribe only with IDs you are
-   comfortable changing. Commands are deduplicated, throttled, and logged.
+3. Open **Workshop**. Confirm no catalog request occurs until **Search / Apply**
+   is clicked, then search Discover, change its sort/tags, and page forward and
+   back. Quickly change a query and confirm an older response never replaces
+   the newer results.
+4. Check Subscribed, Favorites, Published, Voted Up, Voted Down, and Followed.
+   Confirm each list pages correctly and offers only its supported sort choices.
+5. Select an item and verify its preview, plain-text description, author,
+   dates, tags, statistics, dependencies, and local state. Confirm **Open in
+   Steam** opens the expected numeric Community item URL.
+6. Select a collection, lazily load child-detail pages, and use **Subscribe
+   Missing Items** only on a disposable collection. Confirm the dialog is
+   required, subscribed children are skipped, and collections above 200 items
+   refuse the bulk action while individual actions remain usable.
+7. Download or update a safe test item. Confirm the card, detail panel, and
+   download utility show state and byte progress; test **Cancel Monitoring**.
+   Start a second download and confirm monitoring follows the unfinished union.
+8. Let a download finish and confirm the archive automatically rediscovers the
+   configured data/Workshop folders while preserving enablement, order,
+   categories, visibility, and locks. Unsubscribe and confirm state refreshes
+   without deleting the local Workshop folder.
+9. Use subscribe/download/unsubscribe/resubscribe only with IDs you are
+   comfortable changing. Commands are deduplicated, split into at most 40 IDs,
+   delayed by 250 ms per ID and one second between batches, and logged.
 
 If Steam reports rate limiting or repeated failures, stop issuing commands and
 include the helper command log with the report.
@@ -70,9 +90,10 @@ Check the archive at 1920×1080, 1366×768, and the minimum window size. The
 tools rail should become a drawer below 1280 px and the library rail below
 960 px; no layout should clip or introduce horizontal scrolling.
 
-After automatic enrichment and one manual Refresh, inspect
+After catalog use, automatic enrichment, and one manual Refresh, inspect
 `wh3mm-steam-helper-commands.jsonl`. Requests must be batched and bounded, with
-no repeated metadata calls caused only by rendering or sorting the archive.
+catalog summary lines but no per-second progress spam, and no repeated metadata
+or catalog calls caused only by rendering or sorting the archive.
 
 ## 5. Verify launch preparation and WH3 start
 

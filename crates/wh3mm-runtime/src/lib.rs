@@ -4,16 +4,24 @@
 
 use std::fs;
 use std::fs::FileTimes;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use wh3mm_core::{
     CoreError, CoreResult, ModRecord, PreLaunchCopyOperation, PreLaunchPackWrite,
     SteamWorkshopAdapterError, SteamWorkshopAdapterErrorKind, SteamWorkshopMetadataAdapter,
-    WindowsLaunchPlan, WorkshopModData, normalize_workshop_id,
-    parse_ts_steam_helper_mod_data_response, ts_steam_helper_dependency_ids_needing_titles,
+    WORKSHOP_BULK_ACTION_LIMIT, WindowsLaunchPlan, WorkshopCatalogPage, WorkshopCatalogQuery,
+    WorkshopModData, WorkshopMonitorCompletion, WorkshopMonitorCompletionReason,
+    WorkshopMonitorSnapshot, normalize_workshop_id, parse_ts_steam_helper_mod_data_response,
+    ts_steam_helper_dependency_ids_needing_titles,
 };
 
 /// Steam app ID for Total War: Warhammer III.
@@ -168,6 +176,12 @@ pub struct CompletedCopyOperation {
 pub struct SteamWorkshopCommandSafetyConfig {
     /// Delay a live runner should wait between per-ID Steam commands.
     pub command_delay: Duration,
+    /// Maximum IDs sent to one helper process.
+    pub batch_size: usize,
+    /// Delay between non-empty helper batches.
+    pub batch_delay: Duration,
+    /// Maximum IDs accepted by one explicit operation.
+    pub max_operation_ids: usize,
 }
 
 /// Result of checking workshop item state and requesting needed updates.
@@ -224,6 +238,9 @@ impl Default for SteamWorkshopCommandSafetyConfig {
     fn default() -> Self {
         Self {
             command_delay: Duration::from_millis(250),
+            batch_size: 40,
+            batch_delay: Duration::from_secs(1),
+            max_operation_ids: WORKSHOP_BULK_ACTION_LIMIT,
         }
     }
 }
@@ -480,6 +497,23 @@ impl<R> SteamWorkshopCommandAdapter<R>
 where
     R: SteamWorkshopCommandRunner,
 {
+    fn validated_ids(
+        &self,
+        workshop_ids: &[String],
+    ) -> Result<Vec<String>, SteamWorkshopAdapterError> {
+        let ids = normalize_unique_workshop_ids(workshop_ids);
+        if ids.len() > self.config.max_operation_ids {
+            return Err(SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::MalformedResponse,
+                format!(
+                    "Workshop operation exceeds the safe limit of {} IDs",
+                    self.config.max_operation_ids
+                ),
+            ));
+        }
+        Ok(ids)
+    }
+
     /// Returns normalized subscribed workshop IDs.
     ///
     /// # Errors
@@ -501,14 +535,27 @@ where
         &mut self,
         workshop_ids: &[String],
     ) -> Result<SteamWorkshopCommandResult, SteamWorkshopAdapterError> {
-        let ids = normalize_unique_workshop_ids(workshop_ids);
+        let ids = self.validated_ids(workshop_ids)?;
         if ids.is_empty() {
             return Ok(SteamWorkshopCommandResult::requested("sub", ids));
         }
-        let result = self
-            .runner
-            .subscribe_ids(&self.app_id, &ids, self.config.command_delay)?;
-        Ok(normalize_command_result_for_request("sub", ids, result))
+        let mut combined = SteamWorkshopCommandResult::requested("sub", ids.clone());
+        for (index, batch) in ids.chunks(self.config.batch_size.max(1)).enumerate() {
+            let batch = batch.to_vec();
+            let result =
+                self.runner
+                    .subscribe_ids(&self.app_id, &batch, self.config.command_delay)?;
+            let result = normalize_command_result_for_request("sub", batch, result);
+            combined.confirmed_ids.extend(result.confirmed_ids);
+            combined
+                .update_requested_ids
+                .extend(result.update_requested_ids);
+            combined.delay_ms = result.delay_ms.or(combined.delay_ms);
+            if (index + 1) * self.config.batch_size.max(1) < ids.len() {
+                thread::sleep(self.config.batch_delay);
+            }
+        }
+        Ok(combined)
     }
 
     /// Downloads normalized, deduped workshop IDs and returns the command
@@ -521,16 +568,27 @@ where
         &mut self,
         workshop_ids: &[String],
     ) -> Result<SteamWorkshopCommandResult, SteamWorkshopAdapterError> {
-        let ids = normalize_unique_workshop_ids(workshop_ids);
+        let ids = self.validated_ids(workshop_ids)?;
         if ids.is_empty() {
             return Ok(SteamWorkshopCommandResult::requested("download", ids));
         }
-        let result = self
-            .runner
-            .download_ids(&self.app_id, &ids, self.config.command_delay)?;
-        Ok(normalize_command_result_for_request(
-            "download", ids, result,
-        ))
+        let mut combined = SteamWorkshopCommandResult::requested("download", ids.clone());
+        for (index, batch) in ids.chunks(self.config.batch_size.max(1)).enumerate() {
+            let batch = batch.to_vec();
+            let result =
+                self.runner
+                    .download_ids(&self.app_id, &batch, self.config.command_delay)?;
+            let result = normalize_command_result_for_request("download", batch, result);
+            combined.confirmed_ids.extend(result.confirmed_ids);
+            combined
+                .update_requested_ids
+                .extend(result.update_requested_ids);
+            combined.delay_ms = result.delay_ms.or(combined.delay_ms);
+            if (index + 1) * self.config.batch_size.max(1) < ids.len() {
+                thread::sleep(self.config.batch_delay);
+            }
+        }
+        Ok(combined)
     }
 
     /// Unsubscribes from normalized, deduped workshop IDs and returns the
@@ -543,16 +601,21 @@ where
         &mut self,
         workshop_ids: &[String],
     ) -> Result<SteamWorkshopCommandResult, SteamWorkshopAdapterError> {
-        let ids = normalize_unique_workshop_ids(workshop_ids);
+        let ids = self.validated_ids(workshop_ids)?;
         if ids.is_empty() {
             return Ok(SteamWorkshopCommandResult::requested("unsubscribe", ids));
         }
-        let result = self.runner.unsubscribe_ids(&self.app_id, &ids)?;
-        Ok(normalize_command_result_for_request(
-            "unsubscribe",
-            ids,
-            result,
-        ))
+        let mut combined = SteamWorkshopCommandResult::requested("unsubscribe", ids.clone());
+        for (index, batch) in ids.chunks(self.config.batch_size.max(1)).enumerate() {
+            let batch = batch.to_vec();
+            let result = self.runner.unsubscribe_ids(&self.app_id, &batch)?;
+            let result = normalize_command_result_for_request("unsubscribe", batch, result);
+            combined.confirmed_ids.extend(result.confirmed_ids);
+            if (index + 1) * self.config.batch_size.max(1) < ids.len() {
+                thread::sleep(self.config.batch_delay);
+            }
+        }
+        Ok(combined)
     }
 
     /// Checks workshop state for normalized, deduped IDs, triggers downloads
@@ -565,24 +628,32 @@ where
         &mut self,
         workshop_ids: &[String],
     ) -> Result<SteamWorkshopCheckStateResult, SteamWorkshopAdapterError> {
-        let ids = normalize_unique_workshop_ids(workshop_ids);
+        let ids = self.validated_ids(workshop_ids)?;
         if ids.is_empty() {
             return Ok(SteamWorkshopCheckStateResult::default());
         }
 
-        let result = self.runner.check_state_and_download_updates(
-            &self.app_id,
-            &ids,
-            self.config.command_delay,
-        )?;
         let requested_ids = ids
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        let update_requested_ids = normalize_unique_workshop_ids(&result.update_requested_ids)
-            .into_iter()
-            .filter(|id| requested_ids.contains(id))
-            .collect();
+        let mut update_requested_ids = Vec::new();
+        for (index, batch) in ids.chunks(self.config.batch_size.max(1)).enumerate() {
+            let result = self.runner.check_state_and_download_updates(
+                &self.app_id,
+                batch,
+                self.config.command_delay,
+            )?;
+            update_requested_ids.extend(
+                normalize_unique_workshop_ids(&result.update_requested_ids)
+                    .into_iter()
+                    .filter(|id| requested_ids.contains(id)),
+            );
+            if (index + 1) * self.config.batch_size.max(1) < ids.len() {
+                thread::sleep(self.config.batch_delay);
+            }
+        }
+        update_requested_ids = normalize_unique_workshop_ids(&update_requested_ids);
         Ok(SteamWorkshopCheckStateResult {
             checked_ids: ids,
             update_requested_ids,
@@ -627,6 +698,76 @@ struct HelperCommandResult {
     ids: Vec<String>,
     update_requested_ids: Vec<String>,
     delay_ms: Option<u64>,
+}
+
+/// Process boundary for paginated Steam Workshop catalog queries.
+pub trait SteamWorkshopCatalogRunner {
+    /// Executes one normalized catalog query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the helper cannot execute the request or
+    /// returns a malformed catalog page.
+    fn query_catalog(
+        &mut self,
+        app_id: &str,
+        query: &WorkshopCatalogQuery,
+    ) -> Result<WorkshopCatalogPage, SteamWorkshopAdapterError>;
+}
+
+/// Validating adapter for Workshop catalog requests.
+pub struct SteamWorkshopCatalogAdapter<R> {
+    app_id: String,
+    runner: R,
+}
+
+impl<R> SteamWorkshopCatalogAdapter<R> {
+    /// Creates a catalog adapter for one Steam app.
+    #[must_use]
+    pub fn new(app_id: impl Into<String>, runner: R) -> Self {
+        Self {
+            app_id: app_id.into(),
+            runner,
+        }
+    }
+
+    /// Returns the wrapped runner.
+    pub fn into_runner(self) -> R {
+        self.runner
+    }
+}
+
+impl<R: SteamWorkshopCatalogRunner> SteamWorkshopCatalogAdapter<R> {
+    /// Validates and executes one explicit catalog query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when query validation fails or the underlying
+    /// catalog runner cannot complete the request.
+    pub fn query(
+        &mut self,
+        query: &WorkshopCatalogQuery,
+    ) -> Result<WorkshopCatalogPage, SteamWorkshopAdapterError> {
+        let query = query.normalized().map_err(|message| {
+            SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::MalformedResponse,
+                message,
+            )
+        })?;
+        self.runner.query_catalog(&self.app_id, &query)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "event", rename_all = "camelCase")]
+enum HelperMonitorEvent {
+    Snapshot {
+        snapshot: WorkshopMonitorSnapshot,
+    },
+    Complete {
+        reason: WorkshopMonitorCompletionReason,
+        snapshot: WorkshopMonitorSnapshot,
+    },
 }
 
 /// External process runner for Steam Workshop metadata and command helpers.
@@ -738,6 +879,151 @@ impl SteamWorkshopHelperProcessRunner {
                 stderr.trim()
             ),
         ))
+    }
+
+    /// Streams bounded local Steam item-state snapshots from one helper process.
+    ///
+    /// The caller should run this blocking method on a background thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error for invalid IDs, process startup or I/O failure,
+    /// malformed JSONL, a helper failure, or missing completion output.
+    #[allow(clippy::too_many_lines)]
+    pub fn monitor_workshop_items<F>(
+        &self,
+        app_id: &str,
+        workshop_ids: &[String],
+        cancel: &Arc<AtomicBool>,
+        mut on_snapshot: F,
+    ) -> Result<WorkshopMonitorCompletion, SteamWorkshopAdapterError>
+    where
+        F: FnMut(&WorkshopMonitorSnapshot),
+    {
+        let ids = normalize_unique_workshop_ids(workshop_ids);
+        if ids.is_empty() || ids.len() > WORKSHOP_BULK_ACTION_LIMIT {
+            return Err(SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::MalformedResponse,
+                format!("Workshop monitor requires 1..={WORKSHOP_BULK_ACTION_LIMIT} numeric IDs"),
+            ));
+        }
+        let payload = serde_json::json!({
+            "ids": ids,
+            "intervalMs": 1_000_u64,
+            "timeoutMs": 600_000_u64,
+        })
+        .to_string();
+        let mut command = Command::new(&self.executable_path);
+        command
+            .args([app_id, "monitorWorkshopItems", payload.as_str()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in &self.config.env_overrides {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::Unavailable,
+                format!("failed to spawn Steam Workshop monitor: {error}"),
+            )
+        })?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::Unavailable,
+                "Steam Workshop monitor stdout was unavailable",
+            ));
+        };
+        let mut latest = WorkshopMonitorSnapshot::default();
+        let mut completion = None;
+        for line in BufReader::new(stdout).lines() {
+            if cancel.load(Ordering::Acquire) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(WorkshopMonitorCompletion {
+                    reason: WorkshopMonitorCompletionReason::Cancelled,
+                    snapshot: latest,
+                });
+            }
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SteamWorkshopAdapterError::new(
+                        SteamWorkshopAdapterErrorKind::Unavailable,
+                        format!("failed reading Steam Workshop monitor output: {error}"),
+                    ));
+                }
+            };
+            let event = match serde_json::from_str::<HelperMonitorEvent>(&line) {
+                Ok(event) => event,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SteamWorkshopAdapterError::new(
+                        SteamWorkshopAdapterErrorKind::MalformedResponse,
+                        format!("malformed Steam Workshop monitor JSONL: {error}"),
+                    ));
+                }
+            };
+            match event {
+                HelperMonitorEvent::Snapshot { snapshot } => {
+                    latest = snapshot;
+                    on_snapshot(&latest);
+                }
+                HelperMonitorEvent::Complete { reason, snapshot } => {
+                    latest = snapshot;
+                    on_snapshot(&latest);
+                    completion = Some(WorkshopMonitorCompletion {
+                        reason,
+                        snapshot: latest.clone(),
+                    });
+                    break;
+                }
+            }
+        }
+        let status = child.wait().map_err(|error| {
+            SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::Unavailable,
+                format!("failed waiting for Steam Workshop monitor: {error}"),
+            )
+        })?;
+        if !status.success() {
+            return Err(SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::Unavailable,
+                format!("Steam Workshop monitor exited with {status}"),
+            ));
+        }
+        completion.ok_or_else(|| {
+            SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::MalformedResponse,
+                "Steam Workshop monitor exited without a completion event",
+            )
+        })
+    }
+}
+
+impl SteamWorkshopCatalogRunner for SteamWorkshopHelperProcessRunner {
+    fn query_catalog(
+        &mut self,
+        app_id: &str,
+        query: &WorkshopCatalogQuery,
+    ) -> Result<WorkshopCatalogPage, SteamWorkshopAdapterError> {
+        let payload = serde_json::to_string(query).map_err(|error| {
+            SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::MalformedResponse,
+                format!("failed to encode Workshop catalog query: {error}"),
+            )
+        })?;
+        let json = self.run_json_command(app_id, "queryWorkshop", Some(&payload), None)?;
+        serde_json::from_str(&json).map_err(|error| {
+            SteamWorkshopAdapterError::new(
+                SteamWorkshopAdapterErrorKind::MalformedResponse,
+                format!("failed to parse Workshop catalog response: {error}"),
+            )
+        })
     }
 }
 
@@ -2217,24 +2503,28 @@ where
 mod tests {
     use std::fs;
     use std::fs::FileTimes;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
     use std::time::{Duration, SystemTime};
 
     use wh3mm_core::{
         ModIdentity, ModRecord, PreLaunchCopyOperation, PreLaunchPackWrite,
         SteamWorkshopAdapterError, SteamWorkshopAdapterErrorKind, SteamWorkshopMetadataAdapter,
-        WindowsLaunchPlan, WorkshopModData,
+        WindowsLaunchPlan, WorkshopCatalogPage, WorkshopCatalogQuery, WorkshopCatalogScope,
+        WorkshopCatalogSort, WorkshopModData,
     };
 
     #[cfg(not(windows))]
     use super::discover_steam_root_from_windows_registry;
     use super::{
-        LaunchPreparationOptions, SteamResubscribeSafetyConfig, SteamWorkshopCheckStateResult,
-        SteamWorkshopCommandAdapter, SteamWorkshopCommandResult, SteamWorkshopCommandRunner,
-        SteamWorkshopCommandSafetyConfig, TsSteamHelperMetadataAdapter, TsSteamHelperRunner,
-        WH3_STEAM_APP_ID, WrittenPackFile, discover_wh3_steam_install_from_steam_root,
-        discover_wh3_workshop_folder, executable_path_for_prepared_launch,
-        parse_steam_install_path_from_reg_query_output,
+        LaunchPreparationOptions, SteamResubscribeSafetyConfig, SteamWorkshopCatalogAdapter,
+        SteamWorkshopCatalogRunner, SteamWorkshopCheckStateResult, SteamWorkshopCommandAdapter,
+        SteamWorkshopCommandResult, SteamWorkshopCommandRunner, SteamWorkshopCommandSafetyConfig,
+        TsSteamHelperMetadataAdapter, TsSteamHelperRunner, WH3_STEAM_APP_ID, WrittenPackFile,
+        discover_wh3_steam_install_from_steam_root, discover_wh3_workshop_folder,
+        executable_path_for_prepared_launch, parse_steam_install_path_from_reg_query_output,
         parse_steam_libraries_from_libraryfolders_vdf, prepare_windows_launch_files,
         remove_loaded_workshop_mod_dirs, resubscribe_with_cleanup_and_verification,
         validate_wh3_game_folder, validate_windows_game_folder,
@@ -2367,6 +2657,7 @@ mod tests {
             WH3_STEAM_APP_ID,
             SteamWorkshopCommandSafetyConfig {
                 command_delay: Duration::from_millis(123),
+                ..SteamWorkshopCommandSafetyConfig::default()
             },
             runner,
         );
@@ -2430,6 +2721,70 @@ mod tests {
                 vec!["444".to_string()],
                 Duration::from_millis(123)
             )]
+        );
+    }
+
+    #[test]
+    fn steam_command_adapter_batches_and_limits_bulk_operations() {
+        let runner = RecordingWorkshopCommandRunner::default();
+        let mut adapter = SteamWorkshopCommandAdapter::with_config(
+            WH3_STEAM_APP_ID,
+            SteamWorkshopCommandSafetyConfig {
+                command_delay: Duration::ZERO,
+                batch_size: 2,
+                batch_delay: Duration::ZERO,
+                max_operation_ids: 4,
+            },
+            runner,
+        );
+        let ids = ["1", "2", "3", "4"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        adapter.subscribe(&ids).unwrap();
+        let runner = adapter.into_runner();
+        assert_eq!(runner.subscribe_calls.len(), 2);
+        assert_eq!(runner.subscribe_calls[0].1, ["1", "2"]);
+        assert_eq!(runner.subscribe_calls[1].1, ["3", "4"]);
+
+        let runner = RecordingWorkshopCommandRunner::default();
+        let mut adapter = SteamWorkshopCommandAdapter::with_config(
+            WH3_STEAM_APP_ID,
+            SteamWorkshopCommandSafetyConfig {
+                max_operation_ids: 2,
+                ..SteamWorkshopCommandSafetyConfig::default()
+            },
+            runner,
+        );
+        assert!(adapter.download(&ids).is_err());
+    }
+
+    #[test]
+    fn workshop_catalog_adapter_validates_and_forwards_normalized_queries() {
+        let runner = RecordingCatalogRunner::default();
+        let mut adapter = SteamWorkshopCatalogAdapter::new(WH3_STEAM_APP_ID, runner);
+        let page = adapter
+            .query(&WorkshopCatalogQuery {
+                search_text: "  units ".to_string(),
+                required_tags: vec!["Units".to_string(), "units".to_string()],
+                ..WorkshopCatalogQuery::default()
+            })
+            .unwrap();
+        assert_eq!(page.page, 1);
+        let runner = adapter.into_runner();
+        assert_eq!(runner.queries[0].search_text, "units");
+        assert_eq!(runner.queries[0].required_tags, ["Units"]);
+
+        let runner = RecordingCatalogRunner::default();
+        let mut adapter = SteamWorkshopCatalogAdapter::new(WH3_STEAM_APP_ID, runner);
+        assert!(
+            adapter
+                .query(&WorkshopCatalogQuery {
+                    scope: WorkshopCatalogScope::Favorites,
+                    sort: WorkshopCatalogSort::Popular,
+                    ..WorkshopCatalogQuery::default()
+                })
+                .is_err()
         );
     }
 
@@ -2522,6 +2877,7 @@ esac
             WH3_STEAM_APP_ID,
             SteamWorkshopCommandSafetyConfig {
                 command_delay: Duration::from_millis(123),
+                ..SteamWorkshopCommandSafetyConfig::default()
             },
             SteamWorkshopHelperProcessRunner::new(&helper_path),
         );
@@ -2737,6 +3093,64 @@ echo '[]'
         fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn steam_helper_monitor_rejects_malformed_jsonl_and_cleans_up() {
+        let root = temp_root("steam-helper-monitor-jsonl");
+        fs::create_dir_all(&root).unwrap();
+        let helper_path = root.join("monitor-steam-helper.sh");
+        write_unix_helper_script(
+            &helper_path,
+            r#"#!/bin/sh
+echo 'not-json'
+"#,
+        );
+        let runner = SteamWorkshopHelperProcessRunner::new(&helper_path);
+
+        let error = runner
+            .monitor_workshop_items(
+                WH3_STEAM_APP_ID,
+                &["111".to_string()],
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind, SteamWorkshopAdapterErrorKind::MalformedResponse);
+        assert!(
+            error
+                .message
+                .contains("malformed Steam Workshop monitor JSONL")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steam_helper_monitor_honors_cancellation_and_reaps_child() {
+        let root = temp_root("steam-helper-monitor-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let helper_path = root.join("monitor-steam-helper.sh");
+        write_unix_helper_script(
+            &helper_path,
+            r#"#!/bin/sh
+echo '{"event":"snapshot","snapshot":{"elapsedMs":0,"items":[]}}'
+"#,
+        );
+        let runner = SteamWorkshopHelperProcessRunner::new(&helper_path);
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let completion = runner
+            .monitor_workshop_items(WH3_STEAM_APP_ID, &["111".to_string()], &cancel, |_| {})
+            .unwrap();
+
+        assert_eq!(
+            completion.reason,
+            wh3mm_core::WorkshopMonitorCompletionReason::Cancelled
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn removes_loaded_workshop_mod_dirs_for_requested_ids() {
         let root = temp_root("workshop-cleanup");
@@ -2800,6 +3214,7 @@ echo '[]'
             WH3_STEAM_APP_ID,
             SteamWorkshopCommandSafetyConfig {
                 command_delay: Duration::from_millis(7),
+                ..SteamWorkshopCommandSafetyConfig::default()
             },
             runner,
         );
@@ -3591,6 +4006,25 @@ cat "$modfile" > launch-mod-list.txt
                     SteamWorkshopAdapterErrorKind::Unavailable,
                     "test helper has no dependency item response",
                 )
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCatalogRunner {
+        queries: Vec<WorkshopCatalogQuery>,
+    }
+
+    impl SteamWorkshopCatalogRunner for RecordingCatalogRunner {
+        fn query_catalog(
+            &mut self,
+            _app_id: &str,
+            query: &WorkshopCatalogQuery,
+        ) -> Result<WorkshopCatalogPage, SteamWorkshopAdapterError> {
+            self.queries.push(query.clone());
+            Ok(WorkshopCatalogPage {
+                page: query.page,
+                ..WorkshopCatalogPage::default()
             })
         }
     }

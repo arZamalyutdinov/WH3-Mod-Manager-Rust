@@ -5,14 +5,14 @@
 //! owns the backend boundary that a native Windows Steamworks implementation
 //! will fill without changing the Dioxus/runtime helper protocol.
 
+#[cfg(windows)]
+use std::sync::mpsc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
-};
-#[cfg(windows)]
-use std::{
-    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -31,6 +31,218 @@ const STEAM_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const STEAM_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(windows)]
 const STEAM_DEPENDENCY_DELAY: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const WORKSHOP_QUERY_CACHE_SECONDS: u32 = 60;
+const DEFAULT_MONITOR_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_MONITOR_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
+const MAX_MONITOR_IDS: usize = 200;
+const WORKSHOP_CATALOG_PAGE_SIZE: usize = 50;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkshopCatalogScope {
+    #[default]
+    Discover,
+    Subscribed,
+    Favorites,
+    Published,
+    VotedUp,
+    VotedDown,
+    Followed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkshopCatalogSort {
+    Relevance,
+    #[default]
+    Popular,
+    Newest,
+    Trending,
+    MostSubscribed,
+    Updated,
+    Oldest,
+    Title,
+    SubscriptionDate,
+    Score,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkshopCatalogQuery {
+    scope: WorkshopCatalogScope,
+    sort: WorkshopCatalogSort,
+    #[serde(default)]
+    search_text: String,
+    #[serde(default)]
+    required_tags: Vec<String>,
+    #[serde(default)]
+    match_any_tag: bool,
+    page: u32,
+}
+
+impl Default for WorkshopCatalogQuery {
+    fn default() -> Self {
+        Self {
+            scope: WorkshopCatalogScope::Discover,
+            sort: WorkshopCatalogSort::Popular,
+            search_text: String::new(),
+            required_tags: Vec::new(),
+            match_any_tag: false,
+            page: 1,
+        }
+    }
+}
+
+impl WorkshopCatalogQuery {
+    fn normalized(&self) -> Result<Self, String> {
+        if self.page == 0 {
+            return Err("Workshop catalog pages start at 1".to_string());
+        }
+        let supported = if self.scope == WorkshopCatalogScope::Discover {
+            matches!(
+                self.sort,
+                WorkshopCatalogSort::Relevance
+                    | WorkshopCatalogSort::Popular
+                    | WorkshopCatalogSort::Newest
+                    | WorkshopCatalogSort::Trending
+                    | WorkshopCatalogSort::MostSubscribed
+                    | WorkshopCatalogSort::Updated
+            )
+        } else {
+            matches!(
+                self.sort,
+                WorkshopCatalogSort::Newest
+                    | WorkshopCatalogSort::Oldest
+                    | WorkshopCatalogSort::Title
+                    | WorkshopCatalogSort::Updated
+                    | WorkshopCatalogSort::SubscriptionDate
+                    | WorkshopCatalogSort::Score
+            )
+        };
+        if !supported {
+            return Err("Workshop sort is incompatible with the selected scope".to_string());
+        }
+        if self.scope != WorkshopCatalogScope::Discover
+            && (!self.search_text.trim().is_empty() || !self.required_tags.is_empty())
+        {
+            return Err("Search text and tags only apply to Discover".to_string());
+        }
+        let mut seen = BTreeSet::new();
+        let required_tags = self
+            .required_tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .filter(|tag| seen.insert(tag.to_ascii_lowercase()))
+            .map(ToString::to_string)
+            .take(20)
+            .collect();
+        let search_text = self
+            .search_text
+            .trim()
+            .chars()
+            .take(200)
+            .collect::<String>();
+        let sort = if self.sort == WorkshopCatalogSort::Relevance && search_text.is_empty() {
+            WorkshopCatalogSort::Popular
+        } else {
+            self.sort
+        };
+        Ok(Self {
+            scope: self.scope,
+            sort,
+            search_text,
+            required_tags,
+            match_any_tag: self.match_any_tag,
+            page: self.page,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkshopCatalogItemKind {
+    #[default]
+    Item,
+    Collection,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct WorkshopItemStatistics {
+    subscriptions: u64,
+    favorites: u64,
+    followers: u64,
+    views: u64,
+    comments: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+struct WorkshopItemState {
+    workshop_id: String,
+    subscribed: bool,
+    installed: bool,
+    needs_update: bool,
+    downloading: bool,
+    download_pending: bool,
+    bytes_downloaded: Option<u64>,
+    bytes_total: Option<u64>,
+}
+
+impl WorkshopItemState {
+    fn download_complete(&self) -> bool {
+        self.installed && !self.needs_update && !self.downloading && !self.download_pending
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct WorkshopCatalogItem {
+    workshop_id: String,
+    kind: WorkshopCatalogItemKind,
+    title: String,
+    description: String,
+    owner_steam_id: String,
+    author: String,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    tags: Vec<String>,
+    preview_url: Option<String>,
+    file_size: u64,
+    upvotes: u32,
+    downvotes: u32,
+    score: f32,
+    child_ids: Vec<String>,
+    statistics: WorkshopItemStatistics,
+    state: WorkshopItemState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct WorkshopCatalogPage {
+    page: u32,
+    total_results: u32,
+    was_cached: bool,
+    items: Vec<WorkshopCatalogItem>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct WorkshopMonitorSnapshot {
+    elapsed_ms: u64,
+    items: Vec<WorkshopItemState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkshopMonitorCompletionReason {
+    Complete,
+    Timeout,
+    Cancelled,
+}
 
 /// Files used by the fixture-backed helper.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -109,6 +321,11 @@ impl HelperError {
         }
     }
 
+    /// Builds an output/pipe failure for the streaming CLI entry point.
+    pub fn output(message: impl Into<String>) -> Self {
+        Self::unavailable(message)
+    }
+
     /// Process exit code.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
@@ -149,14 +366,97 @@ where
     let request = HelperRequest::from_args(&args)?;
     if request.command == HelperCommand::Probe {
         let response = probe_helper(paths, &request)?;
-        append_command_log(paths.command_log_path.as_deref(), &request)?;
+        append_command_log(paths.command_log_path.as_deref(), &request, Some(&response))?;
         return Ok(response);
     }
 
     let mut backend = load_backend(paths, &request.app_id)?;
     let response = execute_backend_command(backend.as_mut(), &request)?;
-    append_command_log(paths.command_log_path.as_deref(), &request)?;
+    append_command_log(paths.command_log_path.as_deref(), &request, Some(&response))?;
     Ok(response)
+}
+
+/// Executes a helper command and emits one or more JSON lines.
+///
+/// Normal commands emit one line. `monitorWorkshopItems` keeps one Steamworks
+/// client alive and emits bounded local item-state snapshots until completion
+/// or timeout.
+///
+/// # Errors
+///
+/// Returns an error for malformed command arguments or payloads, unavailable
+/// fixture/native backends, command failures, or a failed output emission.
+pub fn run_streaming_with_args<I, S, F>(
+    args: I,
+    paths: &HelperPaths,
+    mut emit: F,
+) -> Result<(), HelperError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+    F: FnMut(&str) -> Result<(), HelperError>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if args.len() < 2 {
+        return Err(HelperError::usage(
+            "usage: wh3mm-steam-helper <app_id> <command> [payload] [delay_ms]",
+        ));
+    }
+    let request = HelperRequest::from_args(&args)?;
+    if request.command != HelperCommand::MonitorWorkshopItems {
+        let output = run_with_args(args, paths)?;
+        return emit(&output);
+    }
+
+    let monitor: MonitorRequest = request.json_payload()?;
+    let ids = normalize_id_list(monitor.ids.iter().map(String::as_str));
+    if ids.is_empty() {
+        return Err(HelperError::usage(
+            "monitorWorkshopItems requires at least one numeric Workshop ID",
+        ));
+    }
+    if ids.len() > MAX_MONITOR_IDS {
+        return Err(HelperError::usage(format!(
+            "monitorWorkshopItems accepts at most {MAX_MONITOR_IDS} IDs"
+        )));
+    }
+    let interval = Duration::from_millis(monitor.interval_ms.clamp(250, 5_000));
+    let timeout =
+        Duration::from_millis(monitor.timeout_ms.clamp(1_000, DEFAULT_MONITOR_TIMEOUT_MS));
+    let mut backend = load_backend(paths, &request.app_id)?;
+    let started = Instant::now();
+    let final_snapshot = loop {
+        let states = backend.item_states(&ids)?;
+        let snapshot = WorkshopMonitorSnapshot {
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            items: states,
+        };
+        emit(&to_json(&MonitorEvent::Snapshot {
+            snapshot: snapshot.clone(),
+        })?)?;
+        if snapshot.items.len() == ids.len()
+            && snapshot
+                .items
+                .iter()
+                .all(WorkshopItemState::download_complete)
+        {
+            emit(&to_json(&MonitorEvent::Complete {
+                reason: WorkshopMonitorCompletionReason::Complete,
+                snapshot: snapshot.clone(),
+            })?)?;
+            break snapshot;
+        }
+        if started.elapsed() >= timeout {
+            emit(&to_json(&MonitorEvent::Complete {
+                reason: WorkshopMonitorCompletionReason::Timeout,
+                snapshot: snapshot.clone(),
+            })?)?;
+            break snapshot;
+        }
+        thread::sleep(interval);
+    };
+    let _ = final_snapshot;
+    append_command_log(paths.command_log_path.as_deref(), &request, None)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,7 +498,7 @@ impl HelperRequest {
         let command = HelperCommand::parse(&args[1])?;
         let (payload, delay_ms) = match command.payload_kind() {
             PayloadKind::None => (None, parse_optional_delay(args.get(2))?),
-            PayloadKind::CommaIds | PayloadKind::SemicolonIds => {
+            PayloadKind::CommaIds | PayloadKind::SemicolonIds | PayloadKind::Json => {
                 let payload = args.get(2).cloned().unwrap_or_default();
                 let delay_ms = parse_optional_delay(args.get(3))?;
                 (Some(payload), delay_ms)
@@ -215,7 +515,7 @@ impl HelperRequest {
 
     fn ids(&self) -> Vec<String> {
         match self.command.payload_kind() {
-            PayloadKind::None => Vec::new(),
+            PayloadKind::None | PayloadKind::Json => Vec::new(),
             PayloadKind::CommaIds => normalize_id_list(
                 self.payload
                     .as_deref()
@@ -232,6 +532,15 @@ impl HelperRequest {
             ),
         }
     }
+
+    fn json_payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T, HelperError> {
+        serde_json::from_str(self.payload.as_deref().unwrap_or_default()).map_err(|error| {
+            HelperError::data(format!(
+                "invalid {} JSON payload: {error}",
+                self.command.as_str()
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +551,8 @@ enum HelperCommand {
     GetItems,
     GetDependencies,
     GetAuthors,
+    QueryWorkshop,
+    MonitorWorkshopItems,
     Subscribe,
     Download,
     Unsubscribe,
@@ -257,6 +568,8 @@ impl HelperCommand {
             "getItems" => Ok(Self::GetItems),
             "getDependencies" => Ok(Self::GetDependencies),
             "getAuthors" => Ok(Self::GetAuthors),
+            "queryWorkshop" => Ok(Self::QueryWorkshop),
+            "monitorWorkshopItems" => Ok(Self::MonitorWorkshopItems),
             "sub" => Ok(Self::Subscribe),
             "download" => Ok(Self::Download),
             "unsubscribe" => Ok(Self::Unsubscribe),
@@ -275,6 +588,8 @@ impl HelperCommand {
             Self::GetItems => "getItems",
             Self::GetDependencies => "getDependencies",
             Self::GetAuthors => "getAuthors",
+            Self::QueryWorkshop => "queryWorkshop",
+            Self::MonitorWorkshopItems => "monitorWorkshopItems",
             Self::Subscribe => "sub",
             Self::Download => "download",
             Self::Unsubscribe => "unsubscribe",
@@ -285,6 +600,7 @@ impl HelperCommand {
     fn payload_kind(self) -> PayloadKind {
         match self {
             Self::Probe | Self::GetSubscribedIds => PayloadKind::None,
+            Self::QueryWorkshop | Self::MonitorWorkshopItems => PayloadKind::Json,
             Self::GetModsData | Self::GetItems | Self::GetDependencies | Self::GetAuthors => {
                 PayloadKind::CommaIds
             }
@@ -300,6 +616,37 @@ enum PayloadKind {
     None,
     CommaIds,
     SemicolonIds,
+    Json,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorRequest {
+    ids: Vec<String>,
+    #[serde(default = "default_monitor_interval_ms")]
+    interval_ms: u64,
+    #[serde(default = "default_monitor_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn default_monitor_interval_ms() -> u64 {
+    DEFAULT_MONITOR_INTERVAL_MS
+}
+
+fn default_monitor_timeout_ms() -> u64 {
+    DEFAULT_MONITOR_TIMEOUT_MS
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "event", rename_all = "camelCase")]
+enum MonitorEvent {
+    Snapshot {
+        snapshot: WorkshopMonitorSnapshot,
+    },
+    Complete {
+        reason: WorkshopMonitorCompletionReason,
+        snapshot: WorkshopMonitorSnapshot,
+    },
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -315,6 +662,40 @@ struct HelperFixture {
     dependencies: BTreeMap<String, Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_map")]
     authors: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    catalog: Vec<WorkshopCatalogItem>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_values"
+    )]
+    favorite_ids: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_values"
+    )]
+    published_ids: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_values"
+    )]
+    voted_up_ids: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_values"
+    )]
+    voted_down_ids: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_values"
+    )]
+    followed_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    monitor_snapshots: Vec<Vec<WorkshopItemState>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -332,6 +713,22 @@ struct WorkshopItem {
     owner: WorkshopOwner,
     #[serde(default, deserialize_with = "deserialize_u64_value")]
     time_updated: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_u64_value",
+        skip_serializing_if = "is_zero"
+    )]
+    time_created: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    author: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    child_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    statistics: WorkshopItemStatistics,
+    #[serde(default, skip_serializing_if = "is_default")]
+    state: WorkshopItemState,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -351,6 +748,14 @@ struct CommandResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     update_requested_ids: Vec<String>,
     delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_count: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -392,17 +797,24 @@ trait SteamHelperBackend {
 
     fn authors(&mut self, ids: &[String]) -> Result<BTreeMap<String, String>, HelperError>;
 
+    fn catalog(&mut self, query: &WorkshopCatalogQuery)
+    -> Result<WorkshopCatalogPage, HelperError>;
+
+    fn item_states(&mut self, ids: &[String]) -> Result<Vec<WorkshopItemState>, HelperError>;
+
     fn command_action(&mut self, request: &HelperRequest) -> Result<CommandResult, HelperError>;
 }
 
 struct FixtureSteamBackend {
     fixture: HelperFixture,
+    monitor_index: usize,
 }
 
 impl FixtureSteamBackend {
     fn from_path(path: Option<&Path>) -> Result<Self, HelperError> {
         Ok(Self {
             fixture: load_fixture(path)?,
+            monitor_index: 0,
         })
     }
 }
@@ -430,12 +842,24 @@ impl SteamHelperBackend for FixtureSteamBackend {
             items: Vec::new(),
             dependencies,
             authors: self.fixture.authors.clone(),
+            ..HelperFixture::default()
         })
     }
 
     fn items(&mut self, ids: &[String]) -> Result<Vec<WorkshopItem>, HelperError> {
         let requested = ids.iter().cloned().collect::<BTreeSet<_>>();
-        Ok(lookup_items(&self.fixture, &requested))
+        let mut items = lookup_items(&self.fixture, &requested);
+        for item in &mut items {
+            item.author = self
+                .fixture
+                .authors
+                .get(&item.owner.steam_id64)
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| item.owner.steam_id64.clone());
+            item.state.workshop_id.clone_from(&item.published_file_id);
+        }
+        Ok(items)
     }
 
     fn dependencies(
@@ -451,6 +875,66 @@ impl SteamHelperBackend for FixtureSteamBackend {
         Ok(filter_authors(&self.fixture.authors, &requested))
     }
 
+    fn catalog(
+        &mut self,
+        query: &WorkshopCatalogQuery,
+    ) -> Result<WorkshopCatalogPage, HelperError> {
+        let query = query.normalized().map_err(HelperError::usage)?;
+        let allowed_ids = fixture_scope_ids(&self.fixture, query.scope);
+        let mut items = self
+            .fixture
+            .catalog
+            .iter()
+            .filter(|item| {
+                allowed_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&item.workshop_id))
+            })
+            .filter(|item| fixture_item_matches_query(item, &query))
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_fixture_catalog(&mut items, query.sort);
+        let total_results = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let start = (query.page.saturating_sub(1) as usize) * WORKSHOP_CATALOG_PAGE_SIZE;
+        let items = items
+            .into_iter()
+            .skip(start)
+            .take(WORKSHOP_CATALOG_PAGE_SIZE)
+            .collect();
+        Ok(WorkshopCatalogPage {
+            page: query.page,
+            total_results,
+            was_cached: false,
+            items,
+        })
+    }
+
+    fn item_states(&mut self, ids: &[String]) -> Result<Vec<WorkshopItemState>, HelperError> {
+        let requested = normalize_id_list(ids.iter().map(String::as_str));
+        if let Some(snapshot) = self
+            .fixture
+            .monitor_snapshots
+            .get(self.monitor_index)
+            .cloned()
+        {
+            self.monitor_index = self
+                .monitor_index
+                .saturating_add(1)
+                .min(self.fixture.monitor_snapshots.len());
+            return Ok(snapshot
+                .into_iter()
+                .filter(|state| requested.contains(&state.workshop_id))
+                .collect());
+        }
+        Ok(self
+            .fixture
+            .catalog
+            .iter()
+            .filter(|item| requested.contains(&item.workshop_id))
+            .map(|item| item.state.clone())
+            .collect())
+    }
+
     fn command_action(&mut self, request: &HelperRequest) -> Result<CommandResult, HelperError> {
         Ok(CommandResult {
             ok: true,
@@ -459,6 +943,10 @@ impl SteamHelperBackend for FixtureSteamBackend {
             ids: request.ids(),
             update_requested_ids: Vec::new(),
             delay_ms: request.delay_ms,
+            query_scope: None,
+            query_sort: None,
+            query_page: None,
+            result_count: None,
         })
     }
 }
@@ -466,6 +954,7 @@ impl SteamHelperBackend for FixtureSteamBackend {
 #[cfg(windows)]
 struct NativeSteamBackend {
     client: steamworks::Client,
+    app_id: u32,
 }
 
 #[cfg(windows)]
@@ -479,7 +968,7 @@ impl NativeSteamBackend {
                      are discoverable beside the helper executable"
             ))
         })?;
-        Ok(Self { client })
+        Ok(Self { client, app_id })
     }
 
     fn published_file_ids(ids: &[String]) -> Result<Vec<steamworks::PublishedFileId>, HelperError> {
@@ -568,12 +1057,13 @@ impl NativeSteamBackend {
                     "failed to create native Steamworks getItems query: {error}"
                 ))
             })?
+            .include_long_desc(true)
+            .include_children(true)
             .fetch(move |result| {
                 let response = result
                     .map(|results| {
-                        results
-                            .iter()
-                            .filter_map(|item| item.map(workshop_item_from_query_result))
+                        (0..results.returned_results())
+                            .filter_map(|index| workshop_item_from_query_results(&results, index))
                             .collect::<Vec<_>>()
                     })
                     .map_err(|error| format!("{error:?}"));
@@ -632,6 +1122,53 @@ impl NativeSteamBackend {
             thread::sleep(STEAM_CALLBACK_POLL_INTERVAL);
         }
     }
+
+    fn states_for_ids(&self, ids: &[String]) -> Result<Vec<WorkshopItemState>, HelperError> {
+        let ugc = self.client.ugc();
+        Self::published_file_ids(ids)?
+            .into_iter()
+            .zip(ids.iter())
+            .map(|(item, id)| {
+                let state = ugc.item_state(item);
+                let (bytes_downloaded, bytes_total) = ugc
+                    .item_download_info(item)
+                    .map_or((None, None), |(downloaded, total)| {
+                        (Some(downloaded), Some(total))
+                    });
+                Ok(WorkshopItemState {
+                    workshop_id: id.clone(),
+                    subscribed: state.contains(steamworks::ItemState::SUBSCRIBED),
+                    installed: state.contains(steamworks::ItemState::INSTALLED),
+                    needs_update: state.contains(steamworks::ItemState::NEEDS_UPDATE),
+                    downloading: state.contains(steamworks::ItemState::DOWNLOADING),
+                    download_pending: state.contains(steamworks::ItemState::DOWNLOAD_PENDING),
+                    bytes_downloaded,
+                    bytes_total,
+                })
+            })
+            .collect()
+    }
+
+    fn resolve_catalog_authors(
+        &mut self,
+        items: &mut [WorkshopCatalogItem],
+    ) -> Result<(), HelperError> {
+        let owner_ids = items
+            .iter()
+            .filter_map(|item| normalize_workshop_id(&item.owner_steam_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let authors = self.authors(&owner_ids)?;
+        for item in items {
+            item.author = authors
+                .get(&item.owner_steam_id)
+                .filter(|name| name.as_str() != "[unknown]" && !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| item.owner_steam_id.clone());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -663,11 +1200,34 @@ impl SteamHelperBackend for NativeSteamBackend {
             items: Vec::new(),
             dependencies,
             authors,
+            ..HelperFixture::default()
         })
     }
 
     fn items(&mut self, ids: &[String]) -> Result<Vec<WorkshopItem>, HelperError> {
-        self.workshop_items_for_ids(ids)
+        let mut items = self.workshop_items_for_ids(ids)?;
+        let states = self.states_for_ids(ids)?;
+        let author_ids = items
+            .iter()
+            .filter_map(|item| normalize_workshop_id(&item.owner.steam_id64))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let authors = self.authors(&author_ids)?;
+        for item in &mut items {
+            item.author = authors
+                .get(&item.owner.steam_id64)
+                .filter(|name| name.as_str() != "[unknown]" && !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| item.owner.steam_id64.clone());
+            if let Some(state) = states
+                .iter()
+                .find(|state| state.workshop_id == item.published_file_id)
+            {
+                item.state = state.clone();
+            }
+        }
+        Ok(items)
     }
 
     fn dependencies(
@@ -705,6 +1265,93 @@ impl SteamHelperBackend for NativeSteamBackend {
         }
 
         Ok(authors)
+    }
+
+    fn catalog(
+        &mut self,
+        query: &WorkshopCatalogQuery,
+    ) -> Result<WorkshopCatalogPage, HelperError> {
+        let query = query.normalized().map_err(HelperError::usage)?;
+        let app_ids = steamworks::AppIDs::ConsumerAppId(steamworks::AppId(self.app_id));
+        let ugc = self.client.ugc();
+        let mut handle = if query.scope == WorkshopCatalogScope::Discover {
+            ugc.query_all(
+                native_discovery_sort(query.sort),
+                steamworks::UGCType::All,
+                app_ids,
+                query.page,
+            )
+        } else {
+            ugc.query_user(
+                self.client.user().steam_id().account_id(),
+                native_user_list(query.scope),
+                steamworks::UGCType::All,
+                native_user_sort(query.sort),
+                app_ids,
+                query.page,
+            )
+        }
+        .map_err(|error| {
+            HelperError::unavailable(format!("failed to create Workshop catalog query: {error}"))
+        })?;
+
+        handle = handle
+            .include_long_desc(true)
+            .include_children(true)
+            .allow_cached_response(WORKSHOP_QUERY_CACHE_SECONDS);
+        if !query.search_text.is_empty() {
+            handle = handle.set_search_text(&query.search_text);
+        }
+        for tag in &query.required_tags {
+            handle = handle.add_required_tag(tag);
+        }
+        if !query.required_tags.is_empty() {
+            handle = handle.set_match_any_tag(query.match_any_tag);
+        }
+        if query.sort == WorkshopCatalogSort::Trending {
+            handle = handle.set_ranked_by_trend_days(7);
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        handle.fetch(move |result| {
+            let response = result
+                .map(|results| {
+                    let items = (0..results.returned_results())
+                        .filter_map(|index| {
+                            workshop_catalog_item_from_query_results(&results, index)
+                        })
+                        .collect::<Vec<_>>();
+                    WorkshopCatalogPage {
+                        page: query.page,
+                        total_results: results.total_results(),
+                        was_cached: results.was_cached(),
+                        items,
+                    }
+                })
+                .map_err(|error| format!("{error:?}"));
+            let _ = sender.send(response);
+        });
+        let mut page = self.wait_for_callback(&receiver, "Workshop catalog query")?;
+        let ids = page
+            .items
+            .iter()
+            .map(|item| item.workshop_id.clone())
+            .collect::<Vec<_>>();
+        let states = self.states_for_ids(&ids)?;
+        for item in &mut page.items {
+            if let Some(state) = states
+                .iter()
+                .find(|state| state.workshop_id == item.workshop_id)
+            {
+                item.state = state.clone();
+            }
+        }
+        self.resolve_catalog_authors(&mut page.items)?;
+        Ok(page)
+    }
+
+    fn item_states(&mut self, ids: &[String]) -> Result<Vec<WorkshopItemState>, HelperError> {
+        self.states_for_ids(ids)
     }
 
     fn command_action(&mut self, request: &HelperRequest) -> Result<CommandResult, HelperError> {
@@ -750,7 +1397,9 @@ impl SteamHelperBackend for NativeSteamBackend {
             | HelperCommand::GetModsData
             | HelperCommand::GetItems
             | HelperCommand::GetDependencies
-            | HelperCommand::GetAuthors => {
+            | HelperCommand::GetAuthors
+            | HelperCommand::QueryWorkshop
+            | HelperCommand::MonitorWorkshopItems => {
                 return Err(HelperError::usage(format!(
                     "{} is not a Steam command action",
                     request.command.as_str()
@@ -765,8 +1414,109 @@ impl SteamHelperBackend for NativeSteamBackend {
             ids,
             update_requested_ids,
             delay_ms: request.delay_ms,
+            query_scope: None,
+            query_sort: None,
+            query_page: None,
+            result_count: None,
         })
     }
+}
+
+#[cfg(windows)]
+fn native_discovery_sort(sort: WorkshopCatalogSort) -> steamworks::UGCQueryType {
+    match sort {
+        WorkshopCatalogSort::Relevance => steamworks::UGCQueryType::RankedByTextSearch,
+        WorkshopCatalogSort::Popular => steamworks::UGCQueryType::RankedByVote,
+        WorkshopCatalogSort::Newest => steamworks::UGCQueryType::RankedByPublicationDate,
+        WorkshopCatalogSort::Trending => steamworks::UGCQueryType::RankedByTrend,
+        WorkshopCatalogSort::MostSubscribed => {
+            steamworks::UGCQueryType::RankedByTotalUniqueSubscriptions
+        }
+        WorkshopCatalogSort::Updated => steamworks::UGCQueryType::RankedByLastUpdatedDate,
+        WorkshopCatalogSort::Oldest
+        | WorkshopCatalogSort::Title
+        | WorkshopCatalogSort::SubscriptionDate
+        | WorkshopCatalogSort::Score => steamworks::UGCQueryType::RankedByVote,
+    }
+}
+
+#[cfg(windows)]
+fn native_user_list(scope: WorkshopCatalogScope) -> steamworks::UserList {
+    match scope {
+        WorkshopCatalogScope::Subscribed => steamworks::UserList::Subscribed,
+        WorkshopCatalogScope::Favorites => steamworks::UserList::Favorited,
+        WorkshopCatalogScope::Published => steamworks::UserList::Published,
+        WorkshopCatalogScope::VotedUp => steamworks::UserList::VotedUp,
+        WorkshopCatalogScope::VotedDown => steamworks::UserList::VotedDown,
+        WorkshopCatalogScope::Followed => steamworks::UserList::Followed,
+        WorkshopCatalogScope::Discover => steamworks::UserList::Subscribed,
+    }
+}
+
+#[cfg(windows)]
+fn native_user_sort(sort: WorkshopCatalogSort) -> steamworks::UserListOrder {
+    match sort {
+        WorkshopCatalogSort::Oldest => steamworks::UserListOrder::CreationOrderAsc,
+        WorkshopCatalogSort::Title => steamworks::UserListOrder::TitleAsc,
+        WorkshopCatalogSort::Updated => steamworks::UserListOrder::LastUpdatedDesc,
+        WorkshopCatalogSort::SubscriptionDate => steamworks::UserListOrder::SubscriptionDateDesc,
+        WorkshopCatalogSort::Score => steamworks::UserListOrder::VoteScoreDesc,
+        WorkshopCatalogSort::Newest
+        | WorkshopCatalogSort::Relevance
+        | WorkshopCatalogSort::Popular
+        | WorkshopCatalogSort::Trending
+        | WorkshopCatalogSort::MostSubscribed => steamworks::UserListOrder::CreationOrderDesc,
+    }
+}
+
+#[cfg(windows)]
+fn workshop_catalog_item_from_query_results(
+    results: &steamworks::QueryResults<'_>,
+    index: u32,
+) -> Option<WorkshopCatalogItem> {
+    let item = results.get(index)?;
+    let workshop_id = item.published_file_id.0.to_string();
+    let child_ids = results
+        .get_children(index)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|child| child.0.to_string())
+        .collect();
+    let statistic = |kind| results.statistic(index, kind).unwrap_or(0);
+    Some(WorkshopCatalogItem {
+        workshop_id: workshop_id.clone(),
+        kind: if item.file_type == steamworks::FileType::Collection {
+            WorkshopCatalogItemKind::Collection
+        } else {
+            WorkshopCatalogItemKind::Item
+        },
+        title: item.title,
+        description: item.description,
+        owner_steam_id: item.owner.raw().to_string(),
+        author: String::new(),
+        created_at_ms: u64::from(item.time_created).saturating_mul(1_000),
+        updated_at_ms: u64::from(item.time_updated).saturating_mul(1_000),
+        tags: item.tags,
+        preview_url: results
+            .preview_url(index)
+            .filter(|url| valid_preview_url(url)),
+        file_size: u64::from(item.file_size),
+        upvotes: item.num_upvotes,
+        downvotes: item.num_downvotes,
+        score: item.score,
+        child_ids,
+        statistics: WorkshopItemStatistics {
+            subscriptions: statistic(steamworks::UGCStatisticType::Subscriptions),
+            favorites: statistic(steamworks::UGCStatisticType::Favorites),
+            followers: statistic(steamworks::UGCStatisticType::Followers),
+            views: statistic(steamworks::UGCStatisticType::UniqueWebsiteViews),
+            comments: statistic(steamworks::UGCStatisticType::Comments),
+        },
+        state: WorkshopItemState {
+            workshop_id,
+            ..WorkshopItemState::default()
+        },
+    })
 }
 
 #[cfg(not(windows))]
@@ -811,6 +1561,17 @@ impl SteamHelperBackend for NativeSteamBackend {
         Err(Self::unavailable("getAuthors"))
     }
 
+    fn catalog(
+        &mut self,
+        _query: &WorkshopCatalogQuery,
+    ) -> Result<WorkshopCatalogPage, HelperError> {
+        Err(Self::unavailable("queryWorkshop"))
+    }
+
+    fn item_states(&mut self, _ids: &[String]) -> Result<Vec<WorkshopItemState>, HelperError> {
+        Err(Self::unavailable("monitorWorkshopItems"))
+    }
+
     fn command_action(&mut self, request: &HelperRequest) -> Result<CommandResult, HelperError> {
         Err(Self::unavailable(request.command.as_str()))
     }
@@ -844,6 +1605,13 @@ fn execute_backend_command(
         HelperCommand::GetItems => to_json(&backend.items(&request.ids())?),
         HelperCommand::GetDependencies => to_json(&backend.dependencies(&request.ids())?),
         HelperCommand::GetAuthors => to_json(&backend.authors(&request.ids())?),
+        HelperCommand::QueryWorkshop => {
+            let query = request.json_payload::<WorkshopCatalogQuery>()?;
+            to_json(&backend.catalog(&query)?)
+        }
+        HelperCommand::MonitorWorkshopItems => Err(HelperError::usage(
+            "monitorWorkshopItems requires the streaming helper entry point",
+        )),
         HelperCommand::Subscribe
         | HelperCommand::Download
         | HelperCommand::Unsubscribe
@@ -951,8 +1719,14 @@ fn parse_u64_id(id: &str) -> Result<u64, HelperError> {
 }
 
 #[cfg(windows)]
-fn workshop_item_from_query_result(item: steamworks::QueryResult) -> WorkshopItem {
-    WorkshopItem {
+fn workshop_item_from_query_results(
+    results: &steamworks::QueryResults<'_>,
+    index: u32,
+) -> Option<WorkshopItem> {
+    let item = results.get(index)?;
+    let workshop_id = item.published_file_id.0.to_string();
+    let statistic = |kind| results.statistic(index, kind).unwrap_or(0);
+    Some(WorkshopItem {
         published_file_id: item.published_file_id.0.to_string(),
         title: item.title,
         description: item.description,
@@ -961,7 +1735,29 @@ fn workshop_item_from_query_result(item: steamworks::QueryResult) -> WorkshopIte
             steam_id64: item.owner.raw().to_string(),
         },
         time_updated: u64::from(item.time_updated),
-    }
+        time_created: u64::from(item.time_created),
+        preview_url: results
+            .preview_url(index)
+            .filter(|url| valid_preview_url(url)),
+        child_ids: results
+            .get_children(index)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child| child.0.to_string())
+            .collect(),
+        statistics: WorkshopItemStatistics {
+            subscriptions: statistic(steamworks::UGCStatisticType::Subscriptions),
+            favorites: statistic(steamworks::UGCStatisticType::Favorites),
+            followers: statistic(steamworks::UGCStatisticType::Followers),
+            views: statistic(steamworks::UGCStatisticType::UniqueWebsiteViews),
+            comments: statistic(steamworks::UGCStatisticType::Comments),
+        },
+        state: WorkshopItemState {
+            workshop_id,
+            ..WorkshopItemState::default()
+        },
+        ..WorkshopItem::default()
+    })
 }
 
 fn load_fixture(fixture_path: Option<&Path>) -> Result<HelperFixture, HelperError> {
@@ -988,6 +1784,11 @@ fn load_fixture(fixture_path: Option<&Path>) -> Result<HelperFixture, HelperErro
 
 fn normalize_fixture(fixture: &mut HelperFixture) {
     fixture.subscribed_ids = normalize_id_list(fixture.subscribed_ids.iter().map(String::as_str));
+    fixture.favorite_ids = normalize_id_list(fixture.favorite_ids.iter().map(String::as_str));
+    fixture.published_ids = normalize_id_list(fixture.published_ids.iter().map(String::as_str));
+    fixture.voted_up_ids = normalize_id_list(fixture.voted_up_ids.iter().map(String::as_str));
+    fixture.voted_down_ids = normalize_id_list(fixture.voted_down_ids.iter().map(String::as_str));
+    fixture.followed_ids = normalize_id_list(fixture.followed_ids.iter().map(String::as_str));
     fixture.dependencies = fixture
         .dependencies
         .iter()
@@ -1002,6 +1803,123 @@ fn normalize_fixture(fixture: &mut HelperFixture) {
         .filter(|(key, _)| normalize_workshop_id(key).is_some())
         .map(|(key, value)| (key.trim().to_string(), value.clone()))
         .collect();
+    for item in fixture.mods.iter_mut().chain(fixture.items.iter_mut()) {
+        item.preview_url = item.preview_url.take().filter(|url| valid_preview_url(url));
+        item.child_ids = normalize_id_list(item.child_ids.iter().map(String::as_str));
+    }
+    if fixture.catalog.is_empty() {
+        fixture.catalog = fixture
+            .mods
+            .iter()
+            .chain(fixture.items.iter())
+            .filter_map(legacy_catalog_item)
+            .collect();
+    }
+    fixture.catalog.retain_mut(|item| {
+        let Some(id) = normalize_workshop_id(&item.workshop_id) else {
+            return false;
+        };
+        item.workshop_id.clone_from(&id);
+        item.state.workshop_id.clone_from(&id);
+        item.child_ids = normalize_id_list(item.child_ids.iter().map(String::as_str));
+        item.preview_url = item.preview_url.take().filter(|url| valid_preview_url(url));
+        true
+    });
+}
+
+fn legacy_catalog_item(item: &WorkshopItem) -> Option<WorkshopCatalogItem> {
+    let workshop_id = normalize_workshop_id(&item.published_file_id)?;
+    Some(WorkshopCatalogItem {
+        workshop_id: workshop_id.clone(),
+        title: item.title.clone(),
+        description: item.description.clone(),
+        owner_steam_id: item.owner.steam_id64.clone(),
+        author: item.owner.steam_id64.clone(),
+        updated_at_ms: item.time_updated.saturating_mul(1_000),
+        tags: item.tags.clone(),
+        state: WorkshopItemState {
+            workshop_id,
+            ..WorkshopItemState::default()
+        },
+        ..WorkshopCatalogItem::default()
+    })
+}
+
+fn fixture_scope_ids(
+    fixture: &HelperFixture,
+    scope: WorkshopCatalogScope,
+) -> Option<BTreeSet<String>> {
+    let ids = match scope {
+        WorkshopCatalogScope::Discover => return None,
+        WorkshopCatalogScope::Subscribed => &fixture.subscribed_ids,
+        WorkshopCatalogScope::Favorites => &fixture.favorite_ids,
+        WorkshopCatalogScope::Published => &fixture.published_ids,
+        WorkshopCatalogScope::VotedUp => &fixture.voted_up_ids,
+        WorkshopCatalogScope::VotedDown => &fixture.voted_down_ids,
+        WorkshopCatalogScope::Followed => &fixture.followed_ids,
+    };
+    Some(ids.iter().cloned().collect())
+}
+
+fn fixture_item_matches_query(item: &WorkshopCatalogItem, query: &WorkshopCatalogQuery) -> bool {
+    let search = query.search_text.to_ascii_lowercase();
+    if !search.is_empty()
+        && !item.title.to_ascii_lowercase().contains(&search)
+        && !item.description.to_ascii_lowercase().contains(&search)
+    {
+        return false;
+    }
+    if query.required_tags.is_empty() {
+        return true;
+    }
+    let item_tags = item
+        .tags
+        .iter()
+        .map(|tag| tag.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let matches = query
+        .required_tags
+        .iter()
+        .map(|tag| item_tags.contains(&tag.to_ascii_lowercase()));
+    if query.match_any_tag {
+        matches.into_iter().any(|matched| matched)
+    } else {
+        matches.into_iter().all(|matched| matched)
+    }
+}
+
+fn sort_fixture_catalog(items: &mut [WorkshopCatalogItem], sort: WorkshopCatalogSort) {
+    items.sort_by(|left, right| match sort {
+        WorkshopCatalogSort::Relevance
+        | WorkshopCatalogSort::Popular
+        | WorkshopCatalogSort::Score => right.score.total_cmp(&left.score),
+        WorkshopCatalogSort::Newest => right.created_at_ms.cmp(&left.created_at_ms),
+        WorkshopCatalogSort::Trending
+        | WorkshopCatalogSort::Updated
+        | WorkshopCatalogSort::SubscriptionDate => right.updated_at_ms.cmp(&left.updated_at_ms),
+        WorkshopCatalogSort::MostSubscribed => right
+            .statistics
+            .subscriptions
+            .cmp(&left.statistics.subscriptions),
+        WorkshopCatalogSort::Oldest => left.created_at_ms.cmp(&right.created_at_ms),
+        WorkshopCatalogSort::Title => left
+            .title
+            .to_ascii_lowercase()
+            .cmp(&right.title.to_ascii_lowercase()),
+    });
+}
+
+fn valid_preview_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 fn filter_dependencies(
@@ -1060,7 +1978,11 @@ fn parse_optional_delay(value: Option<&String>) -> Result<Option<u64>, HelperErr
         .transpose()
 }
 
-fn append_command_log(path: Option<&Path>, request: &HelperRequest) -> Result<(), HelperError> {
+fn append_command_log(
+    path: Option<&Path>,
+    request: &HelperRequest,
+    response: Option<&str>,
+) -> Result<(), HelperError> {
     let Some(path) = path else {
         return Ok(());
     };
@@ -1072,6 +1994,13 @@ fn append_command_log(path: Option<&Path>, request: &HelperRequest) -> Result<()
             ))
         })?;
     }
+    let query = (request.command == HelperCommand::QueryWorkshop)
+        .then(|| request.json_payload::<WorkshopCatalogQuery>().ok())
+        .flatten();
+    let result_count = response
+        .filter(|_| request.command == HelperCommand::QueryWorkshop)
+        .and_then(|response| serde_json::from_str::<WorkshopCatalogPage>(response).ok())
+        .map(|page| page.items.len());
     let entry = CommandResult {
         ok: true,
         app_id: request.app_id.clone(),
@@ -1079,12 +2008,23 @@ fn append_command_log(path: Option<&Path>, request: &HelperRequest) -> Result<()
         ids: request.ids(),
         update_requested_ids: Vec::new(),
         delay_ms: request.delay_ms,
+        query_scope: query.as_ref().map(|query| format!("{:?}", query.scope)),
+        query_sort: query.as_ref().map(|query| format!("{:?}", query.sort)),
+        query_page: query.as_ref().map(|query| query.page),
+        result_count,
     };
     let line = to_json(&entry)?;
-    let mut existing = fs::read_to_string(path).unwrap_or_default();
-    existing.push_str(&line);
-    existing.push('\n');
-    fs::write(path, existing).map_err(|error| {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            HelperError::unavailable(format!(
+                "failed to open Steam helper command log {}: {error}",
+                path.display()
+            ))
+        })?;
+    writeln!(file, "{line}").map_err(|error| {
         HelperError::unavailable(format!(
             "failed to append Steam helper command log {}: {error}",
             path.display()
@@ -1274,7 +2214,12 @@ mod tests {
                         "publishedFileId": "222",
                         "title": "Dependency Mod",
                         "owner": { "steamId64": "76561198000000002" },
-                        "timeUpdated": 2
+                        "timeUpdated": 2,
+                        "timeCreated": 1,
+                        "previewUrl": "https://cdn.example/222.jpg",
+                        "childIds": ["333", "bad", "333"],
+                        "statistics": {"subscriptions": 12, "comments": 2},
+                        "state": {"installed": true}
                     }
                 ],
                 "dependencies": {},
@@ -1285,10 +2230,19 @@ mod tests {
 
         let output = run_with_args(["1142710", "getItems", "222,333"], &paths).unwrap();
 
+        let items = serde_json::from_str::<Vec<WorkshopItem>>(&output).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].published_file_id, "222");
+        assert_eq!(items[0].author, "76561198000000002");
         assert_eq!(
-            output,
-            r#"[{"publishedFileId":"222","title":"Dependency Mod","owner":{"steamId64":"76561198000000002"},"timeUpdated":2}]"#
+            items[0].preview_url.as_deref(),
+            Some("https://cdn.example/222.jpg")
         );
+        assert_eq!(items[0].child_ids, ["333"]);
+        assert_eq!(items[0].statistics.subscriptions, 12);
+        assert_eq!(items[0].statistics.comments, 2);
+        assert!(items[0].state.installed);
+        assert_eq!(items[0].state.workshop_id, "222");
         let _ = fs::remove_file(fixture_path);
     }
 
@@ -1336,6 +2290,121 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, r#"{"76561198000000002":"Dependency Author"}"#);
+        let _ = fs::remove_file(fixture_path);
+    }
+
+    #[test]
+    fn catalog_query_filters_sorts_and_supports_user_lists() {
+        let fixture_path = write_fixture(
+            r#"{
+                "favoriteIds": ["222"],
+                "catalog": [
+                    {"workshopId":"111","title":"Units Alpha","description":"balance","tags":["Units"],"score":0.9,"createdAtMs":10},
+                    {"workshopId":"222","title":"Campaign Beta","description":"campaign","tags":["Campaign"],"score":0.5,"createdAtMs":20}
+                ]
+            }"#,
+        );
+        let paths = HelperPaths::new(Some(fixture_path.clone()), None);
+        let discover = serde_json::to_string(&WorkshopCatalogQuery {
+            search_text: "units".to_string(),
+            required_tags: vec!["Units".to_string()],
+            ..WorkshopCatalogQuery::default()
+        })
+        .unwrap();
+        let page = run_with_args(["1142710", "queryWorkshop", &discover], &paths).unwrap();
+        let page = serde_json::from_str::<WorkshopCatalogPage>(&page).unwrap();
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.items[0].workshop_id, "111");
+
+        let favorites = serde_json::to_string(&WorkshopCatalogQuery {
+            scope: WorkshopCatalogScope::Favorites,
+            sort: WorkshopCatalogSort::Updated,
+            ..WorkshopCatalogQuery::default()
+        })
+        .unwrap();
+        let page = run_with_args(["1142710", "queryWorkshop", &favorites], &paths).unwrap();
+        let page = serde_json::from_str::<WorkshopCatalogPage>(&page).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].workshop_id, "222");
+        let _ = fs::remove_file(fixture_path);
+    }
+
+    #[test]
+    fn streaming_monitor_emits_snapshots_and_completion() {
+        let fixture_path = write_fixture(
+            r#"{
+                "monitorSnapshots": [
+                    [{"workshopId":"111","subscribed":true,"downloading":true,"bytesDownloaded":5,"bytesTotal":10}],
+                    [{"workshopId":"111","subscribed":true,"installed":true,"bytesDownloaded":10,"bytesTotal":10}]
+                ]
+            }"#,
+        );
+        let paths = HelperPaths::new(Some(fixture_path.clone()), None);
+        let payload = r#"{"ids":["111"],"intervalMs":1,"timeoutMs":2000}"#;
+        let mut lines = Vec::new();
+        run_streaming_with_args(
+            ["1142710", "monitorWorkshopItems", payload],
+            &paths,
+            |line| {
+                lines.push(line.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("\"event\":\"snapshot\""));
+        assert!(lines[2].contains("\"event\":\"complete\""));
+        assert!(lines[2].contains("\"reason\":\"complete\""));
+        let _ = fs::remove_file(fixture_path);
+    }
+
+    #[test]
+    fn streaming_monitor_reports_timeout_for_unfinished_items() {
+        let fixture_path = write_fixture(
+            r#"{
+                "monitorSnapshots": [
+                    [{"workshopId":"111","subscribed":true,"downloading":true,"bytesDownloaded":5,"bytesTotal":10}]
+                ]
+            }"#,
+        );
+        let paths = HelperPaths::new(Some(fixture_path.clone()), None);
+        let payload = r#"{"ids":["111"],"intervalMs":250,"timeoutMs":1000}"#;
+        let mut lines = Vec::new();
+
+        run_streaming_with_args(
+            ["1142710", "monitorWorkshopItems", payload],
+            &paths,
+            |line| {
+                lines.push(line.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(lines.last().unwrap().contains("\"event\":\"complete\""));
+        assert!(lines.last().unwrap().contains("\"reason\":\"timeout\""));
+        let _ = fs::remove_file(fixture_path);
+    }
+
+    #[test]
+    fn streaming_monitor_stops_when_output_pipe_breaks() {
+        let fixture_path = write_fixture(
+            r#"{
+                "monitorSnapshots": [
+                    [{"workshopId":"111","subscribed":true,"downloading":true}]
+                ]
+            }"#,
+        );
+        let paths = HelperPaths::new(Some(fixture_path.clone()), None);
+        let payload = r#"{"ids":["111"],"intervalMs":250,"timeoutMs":2000}"#;
+
+        let error =
+            run_streaming_with_args(["1142710", "monitorWorkshopItems", payload], &paths, |_| {
+                Err(HelperError::output("broken pipe"))
+            })
+            .unwrap_err();
+
+        assert_eq!(error, HelperError::output("broken pipe"));
         let _ = fs::remove_file(fixture_path);
     }
 

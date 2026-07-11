@@ -234,6 +234,7 @@ dependencies = [
 name = "wh3mm-runtime"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "wh3mm-core",
 ]
