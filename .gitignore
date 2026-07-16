@@ -5,6 +5,9 @@ target/
 *.md
 !/README.md
 !/WINDOWS-VERIFICATION.md
+!/AGENTS.md
+!/docs/**/*.md
+!/skills/**/*.md
 
 # Local/editor noise
 .DS_Store

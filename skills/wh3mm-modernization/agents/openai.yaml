@@ -1,0 +1,4 @@
+interface:
+  display_name: "WH3MM Modernization"
+  short_description: "Architecture, roadmap, and progress guide"
+  default_prompt: "Use $wh3mm-modernization to review architecture, update plan/progress, and pick the next optimization tasks."
